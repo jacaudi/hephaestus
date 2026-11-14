@@ -1,6 +1,6 @@
 # hephaestus core: design
 
-Status: draft revision 4 (after design-gate passes 1–3), for owner approval. Date: 2026-11-14. Owner: jacaudi.
+Status: **approved** by the owner on 2026-11-14 (revision 4, after design-gate passes 1–3). Date: 2026-11-14. Owner: jacaudi.
 Research and decision record: [`docs/research/booty-slim/README.md`](../research/booty-slim/README.md) (sources S1–S11
 under `docs/research/booty-slim/sources/`).
 - `D<n>` cites a decision from that record.
@@ -52,8 +52,9 @@ This document designs the **service core** only. Separate, later designs cover:
    utility OSes, reinstall (P2.6 partial, P2.9, P2.10).
 6. **The owner's standards.** Embedded templ + htmx UI, passkeys plus OIDC, an admin listener, JSON logs, bun + goose,
    Task, a distroless image (P4.*, D3, D10, D11, D9). Deviations are listed in §10.
-7. **Portable.** One binary and one data directory. It runs as a TrueNAS container day to day, and on any Linux host for
-   recovery (owner, 2026-11-13).
+7. **Portable.** A Go binary shipped as a **container image** (the primary deliverable), plus the same binary as a release
+   asset, with one data directory. The container runs on TrueNAS day to day, and on any Linux host with a container
+   runtime (or the bare binary) for recovery (owner, 2026-11-13 and 2026-11-14).
 
 ### Non-goals (v1)
 - **The inventory agent and its commands**: `reboot`, `poweroff`, `boot-talos`, `wipe-disks` (P2.6 rest, P2.7).
