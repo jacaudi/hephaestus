@@ -1,6 +1,6 @@
 # hephaestus core: design
 
-Status: draft revision 3 (after design-gate passes 1 and 2), for owner approval. Date: 2026-11-14. Owner: jacaudi.
+Status: draft revision 4 (after design-gate passes 1–3), for owner approval. Date: 2026-11-14. Owner: jacaudi.
 Research and decision record: [`docs/research/booty-slim/README.md`](../research/booty-slim/README.md) (sources S1–S11
 under `docs/research/booty-slim/sources/`).
 - `D<n>` cites a decision from that record.
@@ -111,7 +111,13 @@ This document designs the **service core** only. Separate, later designs cover:
     kept; changes marked; zap adapted to slog). Their imports are only `insomniacslk/dhcp`, `siderolabs/gen`, `pin/tftp` and
     `x/sync`, so no machinery (verified, gate 2).
   - **Vendor-copied Topf render path at `70cdbc8`** (MIT, D20). Its import of the Talos main module's `pkg/images` is
-    replaced by a local constant, so only `github.com/siderolabs/talos/pkg/machinery` is imported.
+    replaced by a local constant.
+    - Its schematic resolver's imports of `image-factory/pkg/client` and `pkg/schematic` are replaced by a copied
+      schematic-ID computation (content hash of the schematic YAML). That leaves `github.com/siderolabs/talos/pkg/machinery`
+      as the only Talos module (gate 3).
+    - Its `vals` exec is replaced by hephaestus's `op://`-only resolver (§5.4 sandbox).
+    - Vendored code lives under `internal/third_party/<project>/` with its licence file and a `VENDORED.md` that records
+      the source commit and the changes.
   - **No image-factory client library.** hephaestus calls the factory HTTP API with its own small client: `/versions`,
     `POST /schematics`, `/image/`, `/version/:v/extensions/official`. image-factory v1.8.0 requires machinery v1.14.5,
     which would break the next assertion (gate 2).
@@ -178,42 +184,50 @@ Seams arrive with their second implementor (go-standards §12, tricorder `single
 | `discovered` | adopt into a host as installed (valid UUID) | `installed` (stored hash = current render) |
 | (none) | adopt by typed UUID into a host | `installed` |
 | `discovered` | mark local-only (any machine, including junk UUIDs) | `local-only` |
+| `local-only` | unmark | `discovered` |
 | `discovered` | reject | `rejected` |
 | `rejected` | un-reject | `discovered` |
 | `rejected`, `discovered`, `local-only` | forget | removed (it rediscovers on the next boot) |
 | `assigned` | unassign | `discovered` (live ticket revoked) |
 | `assigned` | `/config` fully written with 200 | `installing` |
 | `installing` | next `/boot` | `install-unconfirmed` |
-| `installing` | admin "abort install" | `assigned` (ticket revoked) |
+| `installing` | admin "abort install" | `assigned`. The ticket was already consumed; the next `/boot` mints a new one |
 | `installing`, `install-unconfirmed` | admin "mark installed" | `installed` |
 | `installed`, `install-unconfirmed` | admin "reinstall" (UI requires confirming that `topf reset` was run, or later the agent's wipe) | `assigned` |
-| any bound state | its host leaves `nodes[]` at the approved revision | `orphaned` |
-| `orphaned` | admin "unbind" | `discovered`. Or "rebind" to another unbound host: `assigned` |
+| any bound state, or `cordoned` wrapping one | its host leaves `nodes[]` at the approved revision | `orphaned`. A cordon wrapper is kept, with prior state `orphaned` |
+| `orphaned` | admin "unbind" | `discovered` |
+| `orphaned` | admin "rebind" to another unbound host | `installed` if the machine was `installed` or `install-unconfirmed` before orphaning; otherwise `assigned` |
 | any state except `cordoned` | cordon | `cordoned` (prior state remembered) |
 | `cordoned` | uncordon | the prior state |
 
 **Decision for `/boot`.**
 - It is a pure function. Inputs:
   - machine state and host binding;
-  - the host's precomputed flags `assets_ready` and `drift`;
+  - the stored serial/product for the UUID;
+  - the per-machine flags `assets_ready` and `drift` (§5.4, §5.6);
+  - utility readiness;
   - `unknown_action`;
-  - request facts;
-  - a ticket minted by the caller beforehand only when row 9 could apply.
-- Output: a script plus the transitions and events to record. The caller applies them and coalesces repeated holding
-  events (one per machine per hour).
+  - request facts, including `${serial}` and `${product}`.
+- Output:
+  - a script template;
+  - the transitions and events to record;
+  - **`needs_ticket`** (row 10 only).
+- The caller applies the transitions, mints the ticket when asked (§6), fills it into the template, and coalesces repeated
+  holding events (one per machine per hour).
 - Rows are checked in order and the first match wins.
 
 | # | Condition | Script |
 |---|---|---|
 | 1 | request is not TLS | `chain https://<name>/boot?…`. Only `/start` and artifact routes are plain HTTP (§5.10) |
-| 2 | one-shot boot-next utility target set | that utility OS; flag cleared |
-| 3 | `cordoned` with prior `installed`, `install-unconfirmed` or `local-only` | `exit` |
-| 4 | `cordoned` (other prior states), `rejected` or `orphaned` | holding script that never advances |
-| 5 | `local-only`, `installing`, `install-unconfirmed`, `installed` | `exit`. The transition `installing → install-unconfirmed` is recorded |
-| 6 | unknown or `discovered` | report, then: `unknown_action=hold` → hold (sleep 30 s, `chain --replace`); `unknown_action=local` → `exit` |
-| 7 | `assigned`, not `assets_ready` | hold |
-| 8 | `assigned`, `drift` | hold |
-| 9 | `assigned` | Talos install script with the ticket |
+| 2 | a known UUID arrives with a serial/product that differs from the record | hold; mark the UUID junk; alert. This covers bound machines too, so a clone never gets an install |
+| 3 | one-shot boot-next utility target set **and that utility is ready** | that utility OS; flag cleared. Not ready: the flag is kept and the remaining rows apply |
+| 4 | `cordoned` with prior `installed`, `install-unconfirmed`, `installing` or `local-only` | `exit` |
+| 5 | `cordoned` (other prior states), `rejected` or `orphaned` | holding script that never advances |
+| 6 | `local-only`, `installing`, `install-unconfirmed`, `installed` | `exit`. The transition `installing → install-unconfirmed` is recorded |
+| 7 | unknown or `discovered` | report, then: `unknown_action=hold` → hold (sleep 30 s, `chain --replace`); `unknown_action=local` → `exit` |
+| 8 | `assigned`, not `assets_ready` | hold |
+| 9 | `assigned`, `drift` | hold |
+| 10 | `assigned` | Talos install script; `needs_ticket` |
 
 **Talos install script.**
 - The cached `kernel` and `initramfs`, fetched over plain HTTP from the artifact routes; their hashes are pinned in the store.
@@ -272,10 +286,31 @@ its `nodes[]`; hephaestus never injects nodes or `data`.
 - Require `talosVersion`.
 - Refuse any contract newer than the vendored machinery supports.
 - The approved booted image version must equal `talosVersion` (D22).
+- **Per-node overrides** (Topf `pkg/config/node.go:22-31`):
+  - a per-node `talosVersion` must be absent or equal the cluster's;
+  - a non-default `factory`, a `platform` other than `metal`, and `secureboot: true` are refused (Secure Boot is a
+    non-goal).
+- Native bundles are generated with the real clock, not booty's fixed 2020 clock (README §10).
 
-**Schematics.** At approval, each host's per-node schematic is resolved as Topf does, registered with `POST /schematics`
-(content-addressed ID), and stored with the host as `(schematic, version, arch)`. Approving also starts the prefetch
-(§5.6). `assets_ready` turns true when the prefetch completes.
+**Render sandbox** (gate 3). Templates must not reach anything outside the approved definition.
+- Rendering reads only from an `fs.FS` over the approved git tree, or the native revision. Absolute paths, `..` and
+  symlinks that leave the tree are refused, including Topf's `@` schematic paths.
+- Templates get **`sprig.HermeticTxtFuncMap()`**: no `env`, `expandenv`, `getHostByName`, time or random functions.
+  Topf's default `sprig.TxtFuncMap()` (`pkg/config/patches.go:154`, verified) would let a template print hephaestus's
+  root-of-trust values.
+- References resolve only through hephaestus's `op://` resolver, reading the approved secret version from the cache. Any
+  other `ref+<scheme>://` is refused, and the `vals` binary is never executed.
+- A definition that violates the sandbox (e.g. a template using `env` or `now`) is refused at import with a clear error.
+  The same definition may still render with laptop Topf; hephaestus is stricter by design.
+
+**Schematics.** At approval, each host's per-node schematic is resolved as Topf does (the copied ID computation) and
+registered with `POST /schematics`. The `(schematic, version)` pair is stored with the host.
+
+**Arch and prefetch.** Arch comes from the **bound machine** (iPXE `${buildarch}`; anything other than arm64 maps to amd64,
+as booter does). So `(schematic, version, arch)` and `assets_ready` are **per bound machine**.
+- **Prefetch triggers**: every entry into `assigned` (approve, rebind, reinstall, abort, uncordon into `assigned`), and
+  every approval of a new revision that changes its tuple.
+- **Startup**: `assets_ready` is reconciled against the store (§5.6).
 
 **Hashes and approval** (D14). For each host, at each approved revision and approved secret version, hephaestus stores:
 - `config_hash`: sha256 of the full render;
@@ -284,20 +319,32 @@ its `nodes[]`; hephaestus never injects nodes or `data`.
 These are computed at approval time and again at every cache refresh. If a recomputation under the *same* approved revision
 and secret version gives a different `config_hash` (library drift), the host's `drift` flag is set.
 
-**A pending revision** arises from a new tree, a `talosVersion` bump, or a pending secret version (§5.5).
-- The UI shows each host's redacted diff.
-- When `config_hash` changed but `display_hash` did not, the UI says "secret values changed".
-- Until the admin approves, the **approved revision and approved secret version keep being served**.
+**A pending revision** is one candidate pair: **(tree, secret version)**.
+- **What creates it**: a new tree (with its secrets resolved fresh), a `talosVersion` bump, or a changed secret value for
+  the approved tree (§5.5).
+- **At most one pending pair per cluster**: a newer candidate replaces the older one.
+- **What the admin sees**: each host's redacted diff. When `config_hash` changed but `display_hash` did not, the UI says
+  "secret values changed".
+- **Approval binds the exact pair the admin was shown**, by its ID. A refresh that arrives during review creates a newer
+  pair instead of mutating the one under review.
+- Until approval, the **approved pair keeps being served**.
+
+**Drift** is set when a render of the *approved* pair hashes differently from the stored `config_hash`, for example after
+a binary upgrade.
+- **When it is checked**: at startup, at every refresh, and on every `/config` request.
+- **What it does**: holds that host (row 9) and raises an alert.
+- **How it clears**: the admin re-approves that host's render. The diff shows old vs new hash with the redacted render,
+  which stores the new hash.
 
 **Serving `/config`** (D13, unattended). Every one of these must hold:
 - the request is TLS;
 - it comes from an on-subnet source (§6);
-- it carries a live ticket for this UUID;
+- it carries a live ticket for this UUID **whose bound host, revision and secret version are still current** (§6);
 - the host is `assigned`;
-- `drift` is false.
+- **the render, done for this request, hashes to the stored `config_hash`**. A mismatch sets `drift` and refuses.
 
-The response is the render at the approved revision and secret version. The ticket is consumed, and the state moves to
-`installing`, only after the response body is fully written without error.
+The response is that render. The ticket is consumed, and the state moves to `installing`, only after the response body is
+fully written without error.
 
 Any refusal returns 404 and does not consume the ticket. Talos retries for up to 3 h (S4 §5). Refusals are audited, one event
 per host per hour.
@@ -310,15 +357,21 @@ per host per hour.
   - Renders, hashes and `/config` read only the **approved** version.
   - Boots never call 1Password.
 - **Refresh.**
-  - Triggers: a new revision, an approval, a manual "refresh", and a timer (default daily).
-  - Each refresh calls `ResolveAll`.
-  - If any value differs, a new **pending** version is stored and the cluster shows a pending revision (§5.4). The approved
-    version keeps serving. Only the approved and latest pending versions are kept.
+  - Triggers: a new tree (resolves that tree's references), a manual "refresh", and a timer (default daily; resolves the
+    **approved** tree's references).
+  - Each refresh calls `ResolveAll` once per cluster.
+  - If any value differs, a new **pending** pair is created (§5.4). The approved version keeps serving. Only the approved
+    and latest pending versions are kept.
+  - **Git read credentials** are cached the same way and resolved on refresh, never on each poll.
   - **Partial failure**: `ResolveAll` returns per-reference results. A failed reference keeps its approved value, the
     refresh is marked `incomplete`, and `/health` warns. A failure never creates a pending version from partial data.
-  - **Rate limits** (1password.dev, verified): 1,000 reads per hour per token; the daily per-account limit is 1,000 reads
-    on Individual/Families and 5,000 on Teams. A daily timer keeps refreshes well inside both for a dozen-host fleet. The
-    request cost of `ResolveAll` is unverified; refresh counts are a metric.
+  - **Rate limits** (1password.dev, verified):
+    - 1,000 reads per hour per token.
+    - A daily limit **per 1Password account, shared by every service account** on it: 1,000 on Individual/Families,
+      5,000 on Teams.
+    - Other consumers (e.g. an External Secrets install) draw from the same daily budget.
+    - A daily timer keeps hephaestus to a few dozen reads a day for this fleet. The request cost of `ResolveAll` is
+      unverified, so reads are a metric and `/health` warns at 50% of a configured daily budget.
 - **Root of trust.** The data key, the 1Password token and the Cloudflare token come from `env` or `file`, never `op://`.
   So hephaestus starts and serves TLS without 1Password. On a fresh data dir it can issue a certificate but cannot render
   until the first refresh succeeds.
@@ -332,22 +385,34 @@ per host per hour.
 One oras-go v3 OCI-layout store under `<data>/store` (D17). Blobs become visible only once complete: oras-go writes to an
 `ingest/` temp file and renames it when done (gate 2). hephaestus therefore **never serves a blob that is still downloading**.
 
-**Prefetch at approval.** Everything a host needs is fetched into the store before `assets_ready` turns true:
-- the Talos boot assets (`kernel-<arch>`, `initramfs-<arch>.xz`, `cmdline-metal-<arch>`, SHA-256 recorded on first fetch,
-  S4 §3);
-- the **installer image**, pulled through hephaestus's own registry client into the store.
+**Prefetch, per bound machine** (triggers in §5.4). Everything a machine needs is fetched into the store before its
+`assets_ready` turns true:
+- the Talos boot assets for its `(schematic, version, arch)`: `kernel-<arch>`, `initramfs-<arch>.xz` and
+  `cmdline-metal-<arch>`. SHA-256 is recorded on first fetch (S4 §3).
+- the **installer image as its full multi-platform index**, tagged by `(schematic, version)`, with the platform manifests
+  and blobs of every arch in use among bound machines. Never collapse it with `WithTargetPlatform` (gate 3): a mixed
+  amd64/arm64 fleet sharing a schematic must not fight over one tag, and the mirror must never answer one arch with
+  another's manifest.
 
 Prefetch jobs:
 - retry with backoff;
-- **resume interrupted downloads** with HTTP `Range` against upstream, into hephaestus's own spool file, which is pushed
-  into the store when complete;
+- resume interrupted downloads with HTTP `Range` **plus `If-Range` on the upstream ETag**, so two upstream versions can
+  never be spliced into one first-fetch hash, into hephaestus's own spool file, which is pushed into the store when complete;
 - show progress in the UI.
+
+**Startup reconciliation.** Every `assets_ready` flag and utility-ready flag is recomputed against the store. A missing
+blob, for example after a restore, clears the flag and re-queues the prefetch.
+
+**Utility readiness.** Each catalog entry has a ready flag. Entries are fetched on first selection as a boot-next target,
+or from an admin "fetch now" in the UI. Row 3 uses the flag.
 
 **Registry mirror.**
 - `/v2/` is read-only, for an **allow-list**: `factory.talos.dev/*` and `ghcr.io/siderolabs/*`.
 - **Routing contract** (the owner's `RegistryMirrorConfig` patch must match): one mirror entry per upstream host, with
   endpoint `https://<name>/v2/<upstream-host>` and `overridePath: true`, so a request path's first segment names the
-  upstream.
+  upstream. containerd's `?ns=<upstream>` query is cross-checked against that segment; a mismatch returns 404.
+- The `ghcr.io` entry captures every `ghcr.io` pull cluster-wide. Anything outside `ghcr.io/siderolabs/*`, and any
+  uncached `ghcr.io/siderolabs` image (e.g. kubelet), returns 404 and falls back upstream.
 - A cached reference is served from the store; referrers (signatures) are kept.
 - **A miss returns 404 and starts a background fetch.** The patch sets `skipFallback: false`, so Talos falls back to
   upstream for that pull. Offline installs still work because everything an assigned host needs was prefetched.
@@ -373,13 +438,14 @@ pinned, cgo-free ISO9660 reader the plan names.
 
 **Pins and GC.**
 - **Pinned**:
-  - every `(schematic, version, arch)` and installer image used by a host in `assigned`, `installing`,
-    `install-unconfirmed` or `installed`, or `cordoned` with one of those as its prior state;
-  - the newest 3 Talos minors' boot assets for every schematic in use, which are also prefetched;
-  - the compiled-in utility catalog.
-- **GC**: untag unpinned, then `Store.GC()`. It runs only when no prefetch or mirror fetch is in flight, and is otherwise
-  rescheduled. While GC runs, new fetches wait. This is acceptable because nothing on a boot's critical path is fetched
-  at boot time.
+  - every tuple and installer index used by a machine in `assigned`, `installing`, `install-unconfirmed` or `installed`,
+    or `cordoned` with one of those as its prior state;
+  - fetched utility entries.
+
+  The earlier "newest 3 minors" pin is dropped: it had no v1 consumer (gate 3).
+- **GC**: untag unpinned, then `Store.GC()`. GC takes the store's write lock, which blocks **serving** as well as fetching
+  (gate 3). So it runs only in a quiet window: no prefetch, mirror fetch or artifact response active for 5 minutes, and no
+  machine in `assigned` or `installing`. Otherwise it is rescheduled.
 
 ### 5.7 UI
 
@@ -441,10 +507,14 @@ Per WL:504-543:
   - certificate expiry within 14 days.
 - **Backup.** `hephaestus backup <dir>` writes:
   - a consistent database snapshot (SQLite `VACUUM INTO`; for Postgres, document `pg_dump`);
-  - the store index;
   - the **git object store**.
 
-  The data key is never included.
+  The data key is never included. **Store blobs are not backed up**: they are refetched from upstream.
+- **Restore** (runbook):
+  1. Stop any running instance.
+  2. Place the snapshot and git objects in an empty data dir.
+  3. Start hephaestus. Startup reconciliation (§5.6) clears every `assets_ready` and re-queues prefetch. Hosts hold at
+     row 8 until their assets are back.
 - **Recovery** needs:
   - a Linux host on the VLAN;
   - the release image or binary, published off-cluster to `ghcr.io/jacaudi/hephaestus` plus GitHub mirror releases;
@@ -467,24 +537,32 @@ Per WL:504-543:
   1.3 by default"), reproducibly, in a container in CI.
   - **Targets**: amd64 `undionly.kpxe` (BIOS), amd64 `snp.efi`, arm64 `snp.efi`. Over TFTP the arm64 binary is served as
     `snp-arm64.efi`, the name the vendored proxy hands out.
+  - **Pin**: full hash `9261ebe38af0c0b38ac332adeec125a518845013`. CI verifies that `a040f9579` is an ancestor.
+  - **Make targets**: `bin-x86_64-pcbios/undionly.kpxe` (reports `buildarch=x86_64`), `bin-x86_64-efi/snp.efi`,
+    `bin-arm64-efi/snp.efi`.
   - **Settings**:
     - `CERT=` and `TRUST=` set to the ISRG Root X1, X2, YR and YE certificates; `TRUST=` embeds only fingerprints, so
       the roots themselves must be present.
-    - `#define CROSSCERT ""` (an `#undef` does not compile; gate 2).
+    - `#undef CROSSCERT` then `#define CROSSCERT ""` (an empty value disables the fetch; a bare redefine fails `-Werror`;
+      gate 3).
     - `#undef OCSP_CHECK`.
     - **For BIOS too**: `DOWNLOAD_PROTO_HTTPS`, `PARAM_CMD` and `NTP_CMD` enabled.
+    - `MEMMAP_SETTINGS` enabled for `${memsize}`. CPUID facts are reported where available (amd64 only).
   - **CI checks**: shipped binaries' `TRUST` fingerprints equal the ISRG set. A separately built **test variant** trusts
     a test CA for QEMU tests and is never shipped.
   - **Fallback**: if lab test 1 shows a TLS 1.3 interop failure with Go, pin v2.0.0. Then TLS 1.2 is allowed on the boot
     listener, as a §10 deviation that exists only in that case.
 - **Static embedded chain script** (gate 1 B2, booty/bootimus precedent). It contains no domain:
   1. DHCP on each interface, with link wait.
-  2. `ntp ${ntp-server}` when DHCP provides one.
+  2. `isset ${ntp} && ntp ${ntp} ||`. The iPXE setting is `ntp` (`net/udp/ntp.c:282`, verified); unknown names expand
+     silently to empty (gate 3).
   3. `chain http://${proxydhcp/next-server}/start?uuid=${uuid}&mac=${net${idx}/mac:hexhyp}&arch=${buildarch}&…`.
   4. `/start` answers a **static** script, `chain https://<name>/boot?` with the same iPXE variables (no request text
      echoed).
   5. Per-interface retry and Ctrl-B escape, as booter does (S2 §2.3).
   6. When retries are exhausted: **`exit`, never `reboot`.**
+  7. When a chained script returns (e.g. after row 4 or 6 `exit`), the embedded script itself `exit`s, as booty's
+     `boot/embed.ipxe` does, instead of walking the remaining NICs.
 
   The vendored proxy sets `siaddr` and option 67 on every offer, so iPXE registers the offer as `proxydhcp` and populates
   `${proxydhcp/next-server}` (verified in iPXE `dhcp.c`, gate 2). There is no `${next-server}` fallback.
@@ -493,8 +571,16 @@ Per WL:504-543:
 
 ### 5.11 Deployment (TrueNAS and Linux)
 
-- **Host networking**, with a **dedicated IP** on the provisioning VLAN. hephaestus binds that IP for proxyDHCP (67/4011),
-  TFTP (69), HTTP (80: `/start` and artifacts) and HTTPS (443). The admin listener (9090) binds the management address.
+- **Host networking**, with a **dedicated VLAN interface** whose **primary address** is hephaestus's IP.
+  - The vendored proxy binds `0.0.0.0:67/4011` with `SO_BINDTODEVICE` to that interface (`pkg/dhcp/proxy.go:86-88`), so
+    its replies come from the interface's primary address (gate 3).
+  - TFTP (69), HTTP (80: `/start` and artifacts) and HTTPS (443) bind the same IP.
+  - The admin listener (9090) binds the management address.
+- **Routing assumptions**, stated and lab-tested:
+  - the admin reaches the UI via the gateway, and the TrueNAS host's replies leave by the same interface, using a
+    policy-routing rule if needed;
+  - Talos nodes keep provisioning-subnet addresses after installing, so the `/v2/` subnet guard admits their installer
+    pulls.
 - **Deployment precondition**: restrict the TrueNAS web UI to the management IP, since by default it binds 0.0.0.0
   (gate 2).
 - **Privileges**:
@@ -514,10 +600,11 @@ Per WL:504-543:
   - The UI and auth routes are reachable from the admin's network.
   - A deployment firewall rule restating the subnet restriction is recommended.
 - **Tickets.**
-  - Minted only for an `assigned` host with `assets_ready` and no `drift`.
-  - At most one live ticket per host; a new one revokes the old.
+  - Minted by the `/boot` caller only when the decision returns `needs_ticket` (row 10).
+  - **Bound to (UUID, host, approved revision pair, secret version).**
+  - At most one live ticket per machine; a new one revokes the old.
+  - **Revoked** by any approval, binding, cordon or state change for that machine or its cluster.
   - Valid for 3 h from minting, matching Talos's retry window.
-  - Bound to the UUID.
   - Consumed after a fully written 200.
 
   There is **no source-IP binding**: Talos may fetch the config from a different NIC than iPXE used (gate 2), and on a
@@ -539,9 +626,13 @@ Per WL:504-543:
 
 1. **First installs.** hephaestus runs on TrueNAS with the home-ops Topf repo imported. An MS-R1 (via its shim) and an amd64
    node go from unknown to `install-unconfirmed`, are confirmed, and reach Talos Ready.
-   - After prefetch, VLAN egress to `factory.talos.dev`, `ghcr.io`, the utility upstreams and 1Password is blocked during
-     the install.
-   - Other registries (registry.k8s.io and so on) stay reachable; they are out of scope.
+   - After prefetch, egress to `factory.talos.dev`, the utility upstreams and 1Password is blocked during the install,
+     for the nodes and for hephaestus alike.
+   - `ghcr.io` and other registries stay reachable, because reaching Ready needs Kubernetes images (e.g.
+     `ghcr.io/siderolabs/kubelet`) that v1 does not prefetch.
+   - **MS-R1 dependency**: iPXE `exit` returns to the shim media's caller, the UEFI Shell. Reaching NVMe unattended
+     depends on the home-ops shim media falling through to `\EFI\BOOT\BOOTAA64.EFI` (out of scope here, S2 §4). Otherwise
+     the admin boots NVMe from the Shell.
 2. **Revisions.**
    - A home-ops commit outside the cluster subpath creates no revision.
    - A commit inside it changes nothing nodes receive until approved.
@@ -557,12 +648,19 @@ Per WL:504-543:
    - drift.
 
    The decision function is table-tested over every state and row, and every transition in §5.2 has a test.
-5. **CI.** `task ci` passes:
+5. **CI.** `task ci` passes on macOS and Linux:
    - lint;
    - tests against both databases;
-   - the golden Topf-render parity test against `topf` at `70cdbc8`, with the machinery assertion;
+   - the machinery assertion;
    - the iPXE TRUST-fingerprint check;
-   - the QEMU end-to-end test: amd64 UEFI and BIOS, test-CA iPXE variant, a bridge plus a test DHCP server, as bootimus does.
+   - the **golden Topf-render parity test**: hermetic fixtures (no `env`/time/random functions) whose `ref+op://`
+     references resolve to fixture values. That means a stub `vals` on `PATH` for `topf render` at `70cdbc8`, and a fixture
+     cache for hephaestus. The two outputs must be byte-identical.
+6. **End to end.** `task e2e` passes on Linux only (it needs tap/bridge and root): a QEMU test with amd64 UEFI and BIOS,
+   the test-CA iPXE variant, and a bridge plus a test DHCP server, as bootimus does. It covers iPXE → `/start` → `/boot`
+   → discovery → approval → install script → kernel and initramfs fetch. Talos's own HTTPS config fetch cannot trust the
+   test CA, so it is covered by lab test 3, not e2e. Where `task e2e` runs (a Linux CI runner once a remote exists, or a
+   Linux host) is a run-contract item.
 
 ## 8. Left to the builder
 
@@ -598,6 +696,13 @@ Per WL:504-543:
 - **Stateful single-instance appliance** (12-Factor VI and VIII).
 - **Off-cluster image distribution** to `ghcr.io/jacaudi/hephaestus`, in addition to WL:560's registry.
 - **No public API in v1.**
+- **D8's agent commands** (`reboot`, `poweroff`, `wipe-disks`) move out of this core design to the inventory-OS design;
+  core v1 has no agent.
+- **D12/D19 narrowed for cluster definitions**: only `ref+op://` is allowed inside Topf files. `env` and `file` sources
+  apply only to hephaestus's own bootstrap secrets (§5.5).
+- **Vendored code**: go-standards §10 says "no vendored directories". Topf's render path and the provider's dhcp/tftp
+  packages are copied under `internal/third_party/` with licences and `VENDORED.md`, because they are not importable
+  without pre-release Talos machinery, or are internal. MIT notices are kept for Topf and the 1Password SDK.
 - **Licences.** Published images contain:
   - modified GPLv2 iPXE binaries, whose source is the pinned commit plus the build config kept in this repo;
   - modified MPL-2.0 files (vendored provider code, changes marked).
@@ -616,5 +721,7 @@ Per WL:504-543:
 5. Golden Topf parity on the migrated home-ops repo, including duplicate `machine.files` (S11).
 6. Utility-OS second stages (SystemRescue `archiso_pxe_http`, live-boot `fetch=`, Alpine `modloop`/`alpine_repo`) over
    plain HTTP from hephaestus.
-7. The container's minimum capabilities on TrueNAS with host networking; the dedicated-IP binding; restricting the GUI.
+7. The container's minimum capabilities on TrueNAS with host networking (whether BuildKit keeps file capabilities;
+   TrueNAS `no-new-privileges`); the dedicated VLAN interface and its primary address; restricting the GUI; symmetric
+   routing for admin UI traffic.
 8. Backup restore on a second Linux host (success criterion 3).
