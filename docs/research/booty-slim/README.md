@@ -345,6 +345,12 @@ S11 lists five lab tests: golden parity, contract change, merge semantics, the d
 | — | **booty fixed-clock CA bug: deferred** by the owner (2026-11-13); not filed | §10 |
 | D23 | **home-ops migrates in two steps.** Step 1: talhelper → Topf on the 1.12 contract, proven by a render diff against talhelper output, with `global/containerd.yaml` left out and FQDN `host` names kept. Step 2: the 1.14 multi-document layout as its own change. Secrets move to 1Password (D19) | home-ops is the owner's GitLab repo; the migration is separate work from the service |
 
+**Recorded (owner, 2026-11-15):**
+
+| # | Decision | Effect |
+|---|---|---|
+| D25 | **TLS from externally supplied certificate files or a TLS-terminating reverse proxy; in-process ACME (lego, Cloudflare DNS-01) dropped; `HEPHAESTUS_DATA_KEY` deferred to M3** (owner, 2026-11-15) | Supersedes D15's in-process ACME client; D15's requirement of a publicly trusted certificate stands, because the iPXE binaries trust only the ISRG roots. `HEPHAESTUS_TLS_MODE` is `file` (a certificate and key that certbot, lego or cert-manager writes and renews, re-read within a minute when the files change) or `proxy` (Caddy, Traefik or Envoy terminates TLS and forwards plain HTTP, with the client in `X-Forwarded-For`; only listed proxies are believed). Both ship. The ACME account and certificate tables, `tlsacme`, the lego dependency and the Cloudflare token go. The data key's only M1 consumer was the ACME client, so it leaves M1 and returns in M3 with its consumers; the `datakey` package stays |
+
 ### 9.3 Options as researched (kept for the record; see 9.1b for the outcome)
 
 | # | Question | Recommendation | Why | Against |

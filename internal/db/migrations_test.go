@@ -53,9 +53,15 @@ func runMigrateSuite(t *testing.T, open func(testing.TB) *db.DB) {
 		if err := d.Bun().NewRaw(query).Scan(t.Context(), &got); err != nil {
 			t.Fatalf("list tables: %v", err)
 		}
-		for _, want := range []string{"machines", "machine_macs", "inventory_reports", "boot_events", "audit_events", "settings", "acme_accounts", "tls_certificates"} {
+		for _, want := range []string{"machines", "machine_macs", "inventory_reports", "boot_events", "audit_events", "settings"} {
 			if !slices.Contains(got, want) {
 				t.Errorf("table %q missing; have %v", want, got)
+			}
+		}
+		// TLS comes from files or a proxy; nothing in the database holds a certificate or an ACME account.
+		for _, gone := range []string{"acme_accounts", "tls_certificates"} {
+			if slices.Contains(got, gone) {
+				t.Errorf("table %q exists, want it gone with the in-process ACME client; have %v", gone, got)
 			}
 		}
 	})

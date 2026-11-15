@@ -63,25 +63,8 @@ CREATE TABLE settings (
     value TEXT NOT NULL
 ) STRICT;
 INSERT INTO settings (key, value) VALUES ('unknown_action', 'local');
-CREATE TABLE acme_accounts (
-    directory_url TEXT PRIMARY KEY,
-    key_sealed    BLOB NOT NULL,
-    registration  TEXT NOT NULL,
-    created_at    TEXT NOT NULL
-) STRICT;
-CREATE TABLE tls_certificates (
-    domain        TEXT PRIMARY KEY,
-    directory_url TEXT NOT NULL,
-    chain_sealed  BLOB NOT NULL,
-    key_sealed    BLOB NOT NULL,
-    not_before    TEXT NOT NULL,
-    not_after     TEXT NOT NULL,
-    updated_at    TEXT NOT NULL
-) STRICT;
 
 -- +goose Down
-DROP TABLE tls_certificates;
-DROP TABLE acme_accounts;
 DROP TABLE settings;
 DROP TABLE audit_events;
 DROP TABLE boot_events;

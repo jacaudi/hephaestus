@@ -6,13 +6,14 @@ import (
 	"net/netip"
 )
 
-// RequireSubnet serves next only to clients whose source address is inside
-// subnet, and answers everyone else 403 with an empty body. An IPv4-mapped
+// RequireSubnet serves next only to clients whose address is inside subnet, and
+// answers everyone else 403 with an empty body. The client is the connection's
+// peer, or the address TrustProxies took from X-Forwarded-For. An IPv4-mapped
 // IPv6 address is unmapped first, so a dual-stack listener still matches an
 // IPv4 subnet; an address that does not parse is refused.
 func RequireSubnet(subnet netip.Prefix, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		addr, err := sourceAddr(r.RemoteAddr)
+		addr, err := clientAddr(r)
 		if err != nil || !subnet.Contains(addr) {
 			w.WriteHeader(http.StatusForbidden)
 			return
@@ -21,11 +22,20 @@ func RequireSubnet(subnet netip.Prefix, next http.Handler) http.Handler {
 	})
 }
 
-// sourceAddr is the client address of a connection's RemoteAddr, with an
-// IPv4-mapped IPv6 address unmapped. The guard and the /discover rate limiter
+// clientAddr is the client address of r, with an IPv4-mapped IPv6 address
+// unmapped: the one TrustProxies set when the request came through a trusted
+// proxy, otherwise the connection's. The guard and the /discover rate limiter
 // both see a client as this one address.
-func sourceAddr(remoteAddr string) (netip.Addr, error) {
-	ap, err := netip.ParseAddrPort(remoteAddr)
+func clientAddr(r *http.Request) (netip.Addr, error) {
+	if addr, ok := r.Context().Value(clientKey{}).(netip.Addr); ok {
+		return addr, nil
+	}
+	return remoteAddr(r)
+}
+
+// remoteAddr is the address of the connection's peer, unmapped.
+func remoteAddr(r *http.Request) (netip.Addr, error) {
+	ap, err := netip.ParseAddrPort(r.RemoteAddr)
 	if err != nil {
 		return netip.Addr{}, fmt.Errorf("boot: source address: %w", err)
 	}

@@ -2,7 +2,9 @@
 
 Status: **approved** by the owner on 2026-11-14 (revision 4, after design-gate passes 1–3). Date: 2026-11-14. Owner: jacaudi.
 Updated 2026-11-15 to match M1 as built: the Milestones section, and the M1 notes and rulings folded into the sections they
-touch.
+touch. Also 2026-11-15 (owner): the in-process Let's Encrypt client is dropped. TLS comes from certificate files that an
+external tool writes and renews, or from a TLS-terminating reverse proxy (§5.10); the data key returns with its consumers
+in M3 (D25).
 Research and decision record: [`docs/research/booty-slim/README.md`](../research/booty-slim/README.md) (sources S1–S11
 under `docs/research/booty-slim/sources/`).
 - `D<n>` cites a decision from that record.
@@ -65,13 +67,13 @@ The goals above are built in four milestones. This section says what each contai
 - **M1: the boot plane** (this branch). Repo skeleton and standards; `hephaestus serve` and `version`; config; logs and
   wide events; the admin listener with a check registry; the database with its two migration sets; fleet identity, the
   full §5.2 transition table and the full `/boot` decision; `/start`, `/boot` and `/discover`; the source-subnet guard;
-  the vendored proxyDHCP and TFTP; the iPXE build with committed binaries; Let's Encrypt through DNS-01 on Cloudflare; the
-  container image. Known limitations: EFI iPXE reports `${memsize}` as 0 (stored and shown as unknown), and CPUID facts
+  the vendored proxyDHCP and TFTP; the iPXE build with committed binaries; TLS from certificate files that an external
+  tool renews, or from a TLS-terminating reverse proxy (§5.10), and no data key yet; the container image. Known limitations: EFI iPXE reports `${memsize}` as 0 (stored and shown as unknown), and CPUID facts
   may be absent on BIOS builds.
 - **M2: store.** The content store, catalog, registry mirror and prefetch (§5.6), with the `store` and `catalog`
   packages, utility OS boots and `assets_ready`.
-- **M3: clusters.** Clusters, render, secrets, `/config` and tickets (§5.4–5.6, §6); the Talos install script; the
-  1Password token; host binding and the create-on-adopt path (§5.2); the machinery assertion and the Topf parity test in CI.
+- **M3: clusters.** Clusters, render, secrets, `/config` and tickets (§5.4–5.6, §6); the Talos install script; the data
+  key (its `datakey` package exists, and nothing reads the key before M3) and the 1Password token; host binding and the create-on-adopt path (§5.2); the machinery assertion and the Topf parity test in CI.
 - **M4: auth, UI and operations.** `web` and `auth` (§5.7, §5.8); `hephaestus backup` and `admin recover` (§5.9); the
   menu-preview endpoint; the alert evaluators and surfaces that need the UI (§5.9), including the `/start`-without-`/boot`
   alert and certificate-expiry alerting beyond the `/health` warning; and the callers of `Transition` and
@@ -108,8 +110,9 @@ publishing the image (§3).
 ### Anti-goals
 - Becoming booty again.
 - **Any unencrypted secret at rest**: database, data dir, logs or backups. 1Password is canonical, and the local cache is
-  encrypted (§5.5). The named exception is the root of trust: the data key, the 1Password service-account token and the
-  Cloudflare token, all supplied by the deployment through env or file (§6).
+  encrypted (§5.5). The named exception is the root of trust: the data key and the 1Password service-account token (both
+  from M3), supplied by the deployment through env or file (§6). The TLS private key is not stored by hephaestus: it
+  stays in the files or the proxy that supply it (§5.10).
 - **Trusting moving refs.** Branches are fetched, but only approved tree hashes are rendered. Catalog definitions are
   compiled in.
 - **First visitor becomes admin** (WL:522).
@@ -179,9 +182,9 @@ publishing the image (§3).
 | `secrets` | `ref+op://` resolution (1Password SDK), the encrypted value cache with pending versions, and the 1Password writer for native bundles (§5.5) |
 | `web` | templ + htmx + shadcn-templ, SSE, strict CSP |
 | `auth` | Passkeys (always), OIDC (optional), sessions, CSRF, bootstrap token, recovery, account linking |
-| `tlsacme` | Let's Encrypt via ACME DNS-01 on Cloudflare (owner, 2026-11-14), plus renewal |
+| `tlscert` | Serves a certificate and key that an external tool writes and renews (owner, 2026-11-15): reads them at startup, reloads them when the files change, and reports their health. It never obtains a certificate (§5.10) |
 | `admin` | `/healthz`, `/readyz`, `/health`, `/metrics` |
-| `datakey` | AES-256-GCM sealing of stored secrets under the data key (§5.5) |
+| `datakey` | AES-256-GCM sealing of stored secrets under the data key (§5.5). Nothing reads the key before M3 |
 | `secret` | A string type that redacts itself in fmt, slog and JSON. Not the `secrets` package above: that one resolves and caches 1Password values (M3), so the two names sit side by side |
 | `telemetry` | The slog logger, wide events and the OpenTelemetry meter provider with its Prometheus exporter (§5.9) |
 | `db` | Opening SQLite or Postgres, the goose migrations, health checks; the shared appkit-shaped DB package (§10) |
@@ -436,10 +439,11 @@ per host per hour.
     - Other consumers (e.g. an External Secrets install) draw from the same daily budget.
     - A daily timer keeps hephaestus to a few dozen reads a day for this fleet. The request cost of `ResolveAll` is
       unverified, so reads are a metric and `/health` warns at 50% of a configured daily budget.
-- **Root of trust.** The data key, the 1Password token and the Cloudflare token come from `env` or `file`, never `op://`.
-  So hephaestus starts and serves TLS without 1Password. On a fresh data dir it can issue a certificate but cannot render
-  until the first refresh succeeds.
-  - The data key also encrypts the ACME account and TLS keys, the ticket-signing key and the session key.
+- **Root of trust.** The data key and the 1Password token come from `env` or `file`, never `op://`. So hephaestus starts
+  and serves TLS without 1Password (TLS needs neither value, §5.10). On a fresh data dir it cannot render until the first
+  refresh succeeds. M1 reads neither value: the data key's only M1 consumer was the in-process ACME client, which is gone
+  (D25), so the key arrives with M3.
+  - The data key also encrypts the ticket-signing key and the session key.
 - **Writer.** A separate type that creates native bundles. On partial failure it deletes what it created. If that rollback
   itself fails, it records the leftover item IDs in the audit log and shows them in the UI for manual cleanup. The cluster
   is never left half-created. Read and write are separate types; there are no stubs.
@@ -548,27 +552,33 @@ Per WL:504-543:
     the address; startup refuses otherwise, and an admin port of 0). The boot HTTP and HTTPS ports are fixed at 80 and
     443: the embedded chain script `http://${proxydhcp/next-server}/start` carries no port (§5.10);
   - DB URL and data dir;
-  - data key, 1Password token (read from M3; M1 does not read it) and Cloudflare token;
+  - data key and 1Password token (both read from M3; M1 reads neither);
   - FQDN;
   - provisioning subnet;
-  - the ACME directory URL (default Let's Encrypt production; the lab points it at staging), the shutdown grace, and the
-    log level and format.
+  - TLS (§5.10): `HEPHAESTUS_TLS_MODE` is `file` (the default) or `proxy`. File mode needs the certificate and key file
+    paths. Proxy mode needs the address hephaestus listens on for the proxy, and the proxies' CIDR prefixes. The variables
+    of the other mode are an error, not ignored;
+  - the shutdown grace, and the log level and format.
 
   Everything else lives in the database.
 - **HTTP.** Huma serves JSON routes when an API exists (WL). The v1 UI is server-rendered HTML on the standard library mux.
 - **Admin listener.** On the management address only. The full set below is the target; M1 builds the part marked (M1) and
   later milestones add the rest alongside the feature each item reports on (store: M2; git, secrets, configs: M3).
   - `/healthz`.
-  - `/readyz`: migrations applied, store readable, certificate loaded; fails while draining. (M1: database ping, no
-    pending migrations and certificate loaded; the store check arrives with the store.)
+  - `/readyz`: migrations applied, store readable, certificate valid; fails while draining. (M1: database ping, no
+    pending migrations and, in file mode, `tls:certificate`, which fails once the served leaf has expired; proxy mode
+    has no certificate check, since the proxy holds the certificate; the store check arrives with the store.)
   - `/health` (health+json): version, DB ping, migrations, disk and store bytes, git fetch age, secret-cache age and
     `incomplete` flag, certificate expiry, 1Password reachability as `warn`. (M1: version, uptime, lifecycle state, DB
-    ping, migrations, data-dir free space with a warning below 10%, certificate expiry; no store, git or secret items yet.)
+    ping, migrations, data-dir free space with a warning below 10%, and in file mode `tls:expiry`, which warns under 14
+    days; no store, git or secret items yet.)
   - `/metrics`: request RED, build info, runtime, boots by decision, configs served and refused, prefetch status, store
     bytes, verify failures, certificate days left, 1Password reads. (M1: request RED, build info, runtime, boots by
-    decision, alerts, discovery reports, certificate days left and renewal failures.)
+    decision, alerts, discovery reports, and in file mode certificate days left and certificate reload failures.)
 - **Timeouts.** Per-route deadlines with `http.ResponseController`. Artifact, blob and SSE routes use idle timeouts
-  instead of fixed write deadlines. Shutdown drains with a configurable grace (default 60 s) and stops proxyDHCP first.
+  instead of fixed write deadlines. Shutdown stops proxyDHCP first, then drains the boot servers and later the admin
+  server against one shared deadline, a configurable grace (default 60 s) counted from when draining starts, so a stop
+  timeout equal to the grace is enough.
 - **Logs.** slog JSON to stdout by default, snake_case, `error` key; text for local use, chosen with
   `HEPHAESTUS_LOG_FORMAT` or `--log-format`. One wide event per request; a `/boot` request makes exactly one decision, so
   its decision fields ride on that request's event rather than a second one. `trace_id` when present: M1 has no tracer
@@ -580,8 +590,8 @@ Per WL:504-543:
     records no event, so there is nothing to evaluate yet;
   - prefetch failures;
   - a secret refresh marked `incomplete`;
-  - certificate expiry within 14 days. M1 shows it only as a `/health` warning and the days-left gauge, with no audit
-    event or alert counter.
+  - certificate expiry within 14 days (file mode). M1 shows it only as a `/health` warning and the days-left gauge, with no
+    audit event or alert counter.
 - **Backup** (M4, with `hephaestus admin recover`; M1 has neither). `hephaestus backup <dir>` writes:
   - a consistent database snapshot (SQLite `VACUUM INTO`; for Postgres, document `pg_dump`);
   - the **git object store**.
@@ -596,7 +606,8 @@ Per WL:504-543:
   - a Linux host on the VLAN;
   - the release image or binary, published off-cluster to `ghcr.io/jacaudi/hephaestus` plus GitHub mirror releases;
   - a backup;
-  - the three root-of-trust values;
+  - the root-of-trust values (from M3: the data key and the 1Password token), and the TLS certificate files or the proxy
+    in front;
   - the LAN DNS record repointed.
 
   Runbook step 1 is to stop the primary instance.
@@ -605,11 +616,29 @@ Per WL:504-543:
 
 - **The stable name** `hephaestus.<owner domain>` resolves through the LAN DNS (the gateway, off-cluster) to
   hephaestus's VLAN IP.
-  - **Certificate**: Let's Encrypt via ACME DNS-01 on Cloudflare (owner, 2026-11-14), with renewal at two-thirds of its
-    lifetime, persisted under the data key.
-  - **Chain**: the client serves Let's Encrypt's default chain. Both the RSA and ECDSA default chains end at ISRG Root X1
-    through cross-signs (letsencrypt.org/certificates; gate 2).
-  - **CT logs** will list the name; accepted.
+  - **TLS source** (owner, 2026-11-15; D25). hephaestus does not obtain, issue or renew a certificate, and holds no ACME
+    account and no DNS credential. `HEPHAESTUS_TLS_MODE` picks one of two sources, and both ship:
+    - **`file`** (default). `HEPHAESTUS_TLS_CERT_FILE` and `HEPHAESTUS_TLS_KEY_FILE` name a chain and key that an external
+      process writes and renews (certbot, lego, cert-manager). The `tlscert` package reads both at startup and refuses to
+      start when a file is unreadable, the key does not match, the leaf does not cover `HEPHAESTUS_FQDN`, or the leaf has
+      expired. Once a minute it stats both files, following symlinks so a Kubernetes secret swap counts, and reloads
+      the pair when either file's modification time or size changed, under the same checks. A replacement that fails them
+      leaves the current pair serving, is counted (`hephaestus.tls.reload.failures`), is reported once through the error
+      handler (the service logs it at Warn), and is not retried until the files change again. The TLS 1.3 listener serves
+      whatever pair is current. The admin checks are `tls:certificate` (critical: fails once the served leaf has expired)
+      and `tls:expiry` (warns under 14 days); the gauge `hephaestus.tls.certificate.days_left` reports the days left.
+    - **`proxy`**. A reverse proxy (Caddy, Traefik, Envoy) terminates TLS 1.3 and forwards plain HTTP to
+      `HEPHAESTUS_PROXY_ADDRESS`, where hephaestus serves the same routes as the HTTPS listener. There is no certificate
+      in the process, no TLS check and no TLS port. The proxy's own addresses are `HEPHAESTUS_PROXY_TRUSTED`
+      (CIDR prefixes). Only a peer inside them is served; the client address is the rightmost `X-Forwarded-For` entry
+      that is not itself a trusted proxy, and that address, not the proxy's, goes through the source-subnet guard and the
+      `/discover` rate limiter (§6).
+    - Plain HTTP `:80` (`/start`, the artifact route) stays on hephaestus in both modes: the embedded chain targets the
+      next-server address, which carries no name.
+  - **Chain**: the certificate's chain, wherever it comes from, must end at an ISRG root, because the iPXE binaries trust
+    only those (below). Let's Encrypt's default chains qualify: both the RSA and ECDSA defaults end at ISRG Root X1
+    through cross-signs (letsencrypt.org/certificates; gate 2). A private CA does not work with the shipped binaries.
+  - **CT logs** list the name when a public CA issues it; accepted.
 - **iPXE**: hephaestus builds its own, pinned at commit `9261ebe` (2026-11-12, after `a040f9579` "[tls] Enable TLS version
   1.3 by default"), reproducibly, in a container in CI.
   - **Targets**: amd64 `undionly.kpxe` (BIOS), amd64 `snp.efi`, arm64 `snp.efi`. Over TFTP the arm64 binary is served as
@@ -653,7 +682,8 @@ Per WL:504-543:
 - **Host networking**, with a **dedicated VLAN interface** whose **primary address** is hephaestus's IP.
   - The vendored proxy binds `0.0.0.0:67/4011` with `SO_BINDTODEVICE` to that interface (`pkg/dhcp/proxy.go:86-88`), so
     its replies come from the interface's primary address (gate 3).
-  - TFTP (69), HTTP (80: `/start` and artifacts) and HTTPS (443) bind the same IP.
+  - TFTP (69), HTTP (80: `/start` and artifacts) and, in `file` mode, HTTPS (443) bind the same IP. In `proxy` mode
+    hephaestus binds `HEPHAESTUS_PROXY_ADDRESS` for the proxy instead of 443, and the proxy owns the name's address.
   - The admin listener (9090) binds the management address.
 - **Routing assumptions**, stated and lab-tested:
   - the admin reaches the UI via the gateway, and the TrueNAS host's replies leave by the same interface, using a
@@ -676,6 +706,15 @@ Per WL:504-543:
 - **Enforcement** (gate 2).
   - Boot-facing routes (`/start`, `/boot`, `/discover`, `/config`, artifacts, `/v2/`) refuse any TCP source address
     outside the configured provisioning subnet. A TCP source cannot be spoofed from off-link.
+  - **Behind a reverse proxy** (`proxy` mode, §5.10) the TCP source is the proxy, so the guard and the `/discover` limiter
+    use the client address that the proxy reports in `X-Forwarded-For`. That header is believed only from a peer inside
+    `HEPHAESTUS_PROXY_TRUSTED`, which makes the trusted proxies part of the trust boundary: one that forwards a
+    client-supplied header unmodified lets that client name any address. Every refusal fails closed with a 403:
+    - a peer outside the trusted list;
+    - a missing or unparsable header (only the entries walked, from the right, are parsed);
+    - a header whose entries are all trusted proxies.
+
+    The peer's own address is never used as the client on the proxy listener, and `Forwarded` and `X-Real-IP` are not read.
   - **Refusal status.** The M1 boot routes (`/start`, `/boot`, `/discover`, artifacts) answer an off-subnet source with
     403. `/config` and `/v2/` (M3 and M2) must answer 404 to an off-subnet source, as §5.4 and §5.6 require of every
     refusal on those routes, so the guard they sit behind must not answer 403 for them.
@@ -699,8 +738,10 @@ Per WL:504-543:
   - Talos prints the full config URL on its console (`platform/metal/metal.go:69`), and the URL sits in `/proc/cmdline`.
     Single-use consumption limits the value.
   - hephaestus redacts query strings in its own logs.
-- **Roots of trust**: the data key, the 1Password token and the Cloudflare token, supplied through `env` or `file` by the
-  deployment. This is the named exception to the anti-goal.
+- **Roots of trust**: the data key and the 1Password token (both from M3), supplied through `env` or `file` by the
+  deployment. This is the named exception to the anti-goal. The TLS private key is not one of them: in `file` mode
+  hephaestus reads it from the file that the external tool keeps, and holds it in memory only; in `proxy` mode it never
+  sees one.
 - **Other properties**:
   - discovery input is untrusted;
   - the mirror is read-only and allow-listed;
@@ -778,6 +819,10 @@ Per WL:504-543:
 - **D21 revised**: no Topf nodes-provider shim (owner, 2026-11-14).
 - **appkit does not exist yet**: auth, admin, config and DB are built here in appkit-shaped packages (D9).
 - **TLS 1.2 on the boot listener only if** the iPXE fallback to v2.0.0 is needed (§5.10). The default pin supports TLS 1.3.
+  In `proxy` mode the proxy's own TLS settings decide, and the README asks for TLS 1.3.
+- **In-process ACME dropped** (owner, 2026-11-15; D25). Certificates come from files that an external tool renews, or from
+  a TLS-terminating proxy (§5.10). This reverses the 2026-11-14 call for Let's Encrypt via DNS-01 on Cloudflare inside
+  hephaestus, and removes the ACME account, the DNS token and the data key from M1.
 - **Privileged ports** use file capabilities, or root as a fallback (WL:553 expects plain UID 65532).
 - **Stateful single-instance appliance** (12-Factor VI and VIII).
 - **Off-cluster image distribution** to `ghcr.io/jacaudi/hephaestus`, in addition to WL:560's registry.
@@ -797,8 +842,9 @@ Per WL:504-543:
 
 ## 11. Lab tests (must pass before relying on the feature)
 
-1. iPXE `9261ebe` (amd64 UEFI and BIOS, arm64 on the MS-R1) completes TLS 1.3 with the Go server and validates the Let's
-   Encrypt chain with internet egress blocked. On failure, fall back to v2.0.0 and TLS 1.2.
+1. iPXE `9261ebe` (amd64 UEFI and BIOS, arm64 on the MS-R1) completes TLS 1.3 with the Go server, and with the reverse
+   proxy in `proxy` mode, and validates an ISRG-rooted chain (Let's Encrypt's default) with internet egress blocked. On
+   failure, fall back to v2.0.0 and TLS 1.2.
 2. `${proxydhcp/next-server}` on the MS-R1 shim path; `undionly.kpxe` size with HTTPS enabled.
 3. Talos `talos.config` over HTTPS with ticket consumption; what Talos does after its 3 h retry window (unverified, S4 §5);
    whether UniFi leases the same IP to iPXE and to Talos (affects only the alert heuristics).

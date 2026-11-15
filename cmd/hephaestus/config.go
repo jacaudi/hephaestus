@@ -6,8 +6,6 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
-	"net/url"
-	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -18,9 +16,17 @@ import (
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
 
-	"go.jacaudi.dev/hephaestus/internal/datakey"
 	"go.jacaudi.dev/hephaestus/internal/db"
 	"go.jacaudi.dev/hephaestus/internal/secret"
+)
+
+// The values of HEPHAESTUS_TLS_MODE: where the boot HTTPS service gets TLS.
+const (
+	// tlsModeFile serves a certificate and key that an external process writes
+	// and renews, at HEPHAESTUS_TLS_CERT_FILE and HEPHAESTUS_TLS_KEY_FILE.
+	tlsModeFile = "file"
+	// tlsModeProxy serves plain HTTP to a TLS-terminating reverse proxy.
+	tlsModeProxy = "proxy"
 )
 
 // dnsLabel is one DNS label: letters, digits and inner hyphens, 1 to 63 bytes.
@@ -39,20 +45,20 @@ type rawConfig struct {
 		Address string `mapstructure:"address"`
 	} `mapstructure:"admin"`
 	Data struct {
-		Dir     string        `mapstructure:"dir"`
-		Key     secret.Secret `mapstructure:"key"`
-		KeyFile string        `mapstructure:"key_file"`
+		Dir string `mapstructure:"dir"`
 	} `mapstructure:"data"`
 	Database struct {
 		URL secret.Secret `mapstructure:"url"`
 	} `mapstructure:"database"`
-	Cloudflare struct {
-		Token     secret.Secret `mapstructure:"token"`
-		TokenFile string        `mapstructure:"token_file"`
-	} `mapstructure:"cloudflare"`
-	ACME struct {
-		DirectoryURL string `mapstructure:"directory_url"`
-	} `mapstructure:"acme"`
+	TLS struct {
+		Mode     string `mapstructure:"mode"`
+		CertFile string `mapstructure:"cert_file"`
+		KeyFile  string `mapstructure:"key_file"`
+	} `mapstructure:"tls"`
+	Proxy struct {
+		Address string   `mapstructure:"address"`
+		Trusted []string `mapstructure:"trusted"`
+	} `mapstructure:"proxy"`
 	ShutdownGrace time.Duration `mapstructure:"shutdown_grace"`
 	Log           struct {
 		Format string     `mapstructure:"format"`
@@ -62,18 +68,21 @@ type rawConfig struct {
 
 // serveConfig is the validated configuration "hephaestus serve" runs with.
 type serveConfig struct {
-	FQDN, Interface  string
-	Address          netip.Addr
-	Subnet           netip.Prefix
-	AdminAddr        netip.AddrPort
-	DataDir          string
-	DatabaseURL      secret.Secret
-	DataKey          *datakey.Key
-	CloudflareToken  secret.Secret
-	ACMEDirectoryURL string
-	ShutdownGrace    time.Duration
-	LogFormat        string
-	LogLevel         slog.Level
+	FQDN, Interface string
+	Address         netip.Addr
+	Subnet          netip.Prefix
+	AdminAddr       netip.AddrPort
+	DataDir         string
+	DatabaseURL     secret.Secret
+	// TLSMode is tlsModeFile or tlsModeProxy. In file mode TLSCertFile and
+	// TLSKeyFile are set; in proxy mode ProxyAddr and TrustedProxies are.
+	TLSMode                 string
+	TLSCertFile, TLSKeyFile string
+	ProxyAddr               netip.AddrPort
+	TrustedProxies          []netip.Prefix
+	ShutdownGrace           time.Duration
+	LogFormat               string
+	LogLevel                slog.Level
 }
 
 // loadConfig reads the bootstrap configuration from the HEPHAESTUS_ environment
@@ -91,7 +100,7 @@ func loadConfig(fs *pflag.FlagSet, addrsOf interfaceAddrs) (serveConfig, error) 
 	v.AutomaticEnv()
 	v.SetDefault("admin.address", "127.0.0.1:9090")
 	v.SetDefault("data.dir", "/var/lib/hephaestus")
-	v.SetDefault("acme.directory_url", "https://acme-v02.api.letsencrypt.org/directory")
+	v.SetDefault("tls.mode", tlsModeFile)
 	v.SetDefault("shutdown_grace", 60*time.Second)
 	v.SetDefault("log.format", "json")
 	v.SetDefault("log.level", "info")
@@ -133,11 +142,7 @@ func (r rawConfig) validate(addrsOf interfaceAddrs) (serveConfig, error) {
 		errs = append(errs, fmt.Errorf("HEPHAESTUS_DATA_DIR %q: must be an absolute path", cfg.DataDir))
 	}
 
-	cfg.DataKey, err = loadDataKey(r.Data.Key, r.Data.KeyFile)
-	errs = append(errs, err)
-
-	cfg.CloudflareToken, err = secretValue("HEPHAESTUS_CLOUDFLARE_TOKEN", r.Cloudflare.Token, r.Cloudflare.TokenFile)
-	errs = append(errs, err)
+	errs = append(errs, r.validateTLS(&cfg))
 
 	cfg.DatabaseURL = r.Database.URL
 	if cfg.DatabaseURL == "" && dirOK { // a bad data dir is already reported; don't derive a second error from it
@@ -147,11 +152,6 @@ func (r rawConfig) validate(addrsOf interfaceAddrs) (serveConfig, error) {
 		if _, _, err := db.ParseURL(cfg.DatabaseURL.Expose()); err != nil {
 			errs = append(errs, fmt.Errorf("HEPHAESTUS_DATABASE_URL: %w", err))
 		}
-	}
-
-	cfg.ACMEDirectoryURL = r.ACME.DirectoryURL
-	if u, err := url.Parse(cfg.ACMEDirectoryURL); err != nil || u.Scheme != "https" || u.Host == "" {
-		errs = append(errs, fmt.Errorf("HEPHAESTUS_ACME_DIRECTORY_URL %q: must be an https URL", cfg.ACMEDirectoryURL))
 	}
 
 	cfg.ShutdownGrace = r.ShutdownGrace
@@ -267,15 +267,10 @@ func validateInterface(name string, address netip.Addr, addrsOf interfaceAddrs) 
 // management IP, on a real port, that is not inside the provisioning subnet
 // (when that is valid).
 func validateAdmin(raw string, subnet netip.Prefix) (netip.AddrPort, error) {
-	ap, err := netip.ParseAddrPort(raw)
+	ap, err := parseAddrPort("HEPHAESTUS_ADMIN_ADDRESS", raw)
 	if err != nil {
-		return netip.AddrPort{}, fmt.Errorf("HEPHAESTUS_ADMIN_ADDRESS %q: must be IP:port", raw)
+		return netip.AddrPort{}, err
 	}
-	if ap.Port() == 0 {
-		return netip.AddrPort{}, fmt.Errorf("HEPHAESTUS_ADMIN_ADDRESS %q: port must be 1 to 65535", raw)
-	}
-	// Unmap so [::ffff:10.10.20.9]:9090 is judged as the IPv4 address it is.
-	ap = netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port())
 	if ap.Addr().IsUnspecified() {
 		return netip.AddrPort{}, fmt.Errorf("HEPHAESTUS_ADMIN_ADDRESS %q: must be a specific management IP, not a wildcard", raw)
 	}
@@ -285,36 +280,66 @@ func validateAdmin(raw string, subnet netip.Prefix) (netip.AddrPort, error) {
 	return ap, nil
 }
 
-// loadDataKey resolves HEPHAESTUS_DATA_KEY or its _FILE form and parses it.
-func loadDataKey(value secret.Secret, file string) (*datakey.Key, error) {
-	encoded, err := secretValue("HEPHAESTUS_DATA_KEY", value, file)
+// parseAddrPort parses the listen address in the environment variable name: an
+// IP address and a port from 1 to 65535. An IPv4-mapped IPv6 address is
+// unmapped, so [::ffff:10.10.20.9]:9090 is judged as the IPv4 address it is.
+func parseAddrPort(name, raw string) (netip.AddrPort, error) {
+	ap, err := netip.ParseAddrPort(raw)
 	if err != nil {
-		return nil, err
+		return netip.AddrPort{}, fmt.Errorf("%s %q: must be IP:port", name, raw)
 	}
-	key, err := datakey.Parse(encoded)
-	if err != nil {
-		return nil, fmt.Errorf("HEPHAESTUS_DATA_KEY: %w", err)
+	if ap.Port() == 0 {
+		return netip.AddrPort{}, fmt.Errorf("%s %q: port must be 1 to 65535", name, raw)
 	}
-	return key, nil
+	return netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port()), nil
 }
 
-// secretValue returns the secret named by the env var name, given directly in
-// value or as the path of a file (name_FILE); exactly one must be set. File
-// contents are whitespace-trimmed.
-func secretValue(name string, value secret.Secret, file string) (secret.Secret, error) {
-	if (value == "") == (file == "") {
-		return "", fmt.Errorf("set exactly one of %s or %s_FILE", name, name)
+// validateTLS checks the TLS settings against the mode and sets the mode's
+// fields of cfg. A variable that belongs to the other mode is an error rather
+// than ignored: a leftover HEPHAESTUS_TLS_CERT_FILE in proxy mode would
+// otherwise let an operator believe the service serves that certificate.
+func (r rawConfig) validateTLS(cfg *serveConfig) error {
+	mode := r.TLS.Mode
+	if mode != tlsModeFile && mode != tlsModeProxy {
+		return errors.New(`HEPHAESTUS_TLS_MODE must be "file" or "proxy"`)
 	}
-	if file == "" {
-		return value, nil
+	cfg.TLSMode = mode
+	errs := []error{
+		tlsSetting(mode, tlsModeFile, "HEPHAESTUS_TLS_CERT_FILE", r.TLS.CertFile != ""),
+		tlsSetting(mode, tlsModeFile, "HEPHAESTUS_TLS_KEY_FILE", r.TLS.KeyFile != ""),
+		tlsSetting(mode, tlsModeProxy, "HEPHAESTUS_PROXY_ADDRESS", r.Proxy.Address != ""),
+		tlsSetting(mode, tlsModeProxy, "HEPHAESTUS_PROXY_TRUSTED", len(r.Proxy.Trusted) > 0),
 	}
-	b, err := os.ReadFile(file) //nolint:gosec // G304: the operator names this file in startup config (a mounted secret); reading it is the feature
-	if err != nil {
-		return "", fmt.Errorf("read %s_FILE: %w", name, err)
+	if mode == tlsModeFile {
+		cfg.TLSCertFile, cfg.TLSKeyFile = r.TLS.CertFile, r.TLS.KeyFile
+		return errors.Join(errs...)
 	}
-	trimmed := strings.TrimSpace(string(b))
-	if trimmed == "" {
-		return "", fmt.Errorf("%s_FILE: file is empty", name)
+	if r.Proxy.Address != "" {
+		var err error
+		cfg.ProxyAddr, err = parseAddrPort("HEPHAESTUS_PROXY_ADDRESS", r.Proxy.Address)
+		errs = append(errs, err)
 	}
-	return secret.Secret(trimmed), nil
+	for _, entry := range r.Proxy.Trusted {
+		entry = strings.TrimSpace(entry)
+		prefix, err := netip.ParsePrefix(entry)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("HEPHAESTUS_PROXY_TRUSTED %q: must be a CIDR prefix", entry))
+			continue
+		}
+		cfg.TrustedProxies = append(cfg.TrustedProxies, prefix.Masked())
+	}
+	return errors.Join(errs...)
+}
+
+// tlsSetting is the error for the environment variable name, which is set or
+// not, under mode when usedBy is the mode that reads it: required there,
+// only valid there.
+func tlsSetting(mode, usedBy, name string, set bool) error {
+	switch {
+	case mode == usedBy && !set:
+		return fmt.Errorf("%s is required when HEPHAESTUS_TLS_MODE is %s", name, mode)
+	case mode != usedBy && set:
+		return fmt.Errorf("%s is only valid when HEPHAESTUS_TLS_MODE is %s", name, usedBy)
+	}
+	return nil
 }

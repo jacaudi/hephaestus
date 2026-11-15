@@ -16,45 +16,66 @@ task build
 | `HEPHAESTUS_PROVISIONING_INTERFACE` | required | Interface proxyDHCP listens on; it must exist and hold the provisioning address |
 | `HEPHAESTUS_PROVISIONING_ADDRESS` | required | This host's IPv4 address on the provisioning subnet |
 | `HEPHAESTUS_PROVISIONING_SUBNET` | required | Provisioning subnet, as an IPv4 CIDR prefix |
-| `HEPHAESTUS_DATA_KEY` or `HEPHAESTUS_DATA_KEY_FILE` | required (set exactly one) | Base64 32-byte key that seals stored secrets |
-| `HEPHAESTUS_CLOUDFLARE_TOKEN` or `HEPHAESTUS_CLOUDFLARE_TOKEN_FILE` | required (set exactly one) | Cloudflare token for the DNS-01 challenge |
+| `HEPHAESTUS_TLS_MODE` | `file` | `file` or `proxy`; see [TLS](#tls) |
+| `HEPHAESTUS_TLS_CERT_FILE`, `HEPHAESTUS_TLS_KEY_FILE` | required in `file` mode, an error in `proxy` mode | Certificate chain and key files, written and renewed by another process |
+| `HEPHAESTUS_PROXY_ADDRESS` | required in `proxy` mode, an error in `file` mode | `IP:port` hephaestus listens on for the reverse proxy |
+| `HEPHAESTUS_PROXY_TRUSTED` | required in `proxy` mode, an error in `file` mode | Comma-separated CIDR prefixes of the proxy's own addresses |
 | `HEPHAESTUS_ADMIN_ADDRESS` | `127.0.0.1:9090` | Admin listener; a specific management IP, never a wildcard or an address inside the provisioning subnet |
 | `HEPHAESTUS_DATA_DIR` | `/var/lib/hephaestus` | Absolute path for state |
 | `HEPHAESTUS_DATABASE_URL` | `sqlite:<data dir>/hephaestus.db` | `sqlite:/abs/path.db` or `postgres://...` |
-| `HEPHAESTUS_ACME_DIRECTORY_URL` | `https://acme-v02.api.letsencrypt.org/directory` | ACME directory (https) |
 | `HEPHAESTUS_SHUTDOWN_GRACE` | `60s` | Time allowed to drain in-flight requests on SIGINT or SIGTERM |
 | `HEPHAESTUS_LOG_LEVEL` | `info` | `slog` level |
 | `HEPHAESTUS_LOG_FORMAT` | `json` | `json` or `text` (the `--log-format` flag wins) |
 
-Generate a data key, then run it. The key encrypts what hephaestus stores, so keep a copy: losing it makes the stored secrets unreadable.
-
 ```sh
-export HEPHAESTUS_DATA_KEY="$(openssl rand -base64 32)"
-export HEPHAESTUS_CLOUDFLARE_TOKEN=...
 export HEPHAESTUS_FQDN=boot.example.com
 export HEPHAESTUS_PROVISIONING_INTERFACE=vlan20
 export HEPHAESTUS_PROVISIONING_ADDRESS=10.10.20.5
 export HEPHAESTUS_PROVISIONING_SUBNET=10.10.20.0/24
+export HEPHAESTUS_TLS_CERT_FILE=/etc/hephaestus/certs/fullchain.pem
+export HEPHAESTUS_TLS_KEY_FILE=/etc/hephaestus/certs/privkey.pem
 ./bin/hephaestus serve
 ```
 
 Ports 67, 69, 80 and 443 (proxyDHCP, TFTP, HTTP, HTTPS) are privileged; proxyDHCP also listens on 4011. The container image grants the binary `cap_net_bind_service`, which covers them, so it runs as UID 65532; a bare binary needs the same capability or root.
 
-## Run the image
+## TLS
 
-The image's default state directory is `/var/lib/hephaestus`, owned by UID 65532. Mount persistent storage there: the SQLite database holds the sealed ACME account and certificate, so losing it forces a re-issue. A bind mount must be owned by 65532. Pass the variables from the env table above.
+hephaestus never obtains a certificate. The iPXE binaries chain to `https://<HEPHAESTUS_FQDN>/boot` and trust only the ISRG roots, so the certificate must chain to them (Let's Encrypt's default chain does). `HEPHAESTUS_TLS_MODE` says who holds it.
+
+**`file` (default).** hephaestus serves a chain and key that another process writes and renews: certbot, lego, cert-manager. It reads both files at startup and refuses to start when either is unreadable, the key does not match, the leaf does not cover `HEPHAESTUS_FQDN`, or the leaf has expired. Once a minute it looks at both files, following symlinks, so a Kubernetes secret update counts. When one changed it reloads the pair under the same checks; a bad replacement is logged as a warning and the current pair keeps serving. The admin listener reports `tls:certificate` (critical; fails after the leaf expires) and `tls:expiry` (warns under 14 days). Mount the directory into the image read-only, readable by UID 65532:
 
 ```sh
-docker run --rm --network host --stop-timeout 60 -v hephaestus-data:/var/lib/hephaestus --env-file hephaestus.env hephaestus:dev
+docker run ... -v /etc/hephaestus/certs:/certs:ro \
+  -e HEPHAESTUS_TLS_CERT_FILE=/certs/fullchain.pem -e HEPHAESTUS_TLS_KEY_FILE=/certs/privkey.pem ...
+```
+
+**`proxy`.** A reverse proxy (Caddy, Traefik, Envoy) terminates TLS 1.3 with a certificate that chains to the ISRG roots, and forwards plain HTTP to `HEPHAESTUS_PROXY_ADDRESS`. hephaestus then serves `/boot`, `/discover` and `/tftp` there and binds neither the HTTPS port nor any certificate. The proxy must set `X-Forwarded-For` (Caddy, Traefik and Envoy do by default); its own address must be in `HEPHAESTUS_PROXY_TRUSTED`. hephaestus reads the client address from the rightmost `X-Forwarded-For` entry that is not a trusted proxy, and answers 403 to any peer outside the trusted list and to a request with no usable header. Point `HEPHAESTUS_FQDN`'s DNS record at the proxy. Plain HTTP `:80` (`/start`, `/tftp`) stays on hephaestus, because the embedded chain script targets the next-server address, not the name.
+
+```caddyfile
+boot.example.com {
+	tls {
+		protocols tls1.3
+	}
+	reverse_proxy 127.0.0.1:8443 # HEPHAESTUS_PROXY_ADDRESS; the proxy's address is in HEPHAESTUS_PROXY_TRUSTED
+}
+```
+
+## Run the image
+
+The image's default state directory is `/var/lib/hephaestus`, owned by UID 65532. Mount persistent storage there: the SQLite database holds the fleet. A bind mount must be owned by 65532. Pass the variables from the env table above.
+
+```sh
+docker run --rm --network host --stop-timeout 60 -v hephaestus-data:/var/lib/hephaestus -v /etc/hephaestus/certs:/certs:ro --env-file hephaestus.env hephaestus:dev
 ```
 
 What the host must provide:
 
 - `CAP_NET_BIND_SERVICE` kept. The image fails under `--cap-drop ALL` unless you also pass `--cap-add NET_BIND_SERVICE`.
-- Host networking, on the provisioning VLAN interface. proxyDHCP binds that interface (UDP 67 and 4011); TFTP, HTTP and HTTPS bind its primary address, `HEPHAESTUS_PROVISIONING_ADDRESS`.
-- A LAN DNS record for `HEPHAESTUS_FQDN` that points at that address.
-- Ports 80 and 443 on that address free: the host's own web UI must not bind 0.0.0.0:80 or 0.0.0.0:443.
-- A stop timeout of at least `HEPHAESTUS_SHUTDOWN_GRACE` (default 60s): `docker stop` waits only 10s unless you set `--stop-timeout` (compose: `stop_grace_period`).
+- Host networking, on the provisioning VLAN interface. proxyDHCP binds that interface (UDP 67 and 4011); TFTP, HTTP and, in `file` mode, HTTPS bind its primary address, `HEPHAESTUS_PROVISIONING_ADDRESS`.
+- A LAN DNS record for `HEPHAESTUS_FQDN`: that address in `file` mode, the proxy's in `proxy` mode.
+- Port 80 on that address free, and port 443 in `file` mode: the host's own web UI must not bind 0.0.0.0:80 or 0.0.0.0:443.
+- A stop timeout of at least `HEPHAESTUS_SHUTDOWN_GRACE` (default 60s): `docker stop` waits only 10s unless you set `--stop-timeout` (compose: `stop_grace_period`). The boot servers and the admin server drain against one shared grace deadline.
 
 ## Prerequisites
 
@@ -74,7 +95,7 @@ What the host must provide:
                          +---------------+------------------------+
                                          |
                               SQLite or Postgres
- TLS: Let's Encrypt certificate for HEPHAESTUS_FQDN via Cloudflare DNS-01
+ TLS: certificate files written by an external tool, or a TLS-terminating reverse proxy
 ```
 
 Machines PXE-boot, chain into iPXE over TFTP, then fetch their boot script over HTTP and HTTPS. The admin listener stays off the VLAN.

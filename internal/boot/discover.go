@@ -253,7 +253,7 @@ func (h *Handlers) readReport(w http.ResponseWriter, r *http.Request) (report, b
 		h.discoverInternalError(w, r, fmt.Errorf("boot: discover: encode facts: %w", err))
 		return report{}, false
 	}
-	source, err := sourceAddr(r.RemoteAddr)
+	source, err := clientAddr(r)
 	if err != nil {
 		// RequireSubnet has already parsed it; only a handler wired without the guard gets here.
 		h.discoverInternalError(w, r, err)

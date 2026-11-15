@@ -14,19 +14,17 @@ import (
 	"sync"
 	"time"
 
-	legolog "github.com/go-acme/lego/v4/log"
 	"github.com/spf13/cobra"
 
 	"go.jacaudi.dev/hephaestus/internal/admin"
 	"go.jacaudi.dev/hephaestus/internal/boot"
 	"go.jacaudi.dev/hephaestus/internal/boot/ipxe"
-	"go.jacaudi.dev/hephaestus/internal/datakey"
 	"go.jacaudi.dev/hephaestus/internal/db"
 	"go.jacaudi.dev/hephaestus/internal/fleet"
 	"go.jacaudi.dev/hephaestus/internal/telemetry"
 	"go.jacaudi.dev/hephaestus/internal/third_party/omniprovider/dhcp"
 	"go.jacaudi.dev/hephaestus/internal/third_party/omniprovider/tftp"
-	"go.jacaudi.dev/hephaestus/internal/tlsacme"
+	"go.jacaudi.dev/hephaestus/internal/tlscert"
 )
 
 const (
@@ -52,22 +50,28 @@ Configuration comes from the environment. Required:
   HEPHAESTUS_PROVISIONING_INTERFACE  interface proxyDHCP listens on
   HEPHAESTUS_PROVISIONING_ADDRESS    this host's address on the provisioning subnet
   HEPHAESTUS_PROVISIONING_SUBNET     provisioning subnet, as a CIDR prefix
-  HEPHAESTUS_DATA_KEY                base64 32-byte key that seals stored secrets
-                                     (or HEPHAESTUS_DATA_KEY_FILE)
-  HEPHAESTUS_CLOUDFLARE_TOKEN        Cloudflare token for the DNS-01 challenge
-                                     (or HEPHAESTUS_CLOUDFLARE_TOKEN_FILE)
+
+TLS comes from one of two sources, chosen by HEPHAESTUS_TLS_MODE:
+  file (default)  HEPHAESTUS_TLS_CERT_FILE and HEPHAESTUS_TLS_KEY_FILE name a
+                  certificate chain and key that another process (certbot, lego,
+                  cert-manager) writes and renews; changes are picked up within
+                  a minute
+  proxy           a reverse proxy terminates TLS 1.3 and forwards plain HTTP to
+                  HEPHAESTUS_PROXY_ADDRESS (IP:port); HEPHAESTUS_PROXY_TRUSTED
+                  lists the proxies' CIDR prefixes, comma separated, and the
+                  client address is taken from their X-Forwarded-For header
 
 Optional: HEPHAESTUS_ADMIN_ADDRESS, HEPHAESTUS_DATA_DIR, HEPHAESTUS_DATABASE_URL,
-HEPHAESTUS_ACME_DIRECTORY_URL, HEPHAESTUS_SHUTDOWN_GRACE, HEPHAESTUS_LOG_LEVEL and
-HEPHAESTUS_LOG_FORMAT (or --log-format).
+HEPHAESTUS_SHUTDOWN_GRACE, HEPHAESTUS_LOG_LEVEL and HEPHAESTUS_LOG_FORMAT (or
+--log-format).
 
 The process stops on SIGINT or SIGTERM after draining in-flight requests.`,
 		Example: `  HEPHAESTUS_FQDN=boot.example.com \
   HEPHAESTUS_PROVISIONING_INTERFACE=vlan20 \
   HEPHAESTUS_PROVISIONING_ADDRESS=10.10.20.5 \
   HEPHAESTUS_PROVISIONING_SUBNET=10.10.20.0/24 \
-  HEPHAESTUS_DATA_KEY_FILE=/run/secrets/data_key \
-  HEPHAESTUS_CLOUDFLARE_TOKEN_FILE=/run/secrets/cloudflare_token \
+  HEPHAESTUS_TLS_CERT_FILE=/certs/fullchain.pem \
+  HEPHAESTUS_TLS_KEY_FILE=/certs/privkey.pem \
   hephaestus serve`,
 		Args: noArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -81,8 +85,6 @@ The process stops on SIGINT or SIGTERM after draining in-flight requests.`,
 			if err != nil {
 				return err
 			}
-			legolog.Logger = slog.NewLogLogger(logger.Handler(), slog.LevelInfo)
-
 			ctx := cmd.Context()
 			if err := listenAndServe(ctx, cfg, logger); err != nil {
 				return fatalLogged(ctx, logger, err)
@@ -99,20 +101,27 @@ func listenAndServe(ctx context.Context, cfg serveConfig, logger *slog.Logger) e
 	if err != nil {
 		return fmt.Errorf("load iPXE binaries: %w", err)
 	}
+	// The second boot listener is HTTPS on the provisioning address in file
+	// mode, and the proxy's upstream in proxy mode.
+	bootTLSAddr := netip.AddrPortFrom(cfg.Address, bootHTTPSPort)
+	if cfg.TLSMode == tlsModeProxy {
+		bootTLSAddr = cfg.ProxyAddr
+	}
 	lns, err := listen(ctx,
 		netip.AddrPortFrom(cfg.Address, bootHTTPPort).String(),
-		netip.AddrPortFrom(cfg.Address, bootHTTPSPort).String(),
+		bootTLSAddr.String(),
 		cfg.AdminAddr.String(),
 	)
 	if err != nil {
 		return err
 	}
-	return runServe(ctx, cfg, logger, serveDeps{
-		newIssuer: legoIssuerFactory(cfg),
-		httpLn:    lns[0], httpsLn: lns[1], adminLn: lns[2],
-		udp:   true,
-		files: files,
-	})
+	deps := serveDeps{httpLn: lns[0], adminLn: lns[2], udp: true, files: files}
+	if cfg.TLSMode == tlsModeProxy {
+		deps.proxyLn = lns[1]
+	} else {
+		deps.httpsLn = lns[1]
+	}
+	return runServe(ctx, cfg, logger, deps)
 }
 
 // fatalLogged logs err at Error level and returns it marked as logged, so main
@@ -122,30 +131,13 @@ func fatalLogged(ctx context.Context, logger *slog.Logger, err error) error {
 	return loggedError{err}
 }
 
-// legoIssuerFactory returns the serveDeps.newIssuer that issues through Let's
-// Encrypt (or the configured ACME directory) with DNS-01 on Cloudflare.
-func legoIssuerFactory(cfg serveConfig) func(context.Context, *tlsacme.Repository, *datakey.Key) (tlsacme.Issuer, error) {
-	return func(ctx context.Context, repo *tlsacme.Repository, key *datakey.Key) (tlsacme.Issuer, error) {
-		iss := tlsacme.NewLegoIssuer(tlsacme.LegoConfig{
-			DirectoryURL:    cfg.ACMEDirectoryURL,
-			CloudflareToken: cfg.CloudflareToken,
-			Repo:            repo,
-			Key:             key,
-		})
-		if err := iss.Load(ctx); err != nil {
-			return nil, err
-		}
-		return iss, nil
-	}
-}
-
 // serveDeps are the parts of runServe a test replaces.
 type serveDeps struct {
-	// newIssuer builds the certificate issuer; an error stops startup.
-	newIssuer func(context.Context, *tlsacme.Repository, *datakey.Key) (tlsacme.Issuer, error)
-	// httpLn, httpsLn and adminLn are the boot HTTP, boot HTTPS and admin
-	// listeners. runServe owns them and closes them on return.
-	httpLn, httpsLn, adminLn net.Listener
+	// httpLn and adminLn are the boot HTTP and admin listeners. httpsLn is the
+	// boot HTTPS listener in file mode, and proxyLn the listener a TLS-terminating
+	// proxy forwards to in proxy mode: exactly one of the two is set. runServe
+	// owns them and closes them on return.
+	httpLn, httpsLn, proxyLn, adminLn net.Listener
 	// udp starts proxyDHCP and TFTP. Tests set it false: both bind fixed
 	// privileged UDP ports.
 	udp bool
@@ -168,11 +160,15 @@ func listen(ctx context.Context, addrs ...string) ([]net.Listener, error) {
 	return lns, nil
 }
 
-// closeAll closes every listener and returns the failures. A listener that is
-// already closed (http.Server closes the one it serves) is not a failure.
+// closeAll closes every listener that is set and returns the failures. A
+// listener that is already closed (http.Server closes the one it serves) is not
+// a failure.
 func closeAll(lns ...net.Listener) error {
 	var errs []error
 	for _, ln := range lns {
+		if ln == nil {
+			continue
+		}
 		if err := ln.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 			errs = append(errs, err)
 		}
@@ -183,7 +179,7 @@ func closeAll(lns ...net.Listener) error {
 // runServe runs the service until ctx is done or a component fails, then
 // shuts down in order. It returns nil after a clean stop.
 func runServe(ctx context.Context, cfg serveConfig, logger *slog.Logger, deps serveDeps) (err error) {
-	defer func() { err = errors.Join(err, closeAll(deps.httpLn, deps.httpsLn, deps.adminLn)) }()
+	defer func() { err = errors.Join(err, closeAll(deps.httpLn, deps.httpsLn, deps.proxyLn, deps.adminLn)) }()
 
 	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
 		return fmt.Errorf("create data dir: %w", err)
@@ -209,29 +205,28 @@ func runServe(ctx context.Context, cfg serveConfig, logger *slog.Logger, deps se
 	}
 
 	repo := fleet.NewRepository(dbh)
-	acmeRepo := tlsacme.NewRepository(dbh)
-	iss, err := deps.newIssuer(ctx, acmeRepo, cfg.DataKey)
-	if err != nil {
-		return fmt.Errorf("build certificate issuer: %w", err)
-	}
-	mgr, err := tlsacme.NewManager(acmeRepo, cfg.DataKey, iss, cfg.FQDN,
-		tlsacme.WithDirectoryURL(cfg.ACMEDirectoryURL),
-		tlsacme.WithMeter(metrics.Meter()),
-		tlsacme.WithErrorHandler(func(ctx context.Context, err error) {
-			logger.WarnContext(ctx, "certificate renewal failed", "error", err)
-		}),
-	)
-	if err != nil {
-		return err
-	}
-	if err := mgr.Load(ctx); err != nil {
-		return err
+
+	// File mode serves the certificate files; an unusable pair stops startup
+	// before anything serves. Proxy mode has no certificate: the proxy holds it.
+	var loader *tlscert.Loader
+	var tlsChecks []admin.Check
+	if cfg.TLSMode == tlsModeFile {
+		loader, err = tlscert.NewLoader(cfg.TLSCertFile, cfg.TLSKeyFile, cfg.FQDN,
+			tlscert.WithMeter(metrics.Meter()),
+			tlscert.WithErrorHandler(func(err error) {
+				logger.WarnContext(ctx, "certificate reload failed", "error", err)
+			}),
+		)
+		if err != nil {
+			return fmt.Errorf("load TLS certificate: %w", err)
+		}
+		tlsChecks = loader.Checks()
 	}
 
 	registry := admin.NewRegistry(slices.Concat(
 		dbh.Checks(),
 		[]admin.Check{admin.DiskCheck("disk:data_dir", cfg.DataDir, minFreeDisk)},
-		mgr.Checks(),
+		tlsChecks,
 	)...)
 	registry.RunOnce(ctx)
 
@@ -245,6 +240,7 @@ func runServe(ctx context.Context, cfg serveConfig, logger *slog.Logger, deps se
 		"address", cfg.Address.String(),
 		"subnet", cfg.Subnet.String(),
 		"admin_address", cfg.AdminAddr.String(),
+		"tls_mode", cfg.TLSMode,
 		"data_dir", cfg.DataDir,
 		"database", string(dbh.Dialect()),
 	)
@@ -258,15 +254,22 @@ func runServe(ctx context.Context, cfg serveConfig, logger *slog.Logger, deps se
 	// HTTPS. Every other boot route redirects to HTTPS. (All binaries, BIOS
 	// included, are built with HTTPS support; TLS is not what is missing here.)
 	httpHandler := telemetry.WideEvents(metrics.Instrument(handlers.PlainHTTP(), "boot-http", deps.httpLn.Addr().String()), logger, slog.LevelInfo)
-	httpsHandler := telemetry.WideEvents(metrics.Instrument(handlers.TLS(), "boot-https", deps.httpsLn.Addr().String()), logger, slog.LevelInfo)
 
-	httpsSrv := newServer(deps.httpsLn, httpsHandler, time.Minute, logger)
-	httpsSrv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS13, GetCertificate: mgr.GetCertificate}
 	p := &plane{
-		cfg: cfg, deps: deps, logger: logger, life: life, registry: registry, mgr: mgr,
+		cfg: cfg, deps: deps, logger: logger, life: life, registry: registry, loader: loader,
 		adminSrv: newServer(deps.adminLn, adminHandler, 10*time.Second, logger),
 		httpSrv:  newServer(deps.httpLn, httpHandler, time.Minute, logger),
-		httpsSrv: httpsSrv,
+	}
+	if cfg.TLSMode == tlsModeProxy {
+		// The proxy terminates TLS and forwards the TLS routes as plain HTTP, so
+		// this server does no TLS itself and trusts the client address only from
+		// the proxies in cfg.TrustedProxies.
+		proxyHandler := telemetry.WideEvents(metrics.Instrument(handlers.Proxied(cfg.TrustedProxies), "boot-proxy", deps.proxyLn.Addr().String()), logger, slog.LevelInfo)
+		p.proxySrv = newServer(deps.proxyLn, proxyHandler, time.Minute, logger)
+	} else {
+		httpsHandler := telemetry.WideEvents(metrics.Instrument(handlers.TLS(), "boot-https", deps.httpsLn.Addr().String()), logger, slog.LevelInfo)
+		p.httpsSrv = newServer(deps.httpsLn, httpsHandler, time.Minute, logger)
+		p.httpsSrv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS13, GetCertificate: loader.GetCertificate}
 	}
 	return p.run(ctx)
 }
@@ -293,16 +296,21 @@ type plane struct {
 	logger   *slog.Logger
 	life     *admin.Lifecycle
 	registry *admin.Registry
-	mgr      *tlsacme.Manager
+	// loader serves and follows the certificate files; nil in proxy mode.
+	loader *tlscert.Loader
 
-	adminSrv, httpSrv, httpsSrv *http.Server
+	adminSrv, httpSrv *http.Server
+	// httpsSrv is the boot HTTPS server in file mode and proxySrv the one behind
+	// the TLS-terminating proxy in proxy mode; the other is nil.
+	httpsSrv, proxySrv *http.Server
 }
 
 // run starts every component, marks the service ready and serves until ctx is
 // done or a component fails. It then shuts down in this order: proxyDHCP;
 // the boot servers (draining requests); TFTP, the checks and the certificate
-// manager; the admin server, which stays up the longest so probes and
-// metrics see the drain. It returns the failure that stopped the service, if
+// loader; the admin server, which stays up the longest so probes and metrics
+// see the drain. The two server drains share one ShutdownGrace deadline, set
+// when draining starts. It returns the failure that stopped the service, if
 // any, joined with the shutdown errors.
 func (p *plane) run(ctx context.Context) error {
 	runCtx, stop := context.WithCancel(ctx)
@@ -318,10 +326,20 @@ func (p *plane) run(ctx context.Context) error {
 	proxy, web, work, adm := &stage{stop: stop}, &stage{stop: stop}, &stage{stop: stop}, &stage{stop: stop}
 
 	adm.start("admin server", func() error { return serveErr(p.adminSrv.Serve(p.deps.adminLn)) })
+	bootSrvs := []*http.Server{p.httpSrv}
 	web.start("boot http server", func() error { return serveErr(p.httpSrv.Serve(p.deps.httpLn)) })
-	web.start("boot https server", func() error { return serveErr(p.httpsSrv.ServeTLS(p.deps.httpsLn, "", "")) })
+	if p.httpsSrv != nil {
+		bootSrvs = append(bootSrvs, p.httpsSrv)
+		web.start("boot https server", func() error { return serveErr(p.httpsSrv.ServeTLS(p.deps.httpsLn, "", "")) })
+	}
+	if p.proxySrv != nil {
+		bootSrvs = append(bootSrvs, p.proxySrv)
+		web.start("boot proxy server", func() error { return serveErr(p.proxySrv.Serve(p.deps.proxyLn)) })
+	}
 	work.start("health checks", func() error { p.registry.Run(workCtx); return nil })
-	work.start("certificate manager", func() error { return p.mgr.Run(workCtx) })
+	if p.loader != nil {
+		work.start("certificate loader", func() error { return p.loader.Run(workCtx) })
+	}
 	if p.deps.udp {
 		addr := p.cfg.Address.String()
 		dhcpProxy := dhcp.NewProxy(addr, bootHTTPPort, p.cfg.Interface, false, p.logger.With("component", "dhcp_proxy"))
@@ -343,7 +361,7 @@ func (p *plane) run(ctx context.Context) error {
 	stopProxy()
 	proxyErr := proxy.wait()
 
-	webErr := errors.Join(shutdownAll(drainCtx, p.httpSrv, p.httpsSrv), web.wait())
+	webErr := errors.Join(shutdownAll(drainCtx, bootSrvs...), web.wait())
 
 	stopWork()
 	workErr := work.wait()

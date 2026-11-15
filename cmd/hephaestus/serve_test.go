@@ -9,6 +9,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"net/netip"
@@ -20,61 +21,65 @@ import (
 
 	"go.uber.org/goleak"
 
-	"go.jacaudi.dev/hephaestus/internal/datakey"
-	"go.jacaudi.dev/hephaestus/internal/db"
 	"go.jacaudi.dev/hephaestus/internal/secret"
-	"go.jacaudi.dev/hephaestus/internal/tlsacme"
-	"go.jacaudi.dev/hephaestus/internal/tlsacme/tlsacmetest"
+	"go.jacaudi.dev/hephaestus/internal/tlscert/tlscerttest"
 )
 
 const (
-	// otherDataKey is a valid data key that is not testDataKey.
-	otherDataKey = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
 	// bootQuery is a well-formed /boot query for a machine in the fleet.
 	bootQuery = "uuid=4c4c4544-0042-3510-8052-b4c04f4e4d32&mac=aa-bb-cc-00-00-01&arch=x86_64&serial=S1&product=P1"
+	// testFQDN is the name the test certificates cover.
+	testFQDN = "hephaestus.example.test"
 )
 
-// testServeConfig is a serveConfig for a loopback run in a fresh data dir.
+// testServeConfig is a serveConfig for a loopback run in a fresh data dir, in
+// file mode with a self-signed certificate for testFQDN.
 func testServeConfig(t *testing.T) serveConfig {
 	t.Helper()
 
-	key, err := datakey.Parse(secret.Secret(testDataKey))
-	if err != nil {
-		t.Fatalf("datakey.Parse: %v", err)
-	}
 	dir := t.TempDir()
+	certFile, keyFile := writeTestCert(t, testFQDN)
 	return serveConfig{
-		FQDN:          "hephaestus.example.test",
+		FQDN:          testFQDN,
 		Interface:     "lo0",
 		Address:       netip.MustParseAddr("127.0.0.1"),
 		Subnet:        netip.MustParsePrefix("127.0.0.0/8"),
 		DataDir:       dir,
 		DatabaseURL:   secret.Secret("sqlite:" + filepath.Join(dir, "h.db")),
-		DataKey:       key,
+		TLSMode:       tlsModeFile,
+		TLSCertFile:   certFile,
+		TLSKeyFile:    keyFile,
 		ShutdownGrace: 5 * time.Second,
 		LogFormat:     "json",
 		LogLevel:      slog.LevelInfo,
 	}
 }
 
-// selfSignedIssuer is a serveDeps.newIssuer that issues self-signed
-// certificates; with a non-nil block it never issues until block is closed.
-func selfSignedIssuer(block <-chan struct{}) func(context.Context, *tlsacme.Repository, *datakey.Key) (tlsacme.Issuer, error) {
-	return func(context.Context, *tlsacme.Repository, *datakey.Key) (tlsacme.Issuer, error) {
-		return &tlsacmetest.SelfSigned{
-			NotBefore: time.Now().Add(-time.Hour),
-			NotAfter:  time.Now().Add(90 * 24 * time.Hour),
-			Block:     block,
-		}, nil
-	}
+// testProxyConfig is testServeConfig in proxy mode. The one trusted proxy is the
+// test client's own address, 127.0.0.1: trusting all of 127.0.0.0/8 would make
+// the 127.0.0.9 client the tests name another trusted proxy, which is refused.
+func testProxyConfig(t *testing.T) serveConfig {
+	t.Helper()
+
+	cfg := testServeConfig(t)
+	cfg.TLSMode, cfg.TLSCertFile, cfg.TLSKeyFile = tlsModeProxy, "", ""
+	cfg.TrustedProxies = []netip.Prefix{netip.MustParsePrefix("127.0.0.1/32")}
+	return cfg
 }
 
-// testDeps listens on three loopback ports; runServe takes ownership of them.
-func testDeps(t *testing.T, newIssuer func(context.Context, *tlsacme.Repository, *datakey.Key) (tlsacme.Issuer, error)) serveDeps {
+// writeTestCert writes a self-signed certificate for name, valid now for 90
+// days, and returns its certificate and key files.
+func writeTestCert(t *testing.T, name string) (certFile, keyFile string) {
+	t.Helper()
+	return tlscerttest.WriteSelfSigned(t, t.TempDir(), name, time.Now().Add(-time.Hour), time.Now().Add(90*24*time.Hour))
+}
+
+// listenLoopback opens n loopback listeners; runServe takes ownership of the ones it is given.
+func listenLoopback(t *testing.T, n int) []net.Listener {
 	t.Helper()
 
 	var lc net.ListenConfig
-	var lns [3]net.Listener
+	lns := make([]net.Listener, n)
 	for i := range lns {
 		ln, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
 		if err != nil {
@@ -82,15 +87,33 @@ func testDeps(t *testing.T, newIssuer func(context.Context, *tlsacme.Repository,
 		}
 		lns[i] = ln
 	}
-	return serveDeps{
-		newIssuer: newIssuer,
-		httpLn:    lns[0], httpsLn: lns[1], adminLn: lns[2],
-		files: map[string][]byte{"amd64/snp.efi": []byte("amd64-efi"), "arm64/snp.efi": []byte("arm64-efi")},
-	}
+	return lns
+}
+
+// testFiles are the iPXE binaries the test servers serve.
+func testFiles() map[string][]byte {
+	return map[string][]byte{"amd64/snp.efi": []byte("amd64-efi"), "arm64/snp.efi": []byte("arm64-efi")}
+}
+
+// testDeps is the file-mode wiring: boot HTTP, boot HTTPS and admin listeners.
+func testDeps(t *testing.T) serveDeps {
+	t.Helper()
+
+	lns := listenLoopback(t, 3)
+	return serveDeps{httpLn: lns[0], httpsLn: lns[1], adminLn: lns[2], files: testFiles()}
+}
+
+// testProxyDeps is the proxy-mode wiring: boot HTTP, proxy and admin listeners.
+func testProxyDeps(t *testing.T) serveDeps {
+	t.Helper()
+
+	lns := listenLoopback(t, 3)
+	return serveDeps{httpLn: lns[0], proxyLn: lns[1], adminLn: lns[2], files: testFiles()}
 }
 
 func (d serveDeps) httpURL() string  { return "http://" + d.httpLn.Addr().String() }
 func (d serveDeps) httpsURL() string { return "https://" + d.httpsLn.Addr().String() }
+func (d serveDeps) proxyURL() string { return "http://" + d.proxyLn.Addr().String() }
 func (d serveDeps) adminURL() string { return "http://" + d.adminLn.Addr().String() }
 
 // discardLogger drops every record.
@@ -140,8 +163,19 @@ type reply struct {
 // get fetches url and fails the test on a transport error.
 func get(t *testing.T, client *http.Client, url string) reply {
 	t.Helper()
+	return getWith(t, client, url, nil)
+}
 
-	resp, err := getE(t.Context(), client, url)
+// getWith is get with extra request headers.
+func getWith(t *testing.T, client *http.Client, url string, header http.Header) reply {
+	t.Helper()
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, url, http.NoBody)
+	if err != nil {
+		t.Fatalf("build GET %s: %v", url, err)
+	}
+	maps.Copy(req.Header, header)
+	resp, err := client.Do(req)
 	if err != nil {
 		t.Fatalf("GET %s: %v", url, err)
 	}
@@ -262,40 +296,11 @@ func requireUnanswered(t *testing.T, probe <-chan probeResult) {
 	}
 }
 
-// waitStored polls until the certificate for cfg.FQDN is in the database, so
-// stopping the service cannot race the Manager's store.
-func waitStored(t *testing.T, cfg serveConfig) {
-	t.Helper()
-
-	handle, err := db.Open(t.Context(), cfg.DatabaseURL)
-	if err != nil {
-		t.Fatalf("db.Open: %v", err)
-	}
-	defer func() {
-		if err := handle.Close(); err != nil {
-			t.Errorf("close db: %v", err)
-		}
-	}()
-	repo := tlsacme.NewRepository(handle)
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		_, ok, err := repo.LoadCertificate(t.Context(), cfg.FQDN)
-		if err != nil {
-			t.Fatalf("LoadCertificate: %v", err)
-		}
-		if ok {
-			return
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	t.Fatal("the issued certificate was not stored within 10s")
-}
-
 func TestRunServe_ServesAndDrains(t *testing.T) {
 	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 
 	cfg := testServeConfig(t)
-	deps := testDeps(t, selfSignedIssuer(nil))
+	deps := testDeps(t)
 	stop, done := startServe(t, cfg, discardLogger(), deps)
 	waitStatus(t, deps.adminURL()+"/readyz", done)
 
@@ -323,6 +328,15 @@ func TestRunServe_ServesAndDrains(t *testing.T) {
 	if !strings.Contains(metrics.body, "hephaestus_boot_decisions_total") {
 		t.Errorf("GET /metrics lacks hephaestus_boot_decisions_total:\n%s", metrics.body)
 	}
+	if !strings.Contains(metrics.body, "hephaestus_tls_certificate_days_left") {
+		t.Errorf("GET /metrics lacks hephaestus_tls_certificate_days_left:\n%s", metrics.body)
+	}
+	health := get(t, testClient(nil), deps.adminURL()+"/health")
+	for _, check := range []string{"tls:certificate", "tls:expiry"} {
+		if !strings.Contains(health.body, check) {
+			t.Errorf("GET /health lacks the %s check:\n%s", check, health.body)
+		}
+	}
 
 	stop()
 	if err := waitDone(t, done, 10*time.Second); err != nil {
@@ -336,7 +350,7 @@ func TestRunServe_MetricsIgnoreHostHeader(t *testing.T) {
 	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 
 	cfg := testServeConfig(t)
-	deps := testDeps(t, selfSignedIssuer(nil))
+	deps := testDeps(t)
 	stop, done := startServe(t, cfg, discardLogger(), deps)
 	waitStatus(t, deps.adminURL()+"/readyz", done)
 
@@ -373,7 +387,7 @@ func TestRunServe_TLS12Refused(t *testing.T) {
 	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 
 	cfg := testServeConfig(t)
-	deps := testDeps(t, selfSignedIssuer(nil))
+	deps := testDeps(t)
 	stop, done := startServe(t, cfg, discardLogger(), deps)
 	waitStatus(t, deps.adminURL()+"/readyz", done)
 
@@ -395,66 +409,57 @@ func TestRunServe_TLS12Refused(t *testing.T) {
 	}
 }
 
-func TestRunServe_WrongDataKeyFails(t *testing.T) {
+// TestRunServe_CertificateForOtherNameFails pins that a certificate that does
+// not cover HEPHAESTUS_FQDN stops startup before anything serves: the admin
+// listener never answers the probe that waits in its backlog.
+func TestRunServe_CertificateForOtherNameFails(t *testing.T) {
 	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 
 	cfg := testServeConfig(t)
-	deps := testDeps(t, selfSignedIssuer(nil))
-	stop, done := startServe(t, cfg, discardLogger(), deps)
-	waitStatus(t, deps.adminURL()+"/readyz", done)
-	waitStored(t, cfg)
-	stop()
-	if err := waitDone(t, done, 10*time.Second); err != nil {
-		t.Fatalf("first run after cancel = %v, want nil", err)
-	}
-
-	other, err := datakey.Parse(secret.Secret(otherDataKey))
-	if err != nil {
-		t.Fatalf("datakey.Parse: %v", err)
-	}
-	cfg.DataKey = other
-	deps = testDeps(t, selfSignedIssuer(nil))
+	cfg.TLSCertFile, cfg.TLSKeyFile = writeTestCert(t, "other.example.test")
+	deps := testDeps(t)
 	probe := probeReadyz(t, deps)
-	_, done = startServe(t, cfg, discardLogger(), deps)
+	_, done := startServe(t, cfg, discardLogger(), deps)
 
-	err = waitDone(t, done, 10*time.Second)
-	if err == nil {
-		t.Fatal("second run with the other data key returned nil, want an error")
-	}
-	if want := "cannot be decrypted with the configured data key"; !strings.Contains(err.Error(), want) {
-		t.Errorf("second run error = %v, want it to contain %q", err, want)
+	err := waitDone(t, done, 10*time.Second)
+
+	if want := "does not cover " + testFQDN; err == nil || !strings.Contains(err.Error(), want) {
+		t.Errorf("runServe = %v, want an error containing %q", err, want)
 	}
 	requireUnanswered(t, probe)
 }
 
-// TestRunServe_OtherDirectoryCertificateReissued pins that a certificate stored
-// under one ACME directory is not served once HEPHAESTUS_ACME_DIRECTORY_URL
-// names another: the second run obtains its own certificate before it is ready.
-func TestRunServe_OtherDirectoryCertificateReissued(t *testing.T) {
+// TestRunServe_ProxyMode pins proxy mode end to end: the proxy listener serves
+// the TLS routes over plain HTTP to a trusted proxy that names a client, refuses
+// a request that names none, and the service is ready with no TLS check.
+func TestRunServe_ProxyMode(t *testing.T) {
 	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 
-	cfg := testServeConfig(t)
-	cfg.ACMEDirectoryURL = "https://acme-staging.example.test/directory"
-	deps := testDeps(t, selfSignedIssuer(nil))
+	cfg := testProxyConfig(t)
+	deps := testProxyDeps(t)
 	stop, done := startServe(t, cfg, discardLogger(), deps)
 	waitStatus(t, deps.adminURL()+"/readyz", done)
-	waitStored(t, cfg)
-	stop()
-	if err := waitDone(t, done, 10*time.Second); err != nil {
-		t.Fatalf("first run after cancel = %v, want nil", err)
+	client := testClient(nil)
+
+	named := getWith(t, client, deps.proxyURL()+"/boot?"+bootQuery, http.Header{"X-Forwarded-For": {"127.0.0.9"}})
+	if named.status != http.StatusOK {
+		t.Errorf("GET /boot with X-Forwarded-For status = %d, want 200", named.status)
+	}
+	if !strings.HasPrefix(named.body, "#!ipxe\nparams\n") {
+		t.Errorf("GET /boot with X-Forwarded-For body = %q, want the boot decision script starting with params", named.body)
+	}
+	if anonymous := get(t, client, deps.proxyURL()+"/boot?"+bootQuery); anonymous.status != http.StatusForbidden {
+		t.Errorf("GET /boot without X-Forwarded-For status = %d, want 403", anonymous.status)
 	}
 
-	cfg.ACMEDirectoryURL = "https://acme.example.test/directory"
-	iss := &tlsacmetest.SelfSigned{NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(90 * 24 * time.Hour)}
-	deps = testDeps(t, func(context.Context, *tlsacme.Repository, *datakey.Key) (tlsacme.Issuer, error) { return iss, nil })
-	stop, done = startServe(t, cfg, discardLogger(), deps)
-	waitStatus(t, deps.adminURL()+"/readyz", done)
-	if got := iss.Calls.Load(); got != 1 {
-		t.Errorf("issuer calls on the second directory = %d, want 1", got)
+	health := get(t, client, deps.adminURL()+"/health")
+	if strings.Contains(health.body, "tls:") {
+		t.Errorf("GET /health lists a TLS check in proxy mode:\n%s", health.body)
 	}
+
 	stop()
 	if err := waitDone(t, done, 10*time.Second); err != nil {
-		t.Errorf("second run after cancel = %v, want nil", err)
+		t.Errorf("runServe after cancel = %v, want nil", err)
 	}
 }
 
@@ -488,43 +493,6 @@ func TestServeCmd_InheritedPersistentFlag(t *testing.T) {
 	}
 }
 
-func TestRunServe_IssuerFactoryErrorStops(t *testing.T) {
-	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
-
-	cfg := testServeConfig(t)
-	deps := testDeps(t, func(context.Context, *tlsacme.Repository, *datakey.Key) (tlsacme.Issuer, error) {
-		// Give an admin server that started too early time to answer the probe.
-		time.Sleep(200 * time.Millisecond)
-		return nil, errors.New("account check failed")
-	})
-	probe := probeReadyz(t, deps)
-	_, done := startServe(t, cfg, discardLogger(), deps)
-
-	err := waitDone(t, done, 10*time.Second)
-	if err == nil || !strings.Contains(err.Error(), "account check failed") {
-		t.Errorf("runServe = %v, want an error containing %q", err, "account check failed")
-	}
-	requireUnanswered(t, probe)
-}
-
-func TestRunServe_ShutdownAbandonsObtain(t *testing.T) {
-	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
-
-	cfg := testServeConfig(t)
-	cfg.ShutdownGrace = 2 * time.Second
-	block := make(chan struct{})
-	defer close(block) // runs before goleak: lets the abandoned Obtain finish
-
-	deps := testDeps(t, selfSignedIssuer(block))
-	stop, done := startServe(t, cfg, discardLogger(), deps)
-	waitStatus(t, deps.adminURL()+"/healthz", done)
-
-	stop()
-	if err := waitDone(t, done, cfg.ShutdownGrace+time.Second); err != nil {
-		t.Errorf("runServe after cancel = %v, want nil", err)
-	}
-}
-
 // holdOpen connects to addr and sends the start of a request without finishing
 // it, so the server counts the connection as in flight until it is cut. The
 // connection is closed when the test ends.
@@ -554,7 +522,7 @@ func TestRunServe_DrainSharesOneGrace(t *testing.T) {
 
 	cfg := testServeConfig(t)
 	cfg.ShutdownGrace = 2 * time.Second
-	deps := testDeps(t, selfSignedIssuer(nil))
+	deps := testDeps(t)
 	stop, done := startServe(t, cfg, discardLogger(), deps)
 	waitStatus(t, deps.adminURL()+"/readyz", done)
 	holdOpen(t, deps.httpLn.Addr().String())
@@ -577,7 +545,7 @@ func TestRunServe_AdminWideEvents(t *testing.T) {
 
 	var logs bytes.Buffer
 	cfg := testServeConfig(t)
-	deps := testDeps(t, selfSignedIssuer(nil))
+	deps := testDeps(t)
 	stop, done := startServe(t, cfg, slog.New(slog.NewJSONHandler(&logs, nil)), deps)
 	waitStatus(t, deps.adminURL()+"/healthz", done)
 
@@ -606,7 +574,7 @@ func TestRunServe_LogsDrainAndStop(t *testing.T) {
 
 	var logs bytes.Buffer
 	cfg := testServeConfig(t)
-	deps := testDeps(t, selfSignedIssuer(nil))
+	deps := testDeps(t)
 	stop, done := startServe(t, cfg, slog.New(slog.NewJSONHandler(&logs, nil)), deps)
 	waitStatus(t, deps.adminURL()+"/readyz", done)
 
@@ -677,7 +645,7 @@ func TestRunServe_ComponentFailureStopsEverything(t *testing.T) {
 	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 
 	cfg := testServeConfig(t)
-	deps := testDeps(t, selfSignedIssuer(nil))
+	deps := testDeps(t)
 	if err := deps.httpLn.Close(); err != nil { // Serve on a closed listener fails at once
 		t.Fatalf("close listener: %v", err)
 	}

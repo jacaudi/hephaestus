@@ -130,13 +130,14 @@ func NewHandlers(repo *fleet.Repository, fqdn string, subnet netip.Prefix, files
 func (h *Handlers) PlainHTTP() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /start", h.start)
-	mux.HandleFunc("GET /boot", h.boot)
+	mux.HandleFunc("GET /boot", h.chain)
 	mux.HandleFunc("GET /tftp/{arch}/snp.efi", h.tftp)
 	return RequireSubnet(h.subnet, mux)
 }
 
 // TLS returns the handler for the TLS listener: /boot, /discover and the iPXE
-// binaries, behind the subnet guard.
+// binaries, behind the subnet guard. Which listener a request came in on, not
+// the request, says it is a TLS one: serving it is what makes /boot decide.
 func (h *Handlers) TLS() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /boot", h.boot)
@@ -145,18 +146,27 @@ func (h *Handlers) TLS() http.Handler {
 	return RequireSubnet(h.subnet, mux)
 }
 
+// Proxied returns the handler for the listener a TLS-terminating reverse proxy
+// forwards to: the TLS routes, for clients named by X-Forwarded-For from a peer
+// inside trusted (see TrustProxies). The request arrives as plain HTTP because
+// the proxy has already terminated the TLS.
+func (h *Handlers) Proxied(trusted []netip.Prefix) http.Handler {
+	return TrustProxies(trusted, h.TLS())
+}
+
 // start answers every request with the chain script, whatever it says.
 func (h *Handlers) start(w http.ResponseWriter, r *http.Request) {
 	h.writeScript(w, r, StartScript(h.fqdn))
 }
 
-// boot answers /boot. Over plain HTTP it only chains to TLS, without parsing
-// the query or touching the database; over TLS it decides, records and renders.
+// chain answers /boot on the plain-HTTP listener: it only chains to TLS,
+// without parsing the query or touching the database.
+func (h *Handlers) chain(w http.ResponseWriter, r *http.Request) {
+	h.serve(w, r, Decide(Input{}))
+}
+
+// boot answers /boot on a TLS listener: it decides, records and renders.
 func (h *Handlers) boot(w http.ResponseWriter, r *http.Request) {
-	if r.TLS == nil {
-		h.serve(w, r, Decide(Input{}))
-		return
-	}
 	ctx := r.Context()
 	req, err := parseBootQuery(r.URL.Query())
 	if err != nil {

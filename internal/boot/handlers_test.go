@@ -25,10 +25,10 @@ import (
 )
 
 const (
-	clientAddr = "10.10.20.50:40000"
-	bootUUID   = "4c4c4544-0042-3510-8052-b4c04f4e4d32"
-	bootMAC    = "aa:bb:cc:00:00:01"
-	zeroUUID   = "00000000-0000-0000-0000-000000000000"
+	testClientAddr = "10.10.20.50:40000"
+	bootUUID       = "4c4c4544-0042-3510-8052-b4c04f4e4d32"
+	bootMAC        = "aa:bb:cc:00:00:01"
+	zeroUUID       = "00000000-0000-0000-0000-000000000000"
 
 	// bootQ is a boot query as iPXE sends it.
 	bootQ = "uuid=" + bootUUID + "&mac=aa-bb-cc-00-00-01&arch=x86_64&serial=S1&product=P1"
@@ -113,7 +113,7 @@ func testSubnet() netip.Prefix { return netip.MustParsePrefix("10.10.20.0/24") }
 func newRequest(t *testing.T, target string, secure bool) *http.Request {
 	t.Helper()
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, target, nil)
-	req.RemoteAddr = clientAddr
+	req.RemoteAddr = testClientAddr
 	if secure {
 		req.TLS = &tls.ConnectionState{}
 	}

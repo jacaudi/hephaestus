@@ -123,7 +123,7 @@ func newDiscoverRequest(t *testing.T, body string) *http.Request {
 	t.Helper()
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/discover", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.RemoteAddr = clientAddr
+	req.RemoteAddr = testClientAddr
 	req.TLS = &tls.ConnectionState{}
 	return req
 }
