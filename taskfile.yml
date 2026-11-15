@@ -1,0 +1,38 @@
+# THE CI CONTRACT (github-actions-align): `task ci` is what CI runs and what you run locally.
+version: '3'
+
+includes:
+  repo:
+    taskfile: .taskfiles/repo.yml
+  go:
+    taskfile: .taskfiles/go.yml
+
+tasks:
+  default:
+    desc: List all tasks
+    cmds:
+      - task --list
+  ci:
+    desc: Everything CI runs. Run this before committing.
+    cmds:
+      - task: repo:ci
+      - task: go:ci
+  lint:
+    desc: Static checks only
+    cmds:
+      - task: repo:ci
+      - task: go:lint
+  test:
+    desc: Tests only
+    cmds:
+      - task: go:test
+  build:
+    desc: Build artefacts
+    cmds:
+      - task: go:build
+  e2e:
+    desc: QEMU end-to-end test (Linux only, design §7.6); not part of ci
+    cmds:
+      - |
+        echo "e2e: the QEMU harness arrives in a later milestone" >&2
+        exit 1
