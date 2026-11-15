@@ -38,7 +38,15 @@ export HEPHAESTUS_PROVISIONING_SUBNET=10.10.20.0/24
 ./bin/hephaestus serve
 ```
 
-Ports 80 and 443 are privileged. The container image grants the binary `cap_net_bind_service` so it runs as UID 65532; a bare binary needs the same capability or root.
+Ports 67, 69, 80, 443 and 4011 (proxyDHCP, TFTP, HTTP, HTTPS) are privileged. The container image grants the binary `cap_net_bind_service`, which covers them, so it runs as UID 65532; a bare binary needs the same capability or root.
+
+## Run the image
+
+The image's default state directory is `/var/lib/hephaestus`, owned by UID 65532. Mount persistent storage there: the SQLite database holds the sealed ACME account and certificate, so losing it forces a re-issue. A bind mount must be owned by 65532. Pass the variables from the env table above. proxyDHCP listens on a host interface, so the container uses the host network.
+
+```sh
+docker run --rm --network host -v hephaestus-data:/var/lib/hephaestus --env-file hephaestus.env hephaestus:dev
+```
 
 ## Prerequisites
 
@@ -66,7 +74,8 @@ Machines PXE-boot, chain into iPXE over TFTP, then fetch their boot script over 
 ## Build
 
 ```sh
-task ci            # format, tidy, lint, vuln, hadolint, go test -race
+task ci            # fmt and tidy checks, lint, vuln, hadolint, go test -race, cross-compile,
+                   # Postgres integration tests, coverage gate (needs DOCKER_HOST)
 task ipxe:build    # rebuild the embedded iPXE binaries (needs DOCKER_HOST)
 task image:build   # build hephaestus:dev for linux/arm64 (needs DOCKER_HOST)
 ```

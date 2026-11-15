@@ -4,3 +4,4 @@ build/ipxe/.work
 build/ipxe/out
 docs
 .superpowers
+.worktrees
