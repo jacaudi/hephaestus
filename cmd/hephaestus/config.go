@@ -122,8 +122,7 @@ func (r rawConfig) validate(addrsOf interfaceAddrs) (serveConfig, error) {
 
 	cfg.Interface = r.Provisioning.Interface
 	cfg.Address, cfg.Subnet, err = validateProvisioning(r.Provisioning.Address, r.Provisioning.Subnet)
-	errs = append(errs, err)
-	errs = append(errs, validateInterface(cfg.Interface, cfg.Address, addrsOf))
+	errs = append(errs, err, validateInterface(cfg.Interface, cfg.Address, addrsOf))
 
 	cfg.AdminAddr, err = validateAdmin(r.Admin.Address, cfg.Subnet)
 	errs = append(errs, err)

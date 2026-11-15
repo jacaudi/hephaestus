@@ -325,7 +325,7 @@ func (p *plane) run(ctx context.Context) error {
 	if p.deps.udp {
 		addr := p.cfg.Address.String()
 		dhcpProxy := dhcp.NewProxy(addr, bootHTTPPort, p.cfg.Interface, false, p.logger.With("component", "dhcp_proxy"))
-		tftpServer := tftp.NewServer(addr, p.cfg.Subnet, p.deps.files,p.logger.With("component", "tftp"))
+		tftpServer := tftp.NewServer(addr, p.cfg.Subnet, p.deps.files, p.logger.With("component", "tftp"))
 		proxy.start("proxyDHCP", func() error { return dhcpProxy.Run(proxyCtx) })
 		work.start("tftp", func() error { return tftpServer.Run(workCtx) })
 	}

@@ -50,7 +50,9 @@ func reportError(w io.Writer, err error) {
 	if _, ok := errors.AsType[loggedError](err); ok { //nolint:errcheck // the match target is not a dropped error; modernize requires AsType over errors.As
 		return
 	}
-	fmt.Fprintf(w, "hephaestus: %v\n", err)
+	if _, werr := fmt.Fprintf(w, "hephaestus: %v\n", err); werr != nil {
+		return // stderr is gone; there is no one left to tell
+	}
 }
 
 // exitCode maps the error returned by the root command to a process exit code.
