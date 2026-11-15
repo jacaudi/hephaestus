@@ -326,9 +326,26 @@ func (r rawConfig) validateTLS(cfg *serveConfig) error {
 			errs = append(errs, fmt.Errorf("HEPHAESTUS_PROXY_TRUSTED %q: must be a CIDR prefix", entry))
 			continue
 		}
-		cfg.TrustedProxies = append(cfg.TrustedProxies, prefix.Masked())
+		prefix = unmapPrefix(prefix).Masked()
+		// A prefix that holds the whole provisioning subnet makes every client a
+		// trusted hop: each request would walk to no client and be refused.
+		if cfg.Subnet.IsValid() && prefix.Bits() <= cfg.Subnet.Bits() && prefix.Contains(cfg.Subnet.Addr()) {
+			errs = append(errs, fmt.Errorf("HEPHAESTUS_PROXY_TRUSTED prefix %s contains the provisioning subnet %s; list only the proxy's own addresses", prefix, cfg.Subnet))
+			continue
+		}
+		cfg.TrustedProxies = append(cfg.TrustedProxies, prefix)
 	}
 	return errors.Join(errs...)
+}
+
+// unmapPrefix returns the IPv4 prefix that an IPv4-mapped IPv6 prefix of at
+// least 96 bits means, so a trusted prefix is matched the way peers are:
+// unmapped. Any other prefix is returned as is.
+func unmapPrefix(p netip.Prefix) netip.Prefix {
+	if a := p.Addr(); a.Is4In6() && p.Bits() >= 96 {
+		return netip.PrefixFrom(a.Unmap(), p.Bits()-96)
+	}
+	return p
 }
 
 // tlsSetting is the error for the environment variable name, which is set or

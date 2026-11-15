@@ -50,6 +50,8 @@ func TrustProxies(trusted []netip.Prefix, next http.Handler) http.Handler {
 			writeProblem(r.Context(), w, http.StatusForbidden)
 			return
 		}
+		// remote_ip on the event is only the proxy; this is the client.
+		telemetry.AddAttrs(r.Context(), slog.String("client_ip", client.String()))
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), clientKey{}, client)))
 	})
 }

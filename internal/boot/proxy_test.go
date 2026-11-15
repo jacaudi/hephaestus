@@ -1,11 +1,16 @@
 package boot
 
 import (
+	"bytes"
+	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"strings"
 	"testing"
+
+	"go.jacaudi.dev/hephaestus/internal/telemetry"
 )
 
 const (
@@ -253,6 +258,26 @@ func TestProxied_DiscoverLimiterKeysOnClient(t *testing.T) {
 	wantStatus(t, rec, http.StatusOK)
 	if n := g.count("SELECT count(*) FROM machines"); n != 2 {
 		t.Errorf("machines = %d, want 2", n)
+	}
+}
+
+// TestProxied_WideEventCarriesClient pins that the request log line names the
+// client the proxy reported: its remote_ip is only the proxy.
+func TestProxied_WideEventCarriesClient(t *testing.T) {
+	g := newRig(t)
+	var buf bytes.Buffer
+	handler := telemetry.WideEvents(g.h.Proxied(trustedProxies()), slog.New(slog.NewJSONHandler(&buf, nil)), slog.LevelInfo)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, proxiedRequest(t, http.MethodGet, "/tftp/amd64/snp.efi", "", "10.10.20.50"))
+
+	wantStatus(t, rec, http.StatusOK)
+	var line map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &line); err != nil {
+		t.Fatalf("log line is not one JSON object: %v\n%s", err, buf.String())
+	}
+	if line["client_ip"] != "10.10.20.50" || line["remote_ip"] != "127.0.0.1" {
+		t.Errorf("client_ip = %v, remote_ip = %v, want 10.10.20.50 and 127.0.0.1", line["client_ip"], line["remote_ip"])
 	}
 }
 

@@ -203,6 +203,10 @@ func TestLoadConfig_Invalid(t *testing.T) {
 		{"trusted proxy not a prefix", proxyModeEnv(map[string]string{"PROXY_TRUSTED": "127.0.0.0/8,10.0.0.1"}), `HEPHAESTUS_PROXY_TRUSTED "10.0.0.1": must be a CIDR prefix`},
 		{"trusted proxy prefix too long", proxyModeEnv(map[string]string{"PROXY_TRUSTED": "10.0.0.0/33"}), `HEPHAESTUS_PROXY_TRUSTED "10.0.0.0/33": must be a CIDR prefix`},
 		{"trusted proxies with an empty entry", proxyModeEnv(map[string]string{"PROXY_TRUSTED": "127.0.0.0/8,"}), `HEPHAESTUS_PROXY_TRUSTED "": must be a CIDR prefix`},
+		{"trusted prefix contains the subnet", proxyModeEnv(map[string]string{"PROXY_TRUSTED": "10.10.0.0/16"}), "HEPHAESTUS_PROXY_TRUSTED prefix 10.10.0.0/16 contains the provisioning subnet 10.10.20.0/24; list only the proxy's own addresses"},
+		{"trusted prefix is the subnet", proxyModeEnv(map[string]string{"PROXY_TRUSTED": "10.10.20.77/24"}), "HEPHAESTUS_PROXY_TRUSTED prefix 10.10.20.0/24 contains the provisioning subnet 10.10.20.0/24; list only the proxy's own addresses"},
+		{"trusted prefix is everything", proxyModeEnv(map[string]string{"PROXY_TRUSTED": "127.0.0.0/8,0.0.0.0/0"}), "HEPHAESTUS_PROXY_TRUSTED prefix 0.0.0.0/0 contains the provisioning subnet 10.10.20.0/24"},
+		{"IPv4-mapped trusted prefix contains the subnet", proxyModeEnv(map[string]string{"PROXY_TRUSTED": "::ffff:10.10.0.0/112"}), "HEPHAESTUS_PROXY_TRUSTED prefix 10.10.0.0/16 contains the provisioning subnet 10.10.20.0/24"},
 		{"zero grace", map[string]string{"SHUTDOWN_GRACE": "0s"}, "HEPHAESTUS_SHUTDOWN_GRACE must be positive"},
 		{"xml logs", map[string]string{"LOG_FORMAT": "xml"}, `HEPHAESTUS_LOG_FORMAT "xml": must be json or text`},
 		{"bad level", map[string]string{"LOG_LEVEL": "loud"}, "decode config"},
@@ -282,8 +286,8 @@ func TestHostInterfaceAddrs(t *testing.T) {
 func TestLoadConfig_ProxyMode(t *testing.T) {
 	setMinimalEnv(t)
 	for k, v := range proxyModeEnv(map[string]string{
-		"PROXY_ADDRESS": "10.10.20.7:8080", // it need not be off the provisioning VLAN
-		"PROXY_TRUSTED": "10.0.0.5/8, 192.168.1.7/24,::1/128",
+		"PROXY_ADDRESS": "10.10.20.7:8080",                                   // it need not be off the provisioning VLAN
+		"PROXY_TRUSTED": "10.0.0.5/16, 192.168.1.7/24,::1/128,10.10.20.9/32", // the last is a proxy on the VLAN itself
 	}) {
 		t.Setenv("HEPHAESTUS_"+k, v)
 	}
@@ -299,12 +303,42 @@ func TestLoadConfig_ProxyMode(t *testing.T) {
 	if want := netip.MustParseAddrPort("10.10.20.7:8080"); got.ProxyAddr != want {
 		t.Errorf("ProxyAddr = %v, want %v", got.ProxyAddr, want)
 	}
-	want := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8"), netip.MustParsePrefix("192.168.1.0/24"), netip.MustParsePrefix("::1/128")}
+	want := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16"), netip.MustParsePrefix("192.168.1.0/24"), netip.MustParsePrefix("::1/128"), netip.MustParsePrefix("10.10.20.9/32")}
 	if !slices.Equal(got.TrustedProxies, want) {
 		t.Errorf("TrustedProxies = %v, want the masked prefixes %v", got.TrustedProxies, want)
 	}
 	if got.TLSCertFile != "" || got.TLSKeyFile != "" {
 		t.Errorf("TLS files = %q and %q in proxy mode, want none", got.TLSCertFile, got.TLSKeyFile)
+	}
+}
+
+// TestLoadConfig_ProxyTrustedUnmapsIPv4Mapped pins that a trusted prefix written
+// in IPv4-mapped form is stored as the IPv4 prefix it means: peers are unmapped
+// before they are matched, so a mapped prefix would otherwise never match.
+func TestLoadConfig_ProxyTrustedUnmapsIPv4Mapped(t *testing.T) {
+	tests := []struct {
+		trusted string
+		want    string
+	}{
+		{"::ffff:10.0.0.1/128", "10.0.0.1/32"},
+		{"::ffff:10.0.1.7/120", "10.0.1.0/24"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.trusted, func(t *testing.T) {
+			setMinimalEnv(t)
+			for k, v := range proxyModeEnv(map[string]string{"PROXY_TRUSTED": tt.trusted}) {
+				t.Setenv("HEPHAESTUS_"+k, v)
+			}
+
+			got, err := load(t)
+
+			if err != nil {
+				t.Fatalf("loadConfig: %v", err)
+			}
+			if want := []netip.Prefix{netip.MustParsePrefix(tt.want)}; !slices.Equal(got.TrustedProxies, want) {
+				t.Errorf("TrustedProxies = %v, want %v", got.TrustedProxies, want)
+			}
+		})
 	}
 }
 

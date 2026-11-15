@@ -41,7 +41,8 @@ type Request struct {
 
 // Input is everything Decide looks at.
 type Input struct {
-	// TLS is whether the request arrived over TLS.
+	// TLS is whether the request was served by a TLS route, directly or through
+	// the reverse proxy that terminated the TLS.
 	TLS bool
 	// Known is whether Machine is a recorded machine.
 	Known bool

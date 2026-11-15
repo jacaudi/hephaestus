@@ -71,8 +71,9 @@ type Loader struct {
 
 // NewLoader reads certFile and keyFile and returns a Loader that serves the
 // pair, or an error and nothing to serve when a file cannot be read, the key
-// does not match the certificate, the leaf does not cover fqdn, or the leaf has
-// expired. It starts nothing: call Run to follow changes to the files.
+// does not match the certificate, the leaf does not cover fqdn, the leaf is not
+// yet valid or has expired, or the interval is not positive. It starts
+// nothing: call Run to follow changes to the files.
 func NewLoader(certFile, keyFile, fqdn string, opts ...Option) (*Loader, error) {
 	l := &Loader{
 		certFile: certFile,
@@ -85,6 +86,9 @@ func NewLoader(certFile, keyFile, fqdn string, opts ...Option) (*Loader, error) 
 	}
 	for _, opt := range opts {
 		opt(l)
+	}
+	if l.interval <= 0 {
+		return nil, fmt.Errorf("tlscert: interval %s must be positive", l.interval)
 	}
 
 	// Stat before reading: a file that changes in between is then seen as
@@ -200,7 +204,11 @@ func (l *Loader) read() (*tls.Certificate, error) {
 	if err := leaf.VerifyHostname(l.fqdn); err != nil {
 		return nil, fmt.Errorf("tlscert: certificate %s does not cover %s: %w", l.certFile, l.fqdn, err)
 	}
-	if l.now().After(leaf.NotAfter) {
+	now := l.now()
+	if now.Before(leaf.NotBefore) {
+		return nil, fmt.Errorf("tlscert: certificate %s is not yet valid: valid from %s", l.certFile, leaf.NotBefore.UTC().Format(time.RFC3339))
+	}
+	if now.After(leaf.NotAfter) {
 		return nil, fmt.Errorf("tlscert: certificate %s expired at %s", l.certFile, leaf.NotAfter.UTC().Format(time.RFC3339))
 	}
 	pair.Leaf = leaf
@@ -220,8 +228,8 @@ func (l *Loader) current() *tls.Certificate {
 }
 
 // Checks returns the certificate health checks. tls:certificate is critical: it
-// passes until the served leaf expires. tls:expiry is informational: it warns
-// when fewer than 14 days are left, and reports the days left either way. The
+// passes from the leaf's NotBefore until it expires. tls:expiry is
+// informational: it warns when fewer than 14 days are left, and reports the days left either way. The
 // served pair is never dropped when it expires; the check takes the service out
 // of rotation.
 func (l *Loader) Checks() []admin.Check {
@@ -232,8 +240,12 @@ func (l *Loader) Checks() []admin.Check {
 }
 
 func (l *Loader) certificateCheck(context.Context) admin.Result {
-	notAfter := l.current().Leaf.NotAfter
-	if l.now().After(notAfter) {
+	leaf := l.current().Leaf
+	notAfter, now := leaf.NotAfter, l.now()
+	if now.Before(leaf.NotBefore) {
+		return admin.Result{Status: admin.StatusFail, Output: "certificate not yet valid until " + leaf.NotBefore.UTC().Format(time.RFC3339)}
+	}
+	if now.After(notAfter) {
 		return admin.Result{Status: admin.StatusFail, Output: "certificate expired at " + notAfter.UTC().Format(time.RFC3339)}
 	}
 	return admin.Result{Status: admin.StatusPass, Output: "valid until " + notAfter.UTC().Format(time.RFC3339)}

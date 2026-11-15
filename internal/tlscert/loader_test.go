@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -84,6 +85,19 @@ func rewrite(t *testing.T, certFile, name string, mtime time.Time) {
 		if err := os.Chtimes(f, mtime, mtime); err != nil {
 			t.Fatalf("chtimes %s: %v", f, err)
 		}
+	}
+}
+
+// replaceFile puts content at path through a temporary file and a rename, so a
+// reader never sees a truncated file.
+func replaceFile(t *testing.T, path, content string) {
+	t.Helper()
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(content), 0o600); err != nil {
+		t.Fatalf("write %s: %v", tmp, err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		t.Fatalf("rename %s: %v", tmp, err)
 	}
 }
 
@@ -254,6 +268,42 @@ func TestNewLoader_Expired(t *testing.T) {
 	}
 }
 
+func TestNewLoader_NotYetValid(t *testing.T) {
+	certFile, keyFile := tlscerttest.WriteSelfSigned(t, t.TempDir(), fqdn, t0().Add(time.Hour), t0().Add(30*day))
+
+	l, err := tlscert.NewLoader(certFile, keyFile, fqdn, tlscert.WithClock(t0))
+
+	if err == nil {
+		t.Fatal("NewLoader succeeded with a certificate that is not yet valid, want an error")
+	}
+	if l != nil {
+		t.Errorf("NewLoader returned a loader along with %v", err)
+	}
+	if want := "not yet valid"; !strings.Contains(err.Error(), want) {
+		t.Errorf("error = %q, want it to contain %q", err, want)
+	}
+}
+
+func TestNewLoader_RejectsNonPositiveInterval(t *testing.T) {
+	certFile, keyFile := files(t, fqdn, 90*day)
+
+	for _, d := range []time.Duration{0, -time.Second} {
+		t.Run(d.String(), func(t *testing.T) {
+			l, err := tlscert.NewLoader(certFile, keyFile, fqdn, tlscert.WithClock(t0), tlscert.WithInterval(d))
+
+			if err == nil {
+				t.Fatal("NewLoader succeeded with a non-positive interval, want an error")
+			}
+			if l != nil {
+				t.Errorf("NewLoader returned a loader along with %v", err)
+			}
+			if want := "interval"; !strings.Contains(err.Error(), want) {
+				t.Errorf("error = %q, want it to contain %q", err, want)
+			}
+		})
+	}
+}
+
 func TestRun_ReloadsOnChange(t *testing.T) {
 	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 	certFile, keyFile := files(t, fqdn, 90*day)
@@ -314,9 +364,7 @@ func TestRun_BadReloadKeepsCurrent(t *testing.T) {
 	stop := startRun(t, l)
 	defer stop()
 
-	if err := os.WriteFile(keyFile, []byte("not a key"), 0o600); err != nil {
-		t.Fatalf("overwrite key: %v", err)
-	}
+	replaceFile(t, keyFile, "not a key")
 
 	eventually(t, "the error handler call", func() bool { return len(errs.all()) > 0 })
 	time.Sleep(15 * tick) // several more ticks: the same bad file must not be retried
@@ -335,9 +383,7 @@ func TestRun_RecoversAfterBadReload(t *testing.T) {
 	l := newLoader(t, certFile, keyFile, tlscert.WithInterval(tick), tlscert.WithErrorHandler(errs.handle))
 	stop := startRun(t, l)
 	defer stop()
-	if err := os.WriteFile(keyFile, []byte("not a key"), 0o600); err != nil {
-		t.Fatalf("overwrite key: %v", err)
-	}
+	replaceFile(t, keyFile, "not a key")
 	eventually(t, "the error handler call", func() bool { return len(errs.all()) > 0 })
 
 	rewrite(t, certFile, fqdn, time.Now().Add(time.Hour))
@@ -376,10 +422,11 @@ func TestRun_RejectsReplacementThatFailsTheChecks(t *testing.T) {
 				}
 			}
 
-			eventually(t, "the error handler call", func() bool { return len(errs.all()) > 0 })
-			if got := errs.all()[0]; !strings.Contains(got.Error(), tt.wantReason) {
-				t.Errorf("handler error = %q, want it to contain %q", got, tt.wantReason)
-			}
+			// The cert and key land one after the other, so a tick between them
+			// may report a mismatch first; the reason must still be reported.
+			eventually(t, "an error naming "+tt.wantReason, func() bool {
+				return slices.ContainsFunc(errs.all(), func(err error) bool { return strings.Contains(err.Error(), tt.wantReason) })
+			})
 			if got := serial(t, l); got.Cmp(old) != 0 {
 				t.Errorf("served serial = %v, want the old %v", got, old)
 			}
@@ -457,6 +504,19 @@ func TestChecks_FailsAfterExpiry(t *testing.T) {
 	}
 }
 
+func TestChecks_FailsBeforeNotBefore(t *testing.T) {
+	certFile, keyFile := files(t, fqdn, 30*day) // valid from t0 - 1h
+	clk := &clock{now: t0()}
+	l := newLoader(t, certFile, keyFile, tlscert.WithClock(clk.Now))
+	check := checkByName(t, l, "tls:certificate")
+
+	clk.Set(t0().Add(-2 * time.Hour))
+
+	if got := check.Run(t.Context()); got.Status != admin.StatusFail {
+		t.Errorf("before NotBefore: status = %q, want fail (%+v)", got.Status, got)
+	}
+}
+
 func newMetrics(t *testing.T) *telemetry.Metrics {
 	t.Helper()
 	m, err := telemetry.NewMetrics("v1.2.3", "abc1234")
@@ -495,9 +555,7 @@ func TestMetrics_DaysLeftAndReloadFailures(t *testing.T) {
 		t.Errorf("metrics count a reload failure before any happened:\n%s", body)
 	}
 
-	if err := os.WriteFile(keyFile, []byte("not a key"), 0o600); err != nil {
-		t.Fatalf("overwrite key: %v", err)
-	}
+	replaceFile(t, keyFile, "not a key")
 	eventually(t, "the error handler call", func() bool { return len(errs.all()) > 0 })
 
 	if body := scrape(t, m); !strings.Contains(body, "hephaestus_tls_reload_failures_total{") {

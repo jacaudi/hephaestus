@@ -43,7 +43,8 @@ func newServeCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "serve",
 		Short: "Run the boot plane and the admin listener",
-		Long: `Run proxyDHCP, TFTP, the boot HTTP and HTTPS listeners and the admin listener.
+		Long: `Run proxyDHCP, TFTP, the boot HTTP listener, the boot HTTPS listener (file mode) or the
+listener a TLS-terminating proxy forwards to (proxy mode), and the admin listener.
 
 Configuration comes from the environment. Required:
   HEPHAESTUS_FQDN                    name the boot HTTPS certificate covers

@@ -620,19 +620,25 @@ Per WL:504-543:
     account and no DNS credential. `HEPHAESTUS_TLS_MODE` picks one of two sources, and both ship:
     - **`file`** (default). `HEPHAESTUS_TLS_CERT_FILE` and `HEPHAESTUS_TLS_KEY_FILE` name a chain and key that an external
       process writes and renews (certbot, lego, cert-manager). The `tlscert` package reads both at startup and refuses to
-      start when a file is unreadable, the key does not match, the leaf does not cover `HEPHAESTUS_FQDN`, or the leaf has
-      expired. Once a minute it stats both files, following symlinks so a Kubernetes secret swap counts, and reloads
-      the pair when either file's modification time or size changed, under the same checks. A replacement that fails them
-      leaves the current pair serving, is counted (`hephaestus.tls.reload.failures`), is reported once through the error
-      handler (the service logs it at Warn), and is not retried until the files change again. The TLS 1.3 listener serves
-      whatever pair is current. The admin checks are `tls:certificate` (critical: fails once the served leaf has expired)
-      and `tls:expiry` (warns under 14 days); the gauge `hephaestus.tls.certificate.days_left` reports the days left.
+      start when a file is unreadable, the key does not match, the leaf does not cover `HEPHAESTUS_FQDN`, or the leaf is
+      not yet valid or has expired. Once a minute it stats both files, following symlinks so a Kubernetes secret swap
+      counts, and reloads the pair when either file's modification time or size changed, under the same checks. A
+      replacement that fails them leaves the current pair serving, is counted (`hephaestus.tls.reload.failures`), is
+      reported once through the error handler (the service logs it at Warn), and is not retried until the files change
+      again. A file that is missing has no modification time to remember, so it is reported on every interval until it
+      returns. The TLS 1.3 listener serves whatever pair is current. The admin checks are `tls:certificate` (critical:
+      fails while the served leaf is not yet valid and once it has expired) and `tls:expiry` (warns under 14 days); the
+      gauge `hephaestus.tls.certificate.days_left` reports the days left.
     - **`proxy`**. A reverse proxy (Caddy, Traefik, Envoy) terminates TLS 1.3 and forwards plain HTTP to
       `HEPHAESTUS_PROXY_ADDRESS`, where hephaestus serves the same routes as the HTTPS listener. There is no certificate
       in the process, no TLS check and no TLS port. The proxy's own addresses are `HEPHAESTUS_PROXY_TRUSTED`
-      (CIDR prefixes). Only a peer inside them is served; the client address is the rightmost `X-Forwarded-For` entry
-      that is not itself a trusted proxy, and that address, not the proxy's, goes through the source-subnet guard and the
-      `/discover` rate limiter (§6).
+      (CIDR prefixes; startup refuses one that contains the whole provisioning subnet, since every client would then
+      look like a trusted hop and every request would be refused). Only a peer inside them is served; the client address
+      is the rightmost `X-Forwarded-For` entry that is not itself a trusted proxy, and that address, not the proxy's,
+      goes through the source-subnet guard and the `/discover` rate limiter (§6). The proxy must replace or append to a
+      client-supplied `X-Forwarded-For`, never pass it through. Caddy and Traefik do by default; Envoy needs
+      `use_remote_address: true` with `xff_num_trusted_hops: 0`, because its default (`false`) leaves the header
+      untouched.
     - Plain HTTP `:80` (`/start`, the artifact route) stays on hephaestus in both modes: the embedded chain targets the
       next-server address, which carries no name.
   - **Chain**: the certificate's chain, wherever it comes from, must end at an ISRG root, because the iPXE binaries trust
@@ -709,7 +715,9 @@ Per WL:504-543:
   - **Behind a reverse proxy** (`proxy` mode, §5.10) the TCP source is the proxy, so the guard and the `/discover` limiter
     use the client address that the proxy reports in `X-Forwarded-For`. That header is believed only from a peer inside
     `HEPHAESTUS_PROXY_TRUSTED`, which makes the trusted proxies part of the trust boundary: one that forwards a
-    client-supplied header unmodified lets that client name any address. Every refusal fails closed with a 403:
+    client-supplied header unmodified lets that client name any address, past both the guard and the limiter. Caddy and
+    Traefik replace or append to it by default; Envoy does not (its default `use_remote_address: false` is transparent), so
+    it needs `use_remote_address: true` with `xff_num_trusted_hops: 0`. Every refusal fails closed with a 403:
     - a peer outside the trusted list;
     - a missing or unparsable header (only the entries walked, from the right, are parsed);
     - a header whose entries are all trusted proxies.

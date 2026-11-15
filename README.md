@@ -19,7 +19,7 @@ task build
 | `HEPHAESTUS_TLS_MODE` | `file` | `file` or `proxy`; see [TLS](#tls) |
 | `HEPHAESTUS_TLS_CERT_FILE`, `HEPHAESTUS_TLS_KEY_FILE` | required in `file` mode, an error in `proxy` mode | Certificate chain and key files, written and renewed by another process |
 | `HEPHAESTUS_PROXY_ADDRESS` | required in `proxy` mode, an error in `file` mode | `IP:port` hephaestus listens on for the reverse proxy |
-| `HEPHAESTUS_PROXY_TRUSTED` | required in `proxy` mode, an error in `file` mode | Comma-separated CIDR prefixes of the proxy's own addresses |
+| `HEPHAESTUS_PROXY_TRUSTED` | required in `proxy` mode, an error in `file` mode | Comma-separated CIDR prefixes of the proxy's own addresses; a prefix that contains the provisioning subnet is refused |
 | `HEPHAESTUS_ADMIN_ADDRESS` | `127.0.0.1:9090` | Admin listener; a specific management IP, never a wildcard or an address inside the provisioning subnet |
 | `HEPHAESTUS_DATA_DIR` | `/var/lib/hephaestus` | Absolute path for state |
 | `HEPHAESTUS_DATABASE_URL` | `sqlite:<data dir>/hephaestus.db` | `sqlite:/abs/path.db` or `postgres://...` |
@@ -50,7 +50,7 @@ docker run ... -v /etc/hephaestus/certs:/certs:ro \
   -e HEPHAESTUS_TLS_CERT_FILE=/certs/fullchain.pem -e HEPHAESTUS_TLS_KEY_FILE=/certs/privkey.pem ...
 ```
 
-**`proxy`.** A reverse proxy (Caddy, Traefik, Envoy) terminates TLS 1.3 with a certificate that chains to the ISRG roots, and forwards plain HTTP to `HEPHAESTUS_PROXY_ADDRESS`. hephaestus then serves `/boot`, `/discover` and `/tftp` there and binds neither the HTTPS port nor any certificate. The proxy must set `X-Forwarded-For` (Caddy, Traefik and Envoy do by default); its own address must be in `HEPHAESTUS_PROXY_TRUSTED`. hephaestus reads the client address from the rightmost `X-Forwarded-For` entry that is not a trusted proxy, and answers 403 to any peer outside the trusted list and to a request with no usable header. Point `HEPHAESTUS_FQDN`'s DNS record at the proxy. Plain HTTP `:80` (`/start`, `/tftp`) stays on hephaestus, because the embedded chain script targets the next-server address, not the name.
+**`proxy`.** A reverse proxy (Caddy, Traefik, Envoy) terminates TLS 1.3 with a certificate that chains to the ISRG roots, and forwards plain HTTP to `HEPHAESTUS_PROXY_ADDRESS`. hephaestus then serves `/boot`, `/discover` and `/tftp` there and binds neither the HTTPS port nor any certificate. The proxy must replace or append to a client-supplied `X-Forwarded-For`, never pass it through, because hephaestus believes the header from a trusted peer and a passed-through one lets the client name any address. Caddy and Traefik do this by default. Envoy does not: its default (`use_remote_address: false`) leaves the header untouched, so set `use_remote_address: true` with `xff_num_trusted_hops: 0`. The proxy's own address must be in `HEPHAESTUS_PROXY_TRUSTED`. hephaestus reads the client address from the rightmost `X-Forwarded-For` entry that is not a trusted proxy, and answers 403 to any peer outside the trusted list and to a request with no usable header. Point `HEPHAESTUS_FQDN`'s DNS record at the proxy. Plain HTTP `:80` (`/start`, `/tftp`) stays on hephaestus, because the embedded chain script targets the next-server address, not the name.
 
 ```caddyfile
 boot.example.com {
