@@ -36,7 +36,7 @@ const (
 	bootHTTPSPort = 443
 
 	// minFreeDisk is the free fraction of the data dir's disk below which the
-	// disk check fails.
+	// disk check warns.
 	minFreeDisk = 0.10
 )
 
@@ -72,7 +72,8 @@ The process stops on SIGINT or SIGTERM after draining in-flight requests.`,
 		Args: noArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			// cmd.Flags() includes the root's persistent flags, so --log-format applies.
-			cfg, err := loadConfig(cmd.Flags())
+			// Errors before the logger exists stay plain text on stderr.
+			cfg, err := loadConfig(cmd.Flags(), hostInterfaceAddrs)
 			if err != nil {
 				return err
 			}
@@ -82,27 +83,43 @@ The process stops on SIGINT or SIGTERM after draining in-flight requests.`,
 			}
 			legolog.Logger = slog.NewLogLogger(logger.Handler(), slog.LevelInfo)
 
-			files, err := ipxe.Files()
-			if err != nil {
-				return fmt.Errorf("load iPXE binaries: %w", err)
-			}
 			ctx := cmd.Context()
-			lns, err := listen(ctx,
-				netip.AddrPortFrom(cfg.Address, bootHTTPPort).String(),
-				netip.AddrPortFrom(cfg.Address, bootHTTPSPort).String(),
-				cfg.AdminAddr.String(),
-			)
-			if err != nil {
-				return err
+			if err := listenAndServe(ctx, cfg, logger); err != nil {
+				return fatalLogged(ctx, logger, err)
 			}
-			return runServe(ctx, cfg, logger, serveDeps{
-				newIssuer: legoIssuerFactory(cfg),
-				httpLn:    lns[0], httpsLn: lns[1], adminLn: lns[2],
-				udp:   true,
-				files: files,
-			})
+			return nil
 		},
 	}
+}
+
+// listenAndServe opens the boot and admin listeners and runs the service on
+// them until ctx is done.
+func listenAndServe(ctx context.Context, cfg serveConfig, logger *slog.Logger) error {
+	files, err := ipxe.Files()
+	if err != nil {
+		return fmt.Errorf("load iPXE binaries: %w", err)
+	}
+	lns, err := listen(ctx,
+		netip.AddrPortFrom(cfg.Address, bootHTTPPort).String(),
+		netip.AddrPortFrom(cfg.Address, bootHTTPSPort).String(),
+		cfg.AdminAddr.String(),
+	)
+	if err != nil {
+		return err
+	}
+	return runServe(ctx, cfg, logger, serveDeps{
+		newIssuer: legoIssuerFactory(cfg),
+		httpLn:    lns[0], httpsLn: lns[1], adminLn: lns[2],
+		udp:   true,
+		files: files,
+	})
+}
+
+// fatalLogged logs err at Error level and returns it marked as logged, so main
+// exits 1 without printing it a second time.
+func fatalLogged(ctx context.Context, logger *slog.Logger, err error) error {
+	logger.ErrorContext(ctx, "serve failed", "error", err)
+	return loggedError{err}
 }
 
 // legoIssuerFactory returns the serveDeps.newIssuer that issues through Let's
@@ -316,6 +333,7 @@ func (p *plane) run(ctx context.Context) error {
 
 	<-runCtx.Done()
 	p.life.Set(admin.Draining)
+	p.logger.InfoContext(base, "draining")
 
 	stopProxy()
 	proxyErr := proxy.wait()
@@ -332,6 +350,7 @@ func (p *plane) run(ctx context.Context) error {
 	admErr := errors.Join(shutdownAll(admCtx, p.adminSrv), adm.wait())
 
 	p.life.Set(admin.Stopped)
+	p.logger.InfoContext(base, "stopped")
 	return errors.Join(proxyErr, webErr, workErr, admErr)
 }
 

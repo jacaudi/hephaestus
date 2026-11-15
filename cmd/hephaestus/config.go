@@ -4,11 +4,13 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -77,7 +79,7 @@ type serveConfig struct {
 // loadConfig reads the bootstrap configuration from the HEPHAESTUS_ environment
 // and the --log-format flag in fs (precedence: flag, environment, default),
 // then validates it. Every validation failure is returned together.
-func loadConfig(fs *pflag.FlagSet) (serveConfig, error) {
+func loadConfig(fs *pflag.FlagSet, addrsOf interfaceAddrs) (serveConfig, error) {
 	// ExperimentalBindStruct makes Unmarshal read every struct key from the
 	// environment, even one with no default (go-standards §10).
 	v := viper.NewWithOptions(viper.ExperimentalBindStruct())
@@ -103,12 +105,12 @@ func loadConfig(fs *pflag.FlagSet) (serveConfig, error) {
 	if err := v.Unmarshal(&raw, hook); err != nil {
 		return serveConfig{}, fmt.Errorf("decode config: %w", err)
 	}
-	return raw.validate()
+	return raw.validate(addrsOf)
 }
 
 // validate checks every field and returns the serveConfig, or every problem
 // joined into one error (errors.Join drops the nil results).
-func (r rawConfig) validate() (serveConfig, error) {
+func (r rawConfig) validate(addrsOf interfaceAddrs) (serveConfig, error) {
 	var (
 		cfg  serveConfig
 		errs []error
@@ -119,12 +121,9 @@ func (r rawConfig) validate() (serveConfig, error) {
 	errs = append(errs, err)
 
 	cfg.Interface = r.Provisioning.Interface
-	if cfg.Interface == "" {
-		errs = append(errs, errors.New("HEPHAESTUS_PROVISIONING_INTERFACE is required"))
-	}
-
 	cfg.Address, cfg.Subnet, err = validateProvisioning(r.Provisioning.Address, r.Provisioning.Subnet)
 	errs = append(errs, err)
+	errs = append(errs, validateInterface(cfg.Interface, cfg.Address, addrsOf))
 
 	cfg.AdminAddr, err = validateAdmin(r.Admin.Address, cfg.Subnet)
 	errs = append(errs, err)
@@ -222,12 +221,59 @@ func validateProvisioning(addrStr, subnetStr string) (netip.Addr, netip.Prefix, 
 	return addr, subnet, errors.Join(errs...)
 }
 
+// interfaceAddrs returns the addresses assigned to the named network
+// interface, or an error when it does not exist.
+type interfaceAddrs func(name string) ([]netip.Addr, error)
+
+// hostInterfaceAddrs is the interfaceAddrs of the host's network interfaces.
+func hostInterfaceAddrs(name string) ([]netip.Addr, error) {
+	iface, err := net.InterfaceByName(name)
+	if err != nil {
+		return nil, err
+	}
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return nil, fmt.Errorf("list addresses: %w", err)
+	}
+	var out []netip.Addr
+	for _, a := range addrs {
+		if ipNet, ok := a.(*net.IPNet); ok {
+			if addr, ok := netip.AddrFromSlice(ipNet.IP); ok {
+				out = append(out, addr.Unmap())
+			}
+		}
+	}
+	return out, nil
+}
+
+// validateInterface requires the provisioning interface to be named and to
+// exist, and, when address is valid, to hold it: proxyDHCP binds the interface
+// and TFTP, HTTP and HTTPS bind the address, so either mismatch would otherwise
+// only surface when the service starts listening.
+func validateInterface(name string, address netip.Addr, addrsOf interfaceAddrs) error {
+	if name == "" {
+		return errors.New("HEPHAESTUS_PROVISIONING_INTERFACE is required")
+	}
+	addrs, err := addrsOf(name)
+	if err != nil {
+		return fmt.Errorf("HEPHAESTUS_PROVISIONING_INTERFACE %q: %w", name, err)
+	}
+	if address.IsValid() && !slices.Contains(addrs, address) {
+		return fmt.Errorf("HEPHAESTUS_PROVISIONING_ADDRESS %s is not assigned to interface %s", address, name)
+	}
+	return nil
+}
+
 // validateAdmin parses the admin listen address and requires a specific
-// management IP that is not inside the provisioning subnet (when that is valid).
+// management IP, on a real port, that is not inside the provisioning subnet
+// (when that is valid).
 func validateAdmin(raw string, subnet netip.Prefix) (netip.AddrPort, error) {
 	ap, err := netip.ParseAddrPort(raw)
 	if err != nil {
 		return netip.AddrPort{}, fmt.Errorf("HEPHAESTUS_ADMIN_ADDRESS %q: must be IP:port", raw)
+	}
+	if ap.Port() == 0 {
+		return netip.AddrPort{}, fmt.Errorf("HEPHAESTUS_ADMIN_ADDRESS %q: port must be 1 to 65535", raw)
 	}
 	// Unmap so [::ffff:10.10.20.9]:9090 is judged as the IPv4 address it is.
 	ap = netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port())

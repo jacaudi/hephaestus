@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"syscall"
@@ -35,6 +36,22 @@ type usageError struct{ err error }
 func (e usageError) Error() string { return e.err.Error() }
 
 func (e usageError) Unwrap() error { return e.err }
+
+// loggedError marks an error that was already logged through slog, so main
+// does not print it a second time.
+type loggedError struct{ err error }
+
+func (e loggedError) Error() string { return e.err.Error() }
+
+func (e loggedError) Unwrap() error { return e.err }
+
+// reportError prints err to w as plain text, unless it was already logged.
+func reportError(w io.Writer, err error) {
+	if _, ok := errors.AsType[loggedError](err); ok { //nolint:errcheck // the match target is not a dropped error; modernize requires AsType over errors.As
+		return
+	}
+	fmt.Fprintf(w, "hephaestus: %v\n", err)
+}
 
 // exitCode maps the error returned by the root command to a process exit code.
 func exitCode(err error) int {
@@ -89,7 +106,7 @@ func main() {
 	err := newRootCmd().ExecuteContext(ctx)
 	stop()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "hephaestus: %v\n", err)
+		reportError(os.Stderr, err)
 	}
 	os.Exit(exitCode(err))
 }

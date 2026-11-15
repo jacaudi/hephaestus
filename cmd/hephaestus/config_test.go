@@ -1,11 +1,14 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -49,6 +52,15 @@ func setMinimalEnv(t *testing.T) string {
 	return dir
 }
 
+// testInterfaces is the interface table the config tests see instead of the
+// host's: vlan20 holds the fixture provisioning address, and nothing else exists.
+func testInterfaces(name string) ([]netip.Addr, error) {
+	if name == "vlan20" {
+		return []netip.Addr{netip.MustParseAddr("fe80::1"), netip.MustParseAddr("10.10.20.5")}, nil
+	}
+	return nil, errors.New("no such network interface")
+}
+
 // load runs loadConfig against a flag set that carries --log-format, parsed from args.
 func load(t *testing.T, args ...string) (serveConfig, error) {
 	t.Helper()
@@ -58,7 +70,7 @@ func load(t *testing.T, args ...string) (serveConfig, error) {
 	if err := fs.Parse(args); err != nil {
 		t.Fatalf("parse flags %v: %v", args, err)
 	}
-	return loadConfig(fs)
+	return loadConfig(fs, testInterfaces)
 }
 
 // writeFile writes content to a new file in a temp dir and returns its path.
@@ -171,6 +183,9 @@ func TestLoadConfig_Invalid(t *testing.T) {
 		{"admin on VLAN", map[string]string{"ADMIN_ADDRESS": "10.10.20.9:9090"}, "HEPHAESTUS_ADMIN_ADDRESS 10.10.20.9:9090 is inside the provisioning subnet 10.10.20.0/24; the admin listener must stay off the VLAN"},
 		{"admin on VLAN as IPv4-mapped", map[string]string{"ADMIN_ADDRESS": "[::ffff:10.10.20.9]:9090"}, "HEPHAESTUS_ADMIN_ADDRESS 10.10.20.9:9090 is inside the provisioning subnet 10.10.20.0/24"},
 		{"admin no port", map[string]string{"ADMIN_ADDRESS": "127.0.0.1"}, `HEPHAESTUS_ADMIN_ADDRESS "127.0.0.1": must be IP:port`},
+		{"admin port zero", map[string]string{"ADMIN_ADDRESS": "127.0.0.1:0"}, `HEPHAESTUS_ADMIN_ADDRESS "127.0.0.1:0": port must be 1 to 65535`},
+		{"unknown interface", map[string]string{"PROVISIONING_INTERFACE": "nosuch0"}, `HEPHAESTUS_PROVISIONING_INTERFACE "nosuch0": no such network interface`},
+		{"address not on interface", map[string]string{"PROVISIONING_ADDRESS": "10.10.20.77"}, "HEPHAESTUS_PROVISIONING_ADDRESS 10.10.20.77 is not assigned to interface vlan20"},
 		{"relative data dir", map[string]string{"DATA_DIR": "relative/dir"}, `HEPHAESTUS_DATA_DIR "relative/dir": must be an absolute path`},
 		{"short key", map[string]string{"DATA_KEY": "AAECAwQFBgcICQoLDA0ODw=="}, "decoded 16 bytes, want 32"},
 		{"both keys", map[string]string{"DATA_KEY_FILE": keyFile}, "set exactly one of HEPHAESTUS_DATA_KEY or HEPHAESTUS_DATA_KEY_FILE"},
@@ -214,6 +229,45 @@ func TestLoadConfig_RelativeDataDirReportsOnlyTheDir(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "HEPHAESTUS_DATABASE_URL") {
 		t.Errorf("error = %q, want no DATABASE_URL complaint", err)
+	}
+}
+
+// A missing interface must not also produce an address complaint derived from it.
+func TestLoadConfig_UnknownInterfaceReportsOnlyTheInterface(t *testing.T) {
+	setMinimalEnv(t)
+	t.Setenv("HEPHAESTUS_PROVISIONING_INTERFACE", "nosuch0")
+
+	_, err := load(t)
+	if err == nil {
+		t.Fatal("loadConfig succeeded, want an error")
+	}
+	if strings.Contains(err.Error(), "is not assigned to interface") {
+		t.Errorf("error = %q, want no address complaint", err)
+	}
+}
+
+// TestHostInterfaceAddrs runs the host lookup serve uses against the host's
+// loopback interface, found by flag so no NIC name is assumed.
+func TestHostInterfaceAddrs(t *testing.T) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		t.Fatalf("net.Interfaces: %v", err)
+	}
+	i := slices.IndexFunc(ifaces, func(i net.Interface) bool { return i.Flags&net.FlagLoopback != 0 })
+	if i < 0 {
+		t.Skip("host has no loopback interface")
+	}
+
+	got, err := hostInterfaceAddrs(ifaces[i].Name)
+	if err != nil {
+		t.Fatalf("hostInterfaceAddrs(%q): %v", ifaces[i].Name, err)
+	}
+	if want := netip.MustParseAddr("127.0.0.1"); !slices.Contains(got, want) {
+		t.Errorf("hostInterfaceAddrs(%q) = %v, want it to contain %v", ifaces[i].Name, got, want)
+	}
+
+	if _, err := hostInterfaceAddrs("nosuch0"); err == nil {
+		t.Error("hostInterfaceAddrs(nosuch0) succeeded, want an error")
 	}
 }
 

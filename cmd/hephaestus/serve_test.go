@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/netip"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -549,6 +550,80 @@ func TestRunServe_AdminWideEvents(t *testing.T) {
 		}
 	}
 	t.Errorf("no \"request\" log line with path /healthz in:\n%s", logs.String())
+}
+
+// TestRunServe_LogsDrainAndStop pins that the shutdown reaches the JSON log
+// stream: "draining" when the context is done, "stopped" after the last stage.
+func TestRunServe_LogsDrainAndStop(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	var logs bytes.Buffer
+	cfg := testServeConfig(t)
+	deps := testDeps(t, selfSignedIssuer(nil))
+	stop, done := startServe(t, cfg, slog.New(slog.NewJSONHandler(&logs, nil)), deps)
+	waitStatus(t, deps.adminURL()+"/readyz", done)
+
+	stop()
+	if err := waitDone(t, done, 10*time.Second); err != nil {
+		t.Fatalf("runServe after cancel = %v, want nil", err)
+	}
+
+	// runServe has returned, so nothing writes to logs any more.
+	var msgs []string
+	for line := range bytes.SplitSeq(logs.Bytes(), []byte("\n")) {
+		var rec map[string]any
+		if json.Unmarshal(line, &rec) != nil {
+			continue
+		}
+		if msg, _ := rec["msg"].(string); msg == "draining" || msg == "stopped" {
+			if rec["level"] != "INFO" {
+				t.Errorf("%q logged at level %v, want INFO", msg, rec["level"])
+			}
+			msgs = append(msgs, msg)
+		}
+	}
+	if want := []string{"draining", "stopped"}; !slices.Equal(msgs, want) {
+		t.Errorf("shutdown log messages = %v, want %v\n%s", msgs, want, logs.String())
+	}
+}
+
+// TestFatalLogged pins that a fatal error after the logger exists is logged at
+// Error level under the error key, once: the returned error is marked so main
+// does not print it a second time, and still exits 1.
+func TestFatalLogged(t *testing.T) {
+	var logs, stderr bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logs, nil))
+	cause := errors.New("listen on 10.10.20.5:80: address in use")
+
+	err := fatalLogged(t.Context(), logger, cause)
+
+	var rec map[string]any
+	if jerr := json.Unmarshal(logs.Bytes(), &rec); jerr != nil {
+		t.Fatalf("log is not one JSON record: %v\n%s", jerr, logs.String())
+	}
+	if rec["level"] != "ERROR" || rec["error"] != cause.Error() {
+		t.Errorf("record = %v, want level ERROR and error %q", rec, cause)
+	}
+	if !errors.Is(err, cause) {
+		t.Errorf("returned error = %v, want one wrapping %v", err, cause)
+	}
+	if got := exitCode(err); got != 1 {
+		t.Errorf("exitCode = %d, want 1", got)
+	}
+	reportError(&stderr, err)
+	if stderr.Len() != 0 {
+		t.Errorf("stderr = %q, want nothing for an error already logged", stderr.String())
+	}
+}
+
+func TestReportError_PrintsUnloggedErrors(t *testing.T) {
+	var stderr bytes.Buffer
+
+	reportError(&stderr, errors.New("HEPHAESTUS_FQDN is required"))
+
+	if want := "hephaestus: HEPHAESTUS_FQDN is required\n"; stderr.String() != want {
+		t.Errorf("stderr = %q, want %q", stderr.String(), want)
+	}
 }
 
 func TestRunServe_ComponentFailureStopsEverything(t *testing.T) {
