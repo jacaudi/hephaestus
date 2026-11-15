@@ -46,7 +46,7 @@ const (
 var errValueTooLong = errors.New("boot: query value too long")
 
 // Handlers serves the boot routes: the iPXE chain scripts and the iPXE binaries
-// over plain HTTP, and /boot over TLS.
+// over plain HTTP, and /boot and /discover over TLS.
 type Handlers struct {
 	repo   *fleet.Repository
 	fqdn   string
@@ -55,7 +55,17 @@ type Handlers struct {
 	now    func() time.Time
 	meter  metric.Meter
 
+	limit             limiterConfig
+	limiter           *windowLimiter
 	decisions, alerts metric.Int64Counter
+	reports           metric.Int64Counter
+}
+
+// limiterConfig is what WithLimiter sets and NewHandlers builds the limiter from.
+type limiterConfig struct {
+	limit    int
+	window   time.Duration
+	capacity int
 }
 
 // Option configures Handlers.
@@ -72,6 +82,14 @@ func WithMeter(m metric.Meter) Option {
 	return func(h *Handlers) { h.meter = m }
 }
 
+// WithLimiter sets how many new machines or changed reports one source address
+// may submit to /discover per window, and how many source addresses are
+// tracked. The defaults are discoverPerSource per discoverWindow over
+// limiterCapacity addresses; tests shrink them.
+func WithLimiter(limit int, window time.Duration, capacity int) Option {
+	return func(h *Handlers) { h.limit = limiterConfig{limit: limit, window: window, capacity: capacity} }
+}
+
 // NewHandlers returns the boot routes for the service at fqdn. Only clients in
 // subnet are served. files holds the iPXE binaries by the names /tftp serves
 // them under, such as "amd64/snp.efi".
@@ -79,10 +97,12 @@ func NewHandlers(repo *fleet.Repository, fqdn string, subnet netip.Prefix, files
 	h := &Handlers{
 		repo: repo, fqdn: fqdn, subnet: subnet, files: files,
 		now: time.Now, meter: noop.NewMeterProvider().Meter(""),
+		limit: limiterConfig{limit: discoverPerSource, window: discoverWindow, capacity: limiterCapacity},
 	}
 	for _, opt := range opts {
 		opt(h)
 	}
+	h.limiter = newWindowLimiter(h.limit.limit, h.limit.window, h.limit.capacity, h.now)
 	var err error
 	h.decisions, err = h.meter.Int64Counter("hephaestus.boot.decisions",
 		metric.WithDescription("Boot decisions served, by decision-table row and action."))
@@ -93,6 +113,11 @@ func NewHandlers(repo *fleet.Repository, fqdn string, subnet netip.Prefix, files
 		metric.WithDescription("Operator alerts raised, by kind."))
 	if err != nil {
 		return nil, fmt.Errorf("boot: alerts counter: %w", err)
+	}
+	h.reports, err = h.meter.Int64Counter("hephaestus.discovery.reports",
+		metric.WithDescription("Inventory reports received on /discover, by outcome."))
+	if err != nil {
+		return nil, fmt.Errorf("boot: discovery reports counter: %w", err)
 	}
 	return h, nil
 }
@@ -107,10 +132,12 @@ func (h *Handlers) PlainHTTP() http.Handler {
 	return RequireSubnet(h.subnet, mux)
 }
 
-// TLS returns the handler for the TLS listener: /boot, behind the subnet guard.
+// TLS returns the handler for the TLS listener: /boot and /discover, behind the
+// subnet guard.
 func (h *Handlers) TLS() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /boot", h.boot)
+	mux.HandleFunc("POST /discover", h.discover)
 	return RequireSubnet(h.subnet, mux)
 }
 
@@ -168,9 +195,14 @@ func (h *Handlers) boot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if d.Alert {
-		h.alerts.Add(ctx, 1, metric.WithAttributes(attribute.String("kind", alertKindUUIDConflict)))
+		h.countAlert(ctx)
 	}
 	h.serve(w, r, d)
+}
+
+// countAlert counts one raised uuid_conflict alert.
+func (h *Handlers) countAlert(ctx context.Context) {
+	h.alerts.Add(ctx, 1, metric.WithAttributes(attribute.String("kind", alertKindUUIDConflict)))
 }
 
 // noteUnrecorded notes on the request's wide event why RecordBoot stored
