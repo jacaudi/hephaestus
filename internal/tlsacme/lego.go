@@ -22,7 +22,12 @@ import (
 	"go.jacaudi.dev/hephaestus/internal/secret"
 )
 
-const userAgent = "hephaestus"
+const (
+	userAgent = "hephaestus"
+	// accountSaveTimeout bounds storing a just-registered account, which must
+	// not depend on the Obtain context (see register).
+	accountSaveTimeout = 30 * time.Second
+)
 
 // LegoConfig configures a LegoIssuer.
 type LegoConfig struct {
@@ -141,7 +146,12 @@ func (l LegoIssuer) register(ctx context.Context, client *lego.Client, user *acm
 	if err != nil {
 		return fmt.Errorf("acme: marshal registration: %w", err)
 	}
-	err = l.cfg.Repo.SaveAccount(ctx, Account{
+	// Manager abandons an Obtain when its context is done, but the server now
+	// holds the account: store it regardless, or the next start registers a
+	// second one. The detached context gets its own timeout.
+	saveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), accountSaveTimeout)
+	defer cancel()
+	err = l.cfg.Repo.SaveAccount(saveCtx, Account{
 		DirectoryURL: l.cfg.DirectoryURL,
 		KeySealed:    l.cfg.Key.Seal(keyDER, accountKeyAAD(l.cfg.DirectoryURL)),
 		Registration: regJSON,

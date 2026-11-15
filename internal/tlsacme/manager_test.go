@@ -14,6 +14,7 @@ import (
 
 	"go.jacaudi.dev/hephaestus/internal/admin"
 	"go.jacaudi.dev/hephaestus/internal/datakey"
+	"go.jacaudi.dev/hephaestus/internal/db"
 	"go.jacaudi.dev/hephaestus/internal/db/dbtest"
 	"go.jacaudi.dev/hephaestus/internal/secret"
 	"go.jacaudi.dev/hephaestus/internal/telemetry"
@@ -78,6 +79,7 @@ func (l *errLog) all() []error {
 
 // harness is one Manager over a fresh SQLite database.
 type harness struct {
+	db    *db.DB
 	repo  *tlsacme.Repository
 	key   *datakey.Key
 	iss   *tlsacmetest.SelfSigned
@@ -88,8 +90,10 @@ type harness struct {
 
 func newHarness(t *testing.T, iss *tlsacmetest.SelfSigned, opts ...tlsacme.Option) *harness {
 	t.Helper()
+	d := dbtest.SQLite(t)
 	h := &harness{
-		repo:  tlsacme.NewRepository(dbtest.SQLite(t)),
+		db:    d,
+		repo:  tlsacme.NewRepository(d),
 		key:   mustKey(t, fixtureKey),
 		clock: &fakeClock{now: start()},
 		errs:  &errLog{},
@@ -357,7 +361,9 @@ func TestReconcile_ShortLivedCertBacksOff(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "already due for renewal") {
 		t.Fatalf("Reconcile error = %v, want one containing %q", err, "already due for renewal")
 	}
-	if want := 10 * time.Minute; wait != want {
+	// The first-failure backoff is 10m, but the issuer is not called again within
+	// 24h of a successful issuance, so the wait is floored at that.
+	if want := 24 * time.Hour; wait != want {
 		t.Errorf("wait = %s, want %s", wait, want)
 	}
 	if s := h.mgr.Status(); !s.Loaded || s.Failures != 1 {
@@ -523,4 +529,112 @@ func TestRun_AbandonsBlockedObtain(t *testing.T) {
 		t.Fatal("Run did not return while Obtain was blocked")
 	}
 	close(block)
+}
+
+// failSaves makes every certificate save fail until the returned function
+// lifts the fault. A trigger fails the upsert inside the database, so the
+// Manager still talks to its real Repository.
+func failSaves(t *testing.T, h *harness) (lift func()) {
+	t.Helper()
+	if _, err := h.db.Bun().ExecContext(t.Context(),
+		"CREATE TRIGGER fail_save BEFORE INSERT ON tls_certificates BEGIN SELECT RAISE(ABORT, 'disk full'); END"); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+	return func() {
+		t.Helper()
+		if _, err := h.db.Bun().ExecContext(t.Context(), "DROP TRIGGER fail_save"); err != nil {
+			t.Fatalf("drop trigger: %v", err)
+		}
+	}
+}
+
+func TestReconcile_StoreFailureKeepsCertAndRetriesSaveOnly(t *testing.T) {
+	h := newHarness(t, ninety())
+	lift := failSaves(t, h)
+
+	for i, wantWait := range []time.Duration{10 * time.Minute, 20 * time.Minute} {
+		wait, err := h.mgr.Reconcile(t.Context())
+		if err == nil || !strings.Contains(err.Error(), "store issued certificate") {
+			t.Fatalf("Reconcile #%d error = %v, want one containing %q", i+1, err, "store issued certificate")
+		}
+		// The next step is a save, not an Obtain, so no 24h floor applies.
+		if wait != wantWait {
+			t.Errorf("Reconcile #%d wait = %s, want %s", i+1, wait, wantWait)
+		}
+		cert, err := h.mgr.GetCertificate(nil)
+		if err != nil || cert.Leaf.DNSNames[0] != domain {
+			t.Errorf("GetCertificate after failed save = %v, %v; want the issued certificate", cert, err)
+		}
+		h.clock.Set(h.clock.Now().Add(wait))
+	}
+	if _, ok, err := h.repo.LoadCertificate(t.Context(), domain); err != nil || ok {
+		t.Fatalf("LoadCertificate = ok %v, err %v; want no stored row while saves fail", ok, err)
+	}
+
+	lift()
+	wait, err := h.mgr.Reconcile(t.Context())
+	if err != nil {
+		t.Fatalf("Reconcile after the fault is lifted: %v", err)
+	}
+	if want := renewIn(h.clock.Now()); wait != want {
+		t.Errorf("wait = %s, want the normal renewal wait %s", wait, want)
+	}
+	if got := h.iss.Calls.Load(); got != 1 {
+		t.Errorf("issuer calls = %d, want 1: a failed save must not re-issue", got)
+	}
+	if _, ok, err := h.repo.LoadCertificate(t.Context(), domain); err != nil || !ok {
+		t.Errorf("LoadCertificate = ok %v, err %v; want the retried save stored", ok, err)
+	}
+	if s := h.mgr.Status(); s.Failures != 0 || s.LastError != "" {
+		t.Errorf("Status() = %+v, want failures reset", s)
+	}
+
+	// Saved and not due: nothing more to do.
+	if _, err := h.mgr.Reconcile(t.Context()); err != nil {
+		t.Errorf("final Reconcile: %v", err)
+	}
+	if got := h.iss.Calls.Load(); got != 1 {
+		t.Errorf("issuer calls = %d, want 1", got)
+	}
+}
+
+// renewIn is the wait the harness's 90-day certificate (valid from start())
+// has left at now.
+func renewIn(now time.Time) time.Duration {
+	return tlsacme.RenewAt(start(), start().Add(ninetyDays)).Sub(now)
+}
+
+func TestReconcile_NoReissueWithin24h(t *testing.T) {
+	// Already due the moment it is issued: RenewAt is 30 days in the past.
+	h := newHarness(t, &tlsacmetest.SelfSigned{NotBefore: start().Add(-ninetyDays), NotAfter: start().Add(time.Hour)})
+
+	wait, err := h.mgr.Reconcile(t.Context())
+	if err == nil || !strings.Contains(err.Error(), "already due for renewal") {
+		t.Fatalf("Reconcile error = %v, want one containing %q", err, "already due for renewal")
+	}
+	if want := 24 * time.Hour; wait != want {
+		t.Errorf("wait = %s, want %s", wait, want)
+	}
+
+	for _, elapsed := range []time.Duration{10 * time.Minute, 5 * time.Hour, 23 * time.Hour} {
+		h.clock.Set(start().Add(elapsed))
+		wait, err := h.mgr.Reconcile(t.Context())
+		if err != nil {
+			t.Fatalf("Reconcile at +%s: %v", elapsed, err)
+		}
+		if want := 24*time.Hour - elapsed; wait != want {
+			t.Errorf("wait at +%s = %s, want %s", elapsed, wait, want)
+		}
+		if got := h.iss.Calls.Load(); got != 1 {
+			t.Fatalf("issuer calls at +%s = %d, want 1", elapsed, got)
+		}
+	}
+
+	h.clock.Set(start().Add(24 * time.Hour))
+	if _, err := h.mgr.Reconcile(t.Context()); err == nil {
+		t.Error("Reconcile at +24h error = nil, want the already-due error again")
+	}
+	if got := h.iss.Calls.Load(); got != 2 {
+		t.Errorf("issuer calls at +24h = %d, want 2", got)
+	}
 }

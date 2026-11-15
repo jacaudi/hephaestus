@@ -26,6 +26,11 @@ const (
 	// maxBackoffShift is the shift at which minBackoff exceeds maxBackoff.
 	maxBackoffShift = 6
 
+	// minReissueInterval is how long the issuer is left alone after a successful
+	// issuance, whatever happens to the certificate: Let's Encrypt limits
+	// duplicate certificates to 5 per name per 7 days.
+	minReissueInterval = 24 * time.Hour
+
 	expiryWarn = 14.0 // days left below which tls:expiry warns
 
 	checkCertificate = "tls:certificate"
@@ -99,6 +104,8 @@ type Manager struct {
 
 	mu       sync.RWMutex
 	cert     *tls.Certificate // nil until loaded; Leaf is always set
+	pending  *Certificate     // issued and served, but not yet stored
+	issuedAt time.Time        // when the last certificate was issued; zero if none this run
 	failures int
 	lastErr  string
 }
@@ -182,16 +189,21 @@ func (m *Manager) Load(ctx context.Context) error {
 // is counted, handed to the error handler and returned with the backoff wait:
 // 10 minutes, doubling per consecutive failure, capped at 6 hours.
 //
+// Issuing costs rate limit (Let's Encrypt allows 5 duplicate certificates per
+// name per 7 days), so a certificate that was issued is never thrown away for
+// a failure after the fact:
+//   - one that could not be stored stays loaded and served, and later calls
+//     retry only the store, never the issuer;
+//   - the issuer is not called again within 24 hours of a successful issuance,
+//     so a certificate that is already due the moment it is issued cannot
+//     trigger a re-issue on every backoff tick; the wait is raised to the end
+//     of that interval.
+//
 // lego's Obtain takes no context, so Reconcile runs it in its own goroutine
 // and abandons it when ctx is done, returning ctx.Err(); the abandoned call
 // finishes on its own and its result is discarded. The next start retries.
 func (m *Manager) Reconcile(ctx context.Context) (time.Duration, error) {
-	if c := m.current(); c != nil {
-		if wait := RenewAt(c.Leaf.NotBefore, c.Leaf.NotAfter).Sub(m.now()); wait > 0 {
-			return wait, nil
-		}
-	}
-	wait, err := m.renew(ctx)
+	wait, err := m.reconcile(ctx)
 	if err != nil {
 		if ctx.Err() != nil {
 			return 0, ctx.Err()
@@ -201,9 +213,25 @@ func (m *Manager) Reconcile(ctx context.Context) (time.Duration, error) {
 	return wait, nil
 }
 
-// renew obtains, checks, stores and loads a new certificate and returns the
-// wait until it is due. A certificate that is already due stays loaded (it is
-// valid) but is reported as an error.
+func (m *Manager) reconcile(ctx context.Context) (time.Duration, error) {
+	if m.hasPending() {
+		return m.persist(ctx)
+	}
+	now := m.now()
+	if c := m.current(); c != nil {
+		if wait := RenewAt(c.Leaf.NotBefore, c.Leaf.NotAfter).Sub(now); wait > 0 {
+			return wait, nil
+		}
+	}
+	if wait := m.untilReissue(now); wait > 0 {
+		return wait, nil
+	}
+	return m.renew(ctx)
+}
+
+// renew obtains and checks a new certificate, serves it, and stores it. A
+// certificate that fails the checks is dropped; one that passes them counts
+// as issued from here on, whatever happens to it next.
 func (m *Manager) renew(ctx context.Context) (time.Duration, error) {
 	issued, err := m.obtain(ctx)
 	if err != nil {
@@ -216,8 +244,23 @@ func (m *Manager) renew(ctx context.Context) (time.Duration, error) {
 	if !slices.Contains(pair.Leaf.DNSNames, m.domain) {
 		return 0, fmt.Errorf("issued certificate does not cover %s", m.domain)
 	}
+
+	m.mu.Lock()
+	m.cert, m.pending, m.issuedAt = pair, &issued, m.now()
+	m.mu.Unlock()
+	return m.persist(ctx)
+}
+
+// persist stores the issued certificate that is waiting to be saved and
+// returns how long until it is due. A certificate that is already due stays
+// loaded (it is valid) but is reported as an error.
+func (m *Manager) persist(ctx context.Context) (time.Duration, error) {
+	m.mu.RLock()
+	issued, pair := m.pending, m.cert
+	m.mu.RUnlock()
+
 	now := m.now()
-	err = m.repo.SaveCertificate(ctx, StoredCertificate{
+	err := m.repo.SaveCertificate(ctx, StoredCertificate{
 		Domain:      m.domain,
 		ChainSealed: m.key.Seal(issued.ChainPEM, chainAAD(m.domain)),
 		KeySealed:   m.key.Seal(issued.KeyPEM, keyAAD(m.domain)),
@@ -228,9 +271,8 @@ func (m *Manager) renew(ctx context.Context) (time.Duration, error) {
 	if err != nil {
 		return 0, fmt.Errorf("store issued certificate: %w", err)
 	}
-
 	m.mu.Lock()
-	m.cert = pair
+	m.pending = nil
 	m.mu.Unlock()
 
 	wait := RenewAt(pair.Leaf.NotBefore, pair.Leaf.NotAfter).Sub(now)
@@ -266,17 +308,41 @@ func (m *Manager) obtain(ctx context.Context) (Certificate, error) {
 	}
 }
 
-// fail records err and returns the backoff wait with it.
+// fail records err and returns the backoff wait with it. When the next step
+// is an issuer call, the wait is at least what is left of the minimum
+// re-issue interval; a pending store retry never calls the issuer, so it
+// keeps the plain backoff.
 func (m *Manager) fail(ctx context.Context, err error) (time.Duration, error) {
 	m.mu.Lock()
 	m.failures++
 	m.lastErr = err.Error()
 	wait := min(minBackoff<<min(m.failures-1, maxBackoffShift), maxBackoff)
+	pending := m.pending != nil
 	m.mu.Unlock()
+	if !pending {
+		wait = max(wait, m.untilReissue(m.now()))
+	}
 
 	m.renewalFailures.Add(ctx, 1)
 	m.onError(ctx, err)
 	return wait, err
+}
+
+// untilReissue is how long the issuer must still be left alone after the last
+// successful issuance; zero or negative when it may be called.
+func (m *Manager) untilReissue(now time.Time) time.Duration {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.issuedAt.IsZero() {
+		return 0
+	}
+	return m.issuedAt.Add(minReissueInterval).Sub(now)
+}
+
+func (m *Manager) hasPending() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.pending != nil
 }
 
 // Run calls Reconcile, waits as it says, and repeats until ctx is done, then
