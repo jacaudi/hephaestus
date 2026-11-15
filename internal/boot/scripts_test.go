@@ -116,4 +116,16 @@ func TestRender(t *testing.T) {
 			}
 		})
 	}
+
+	for _, a := range []Action{"", "bogus"} {
+		t.Run("unknown "+string(a), func(t *testing.T) {
+			got, err := Render(Decision{Row: 6, Action: a}, testFQDN)
+			if !errors.Is(err, ErrUnknownAction) {
+				t.Errorf("Render() error = %v, want ErrUnknownAction", err)
+			}
+			if got != "" {
+				t.Errorf("Render() = %q, want no script", got)
+			}
+		})
+	}
 }

@@ -2,12 +2,17 @@ package boot
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 )
 
 // ErrUnsupportedAction is returned by Render for an action whose script M1
 // does not have.
 var ErrUnsupportedAction = errors.New("boot: script for this action is not available in M1")
+
+// ErrUnknownAction is returned by Render for an action that is not one of the
+// Action constants, so a decision that was never set cannot render as an empty script.
+var ErrUnknownAction = errors.New("boot: unknown action")
 
 // bootQuery is the /boot query string. Request facts reach it only as iPXE
 // variables, never as text.
@@ -62,7 +67,8 @@ func ReportScript(fqdn, then string) string {
 }
 
 // Render returns the script for d. Utility and install scripts belong to M2
-// and M3; Render returns ErrUnsupportedAction for them.
+// and M3; Render returns ErrUnsupportedAction for them, and ErrUnknownAction
+// for an action it does not know.
 func Render(d Decision, fqdn string) (string, error) {
 	var script string
 	switch d.Action {
@@ -74,6 +80,8 @@ func Render(d Decision, fqdn string) (string, error) {
 		script = HoldScript(fqdn, d.Reason)
 	case ActionUtility, ActionInstall:
 		return "", ErrUnsupportedAction
+	default:
+		return "", fmt.Errorf("%w %q", ErrUnknownAction, d.Action)
 	}
 	if d.Report {
 		script = ReportScript(fqdn, script)

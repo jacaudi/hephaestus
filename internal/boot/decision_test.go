@@ -58,6 +58,7 @@ func TestDecide(t *testing.T) {
 		{"boot-next ready", known(fleet.StateInstalled, withBootNext, withUtilityReady),
 			Decision{Row: 3, Action: ActionUtility, Utility: "memtest", ClearBootNext: true}},
 		{"boot-next not ready", known(fleet.StateInstalled, withBootNext), Decision{Row: 6, Action: ActionExit}},
+		{"state none", known(fleet.StateNone), Decision{Row: 5, Action: ActionHold, Reason: "machine state is unknown"}},
 		{"rejected", known(fleet.StateRejected), Decision{Row: 5, Action: ActionHold, Reason: "machine is rejected"}},
 		{"orphaned", known(fleet.StateOrphaned), Decision{Row: 5, Action: ActionHold, Reason: "machine is orphaned"}},
 		{"local-only", known(fleet.StateLocalOnly), Decision{Row: 6, Action: ActionExit}},
