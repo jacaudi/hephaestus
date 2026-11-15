@@ -98,6 +98,7 @@ func loadConfig(fs *pflag.FlagSet) (serveConfig, error) {
 	hook := viper.DecodeHook(mapstructure.ComposeDecodeHookFunc(
 		mapstructure.TextUnmarshallerHookFunc(), // slog.Level from "info"
 		mapstructure.StringToTimeDurationHookFunc(),
+		mapstructure.StringToSliceHookFunc(","), // DecodeHook replaces Viper's defaults (go-standards §10)
 	))
 	if err := v.Unmarshal(&raw, hook); err != nil {
 		return serveConfig{}, fmt.Errorf("decode config: %w", err)

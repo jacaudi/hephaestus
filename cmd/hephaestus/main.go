@@ -77,12 +77,15 @@ Run "hephaestus version" to print the build version.`,
 	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error {
 		return usageError{err}
 	})
-	root.AddCommand(newVersionCmd())
+	root.AddCommand(newVersionCmd(), newServeCmd())
 	return root
 }
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	// After the first signal, restore default handling so a second one kills a
+	// stuck drain (go-standards §13.1).
+	context.AfterFunc(ctx, stop)
 	err := newRootCmd().ExecuteContext(ctx)
 	stop()
 	if err != nil {
