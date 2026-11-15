@@ -64,7 +64,7 @@ type Identity struct {
 }
 
 // BootEvent is the decision /boot made for a request: the row of design
-// section 5.3's decision table, the action and the reason.
+// section 5.2's decision table, the action and the reason.
 type BootEvent struct {
 	Row            int
 	Action, Reason string
