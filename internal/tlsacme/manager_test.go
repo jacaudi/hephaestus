@@ -28,6 +28,9 @@ const (
 	otherKey    = secret.Secret("AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=")
 	ninetyDays  = 90 * 24 * time.Hour
 	failurePath = "obtain certificate for " + domain
+
+	stagingDirectory    = "https://acme-staging.example.test/directory"
+	productionDirectory = "https://acme.example.test/directory"
 )
 
 func start() time.Time { return time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC) }
@@ -280,6 +283,92 @@ func TestLoad_CertForOtherNameIgnored(t *testing.T) {
 	}
 	if h.mgr.Status().Loaded {
 		t.Error("Status().Loaded = true for a certificate that does not cover the domain, want false")
+	}
+}
+
+// TestLoad_OtherDirectoryIgnored pins that a certificate obtained from one ACME
+// directory is not served once another directory is configured: Load skips it
+// and Reconcile obtains and stores a new one from the configured directory.
+func TestLoad_OtherDirectoryIgnored(t *testing.T) {
+	h := newHarness(t, ninety(), tlsacme.WithDirectoryURL(stagingDirectory))
+	if _, err := h.mgr.Reconcile(t.Context()); err != nil {
+		t.Fatalf("Reconcile on the first directory: %v", err)
+	}
+
+	same := h.manager(t, h.key, ninety(), tlsacme.WithDirectoryURL(stagingDirectory))
+	if err := same.Load(t.Context()); err != nil {
+		t.Fatalf("Load on the same directory: %v", err)
+	}
+	if !same.Status().Loaded {
+		t.Error("Status().Loaded = false on the directory the certificate came from, want true")
+	}
+
+	iss := ninety()
+	other := h.manager(t, h.key, iss, tlsacme.WithDirectoryURL(productionDirectory))
+	if err := other.Load(t.Context()); err != nil {
+		t.Fatalf("Load on another directory: %v", err)
+	}
+	if other.Status().Loaded {
+		t.Error("Status().Loaded = true for a certificate from another directory, want false")
+	}
+	if _, err := other.Reconcile(t.Context()); err != nil {
+		t.Fatalf("Reconcile on another directory: %v", err)
+	}
+	if got := iss.Calls.Load(); got != 1 {
+		t.Errorf("issuer calls = %d, want 1", got)
+	}
+	row, ok, err := h.repo.LoadCertificate(t.Context(), domain)
+	if err != nil || !ok {
+		t.Fatalf("LoadCertificate = ok %v, err %v; want true, nil", ok, err)
+	}
+	if row.DirectoryURL != productionDirectory {
+		t.Errorf("stored DirectoryURL = %q, want %q", row.DirectoryURL, productionDirectory)
+	}
+}
+
+// TestLoad_RestartKeepsReissueFloor pins that the 24h floor between issuer
+// calls survives a restart: a stored certificate that is already due is not
+// replaced until 24h after it was stored, however often the service restarts.
+func TestLoad_RestartKeepsReissueFloor(t *testing.T) {
+	// Already due the moment it is issued: RenewAt is 30 days in the past.
+	due := func() *tlsacmetest.SelfSigned {
+		return &tlsacmetest.SelfSigned{NotBefore: start().Add(-ninetyDays), NotAfter: start().Add(time.Hour)}
+	}
+	h := newHarness(t, due())
+	if _, err := h.mgr.Reconcile(t.Context()); err == nil || !strings.Contains(err.Error(), "already due for renewal") {
+		t.Fatalf("Reconcile error = %v, want one containing %q", err, "already due for renewal")
+	}
+
+	for _, elapsed := range []time.Duration{time.Minute, 2 * time.Minute, 23 * time.Hour} {
+		h.clock.Set(start().Add(elapsed))
+		iss := due()
+		restarted := h.manager(t, h.key, iss)
+		if err := restarted.Load(t.Context()); err != nil {
+			t.Fatalf("Load at +%s: %v", elapsed, err)
+		}
+		wait, err := restarted.Reconcile(t.Context())
+		if err != nil {
+			t.Fatalf("Reconcile at +%s: %v", elapsed, err)
+		}
+		if want := 24*time.Hour - elapsed; wait != want {
+			t.Errorf("wait at +%s = %s, want %s", elapsed, wait, want)
+		}
+		if got := iss.Calls.Load(); got != 0 {
+			t.Fatalf("issuer calls at +%s = %d, want 0", elapsed, got)
+		}
+	}
+
+	h.clock.Set(start().Add(24 * time.Hour))
+	iss := due()
+	restarted := h.manager(t, h.key, iss)
+	if err := restarted.Load(t.Context()); err != nil {
+		t.Fatalf("Load at +24h: %v", err)
+	}
+	if _, err := restarted.Reconcile(t.Context()); err == nil {
+		t.Error("Reconcile at +24h error = nil, want the already-due error again")
+	}
+	if got := iss.Calls.Load(); got != 1 {
+		t.Errorf("issuer calls at +24h = %d, want 1", got)
 	}
 }
 

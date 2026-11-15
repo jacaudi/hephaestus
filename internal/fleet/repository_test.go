@@ -475,6 +475,7 @@ func runRepositorySuite(t *testing.T, open func(testing.TB) *db.DB) {
 			{"orphaned_from on a state that is not orphaned", "state = 'discovered', prior_state = NULL, orphaned_from = 'installed'"},
 			{"orphaned_from on cordoned over another state", "state = 'cordoned', prior_state = 'installed', orphaned_from = 'installed'"},
 			{"orphaned without orphaned_from", "state = 'orphaned', prior_state = NULL, orphaned_from = NULL"},
+			{"cordoned over orphaned without orphaned_from", "state = 'cordoned', prior_state = 'orphaned', orphaned_from = NULL"},
 		}
 		for _, tc := range tests {
 			if err := execRaw(t, d, "UPDATE machines SET "+tc.set+" WHERE id = ?", m.ID); err == nil {

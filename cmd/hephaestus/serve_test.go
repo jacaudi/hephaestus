@@ -387,6 +387,37 @@ func TestRunServe_WrongDataKeyFails(t *testing.T) {
 	requireUnanswered(t, probe)
 }
 
+// TestRunServe_OtherDirectoryCertificateReissued pins that a certificate stored
+// under one ACME directory is not served once HEPHAESTUS_ACME_DIRECTORY_URL
+// names another: the second run obtains its own certificate before it is ready.
+func TestRunServe_OtherDirectoryCertificateReissued(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	cfg := testServeConfig(t)
+	cfg.ACMEDirectoryURL = "https://acme-staging.example.test/directory"
+	deps := testDeps(t, selfSignedIssuer(nil))
+	stop, done := startServe(t, cfg, discardLogger(), deps)
+	waitStatus(t, deps.adminURL()+"/readyz", done)
+	waitStored(t, cfg)
+	stop()
+	if err := waitDone(t, done, 10*time.Second); err != nil {
+		t.Fatalf("first run after cancel = %v, want nil", err)
+	}
+
+	cfg.ACMEDirectoryURL = "https://acme.example.test/directory"
+	iss := &tlsacmetest.SelfSigned{NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(90 * 24 * time.Hour)}
+	deps = testDeps(t, func(context.Context, *tlsacme.Repository, *datakey.Key) (tlsacme.Issuer, error) { return iss, nil })
+	stop, done = startServe(t, cfg, discardLogger(), deps)
+	waitStatus(t, deps.adminURL()+"/readyz", done)
+	if got := iss.Calls.Load(); got != 1 {
+		t.Errorf("issuer calls on the second directory = %d, want 1", got)
+	}
+	stop()
+	if err := waitDone(t, done, 10*time.Second); err != nil {
+		t.Errorf("second run after cancel = %v, want nil", err)
+	}
+}
+
 func TestServeCmd_InvalidConfig(t *testing.T) {
 	clearEnv(t)
 

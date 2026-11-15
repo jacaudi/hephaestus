@@ -15,10 +15,12 @@ CREATE TABLE machines (
     created_at    TEXT NOT NULL,
     last_seen_at  TEXT NOT NULL,
     -- A lifecycle shape Next can produce: cordoned remembers a prior state, and only an
-    -- orphaned machine, or one cordoned over orphaned, remembers the state it was orphaned from.
+    -- orphaned machine, or one cordoned over orphaned, remembers the state it was orphaned from;
+    -- cordoned over orphaned always does.
     CHECK ((state = 'cordoned') = (prior_state IS NOT NULL)),
     CHECK (orphaned_from IS NULL OR state = 'orphaned' OR (state = 'cordoned' AND prior_state = 'orphaned')),
-    CHECK (state <> 'orphaned' OR orphaned_from IS NOT NULL)
+    CHECK (state <> 'orphaned' OR orphaned_from IS NOT NULL),
+    CHECK (state <> 'cordoned' OR prior_state <> 'orphaned' OR orphaned_from IS NOT NULL)
 ) STRICT;
 CREATE UNIQUE INDEX machines_valid_uuid ON machines (smbios_uuid) WHERE junk = 0;
 CREATE INDEX machines_uuid ON machines (smbios_uuid);
@@ -68,12 +70,13 @@ CREATE TABLE acme_accounts (
     created_at    TEXT NOT NULL
 ) STRICT;
 CREATE TABLE tls_certificates (
-    domain       TEXT PRIMARY KEY,
-    chain_sealed BLOB NOT NULL,
-    key_sealed   BLOB NOT NULL,
-    not_before   TEXT NOT NULL,
-    not_after    TEXT NOT NULL,
-    updated_at   TEXT NOT NULL
+    domain        TEXT PRIMARY KEY,
+    directory_url TEXT NOT NULL,
+    chain_sealed  BLOB NOT NULL,
+    key_sealed    BLOB NOT NULL,
+    not_before    TEXT NOT NULL,
+    not_after     TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
 ) STRICT;
 
 -- +goose Down

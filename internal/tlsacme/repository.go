@@ -21,11 +21,11 @@ type Account struct {
 	CreatedAt    time.Time
 }
 
-// StoredCertificate is the certificate of one domain as stored: the chain and
-// the private key sealed, and the validity window in clear so it can be
-// inspected without the data key.
+// StoredCertificate is the certificate of one domain as stored: the ACME
+// directory it came from, the chain and the private key sealed, and the
+// validity window in clear so it can be inspected without the data key.
 type StoredCertificate struct {
-	Domain                         string
+	Domain, DirectoryURL           string
 	ChainSealed, KeySealed         []byte
 	NotBefore, NotAfter, UpdatedAt time.Time
 }
@@ -44,12 +44,13 @@ type accountRow struct {
 type certificateRow struct {
 	bun.BaseModel `bun:"table:tls_certificates"`
 
-	Domain      string    `bun:"domain,pk"`
-	ChainSealed []byte    `bun:"chain_sealed"`
-	KeySealed   []byte    `bun:"key_sealed"`
-	NotBefore   time.Time `bun:"not_before"`
-	NotAfter    time.Time `bun:"not_after"`
-	UpdatedAt   time.Time `bun:"updated_at"`
+	Domain       string    `bun:"domain,pk"`
+	DirectoryURL string    `bun:"directory_url"`
+	ChainSealed  []byte    `bun:"chain_sealed"`
+	KeySealed    []byte    `bun:"key_sealed"`
+	NotBefore    time.Time `bun:"not_before"`
+	NotAfter     time.Time `bun:"not_after"`
+	UpdatedAt    time.Time `bun:"updated_at"`
 }
 
 // Repository stores the ACME account and the certificate.
@@ -101,15 +102,17 @@ func (r *Repository) LoadAccount(ctx context.Context, directoryURL string) (Acco
 // SaveCertificate stores c, replacing the certificate of the same domain.
 func (r *Repository) SaveCertificate(ctx context.Context, c StoredCertificate) error {
 	row := certificateRow{
-		Domain:      c.Domain,
-		ChainSealed: c.ChainSealed,
-		KeySealed:   c.KeySealed,
-		NotBefore:   c.NotBefore.UTC(),
-		NotAfter:    c.NotAfter.UTC(),
-		UpdatedAt:   c.UpdatedAt.UTC(),
+		Domain:       c.Domain,
+		DirectoryURL: c.DirectoryURL,
+		ChainSealed:  c.ChainSealed,
+		KeySealed:    c.KeySealed,
+		NotBefore:    c.NotBefore.UTC(),
+		NotAfter:     c.NotAfter.UTC(),
+		UpdatedAt:    c.UpdatedAt.UTC(),
 	}
 	_, err := r.bdb.NewInsert().Model(&row).
 		On("CONFLICT (domain) DO UPDATE").
+		Set("directory_url = EXCLUDED.directory_url").
 		Set("chain_sealed = EXCLUDED.chain_sealed").
 		Set("key_sealed = EXCLUDED.key_sealed").
 		Set("not_before = EXCLUDED.not_before").
@@ -133,11 +136,12 @@ func (r *Repository) LoadCertificate(ctx context.Context, domain string) (Stored
 		return StoredCertificate{}, false, fmt.Errorf("tlsacme: load certificate: %w", err)
 	}
 	return StoredCertificate{
-		Domain:      row.Domain,
-		ChainSealed: row.ChainSealed,
-		KeySealed:   row.KeySealed,
-		NotBefore:   row.NotBefore.UTC(),
-		NotAfter:    row.NotAfter.UTC(),
-		UpdatedAt:   row.UpdatedAt.UTC(),
+		Domain:       row.Domain,
+		DirectoryURL: row.DirectoryURL,
+		ChainSealed:  row.ChainSealed,
+		KeySealed:    row.KeySealed,
+		NotBefore:    row.NotBefore.UTC(),
+		NotAfter:     row.NotAfter.UTC(),
+		UpdatedAt:    row.UpdatedAt.UTC(),
 	}, true, nil
 }

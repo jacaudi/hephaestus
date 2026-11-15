@@ -72,6 +72,13 @@ func WithErrorHandler(h func(context.Context, error)) Option {
 	return func(m *Manager) { m.onError = h }
 }
 
+// WithDirectoryURL sets the ACME directory the Issuer obtains certificates from.
+// The Manager stores it with every certificate and ignores a stored certificate
+// that came from another directory, so switching directories (staging to
+// production) obtains a new certificate instead of serving the old one. The
+// default is "", which matches only certificates stored without a directory.
+func WithDirectoryURL(url string) Option { return func(m *Manager) { m.directoryURL = url } }
+
 // WithMeter sets the meter the Manager's instruments are registered on; the
 // default is a no-op meter.
 func WithMeter(meter metric.Meter) Option { return func(m *Manager) { m.meter = meter } }
@@ -96,16 +103,17 @@ type Manager struct {
 	iss    Issuer
 	domain string
 
-	now     func() time.Time
-	onError func(context.Context, error)
-	meter   metric.Meter
+	directoryURL string
+	now          func() time.Time
+	onError      func(context.Context, error)
+	meter        metric.Meter
 
 	renewalFailures metric.Int64Counter
 
 	mu       sync.RWMutex
 	cert     *tls.Certificate // nil until loaded; Leaf is always set
 	pending  *Certificate     // issued and served, but not yet stored
-	issuedAt time.Time        // when the last certificate was issued; zero if none this run
+	issuedAt time.Time        // when the served certificate was issued or last stored; zero if none
 	failures int
 	lastErr  string
 }
@@ -151,14 +159,14 @@ func NewManager(repo *Repository, key *datakey.Key, iss Issuer, domain string, o
 // Load serves the certificate stored for the domain, if there is one. A
 // stored certificate that does not open under the data key is an error, never
 // a reason to issue a new one: that would hide a wrong key and burn rate
-// limits. A certificate that does not cover the domain (the FQDN changed) is
-// ignored, so Run issues a new one.
+// limits. A certificate that does not cover the domain (the FQDN changed) or
+// that came from another ACME directory is ignored, so Run issues a new one.
 func (m *Manager) Load(ctx context.Context) error {
 	row, ok, err := m.repo.LoadCertificate(ctx, m.domain)
 	if err != nil {
 		return err
 	}
-	if !ok {
+	if !ok || row.DirectoryURL != m.directoryURL {
 		return nil
 	}
 	chain, err := m.key.Open(row.ChainSealed, chainAAD(m.domain))
@@ -177,7 +185,7 @@ func (m *Manager) Load(ctx context.Context) error {
 		return nil
 	}
 	m.mu.Lock()
-	m.cert = pair
+	m.cert, m.issuedAt = pair, row.UpdatedAt
 	m.mu.Unlock()
 	return nil
 }
@@ -261,12 +269,13 @@ func (m *Manager) persist(ctx context.Context) (time.Duration, error) {
 
 	now := m.now()
 	err := m.repo.SaveCertificate(ctx, StoredCertificate{
-		Domain:      m.domain,
-		ChainSealed: m.key.Seal(issued.ChainPEM, chainAAD(m.domain)),
-		KeySealed:   m.key.Seal(issued.KeyPEM, keyAAD(m.domain)),
-		NotBefore:   pair.Leaf.NotBefore,
-		NotAfter:    pair.Leaf.NotAfter,
-		UpdatedAt:   now,
+		Domain:       m.domain,
+		DirectoryURL: m.directoryURL,
+		ChainSealed:  m.key.Seal(issued.ChainPEM, chainAAD(m.domain)),
+		KeySealed:    m.key.Seal(issued.KeyPEM, keyAAD(m.domain)),
+		NotBefore:    pair.Leaf.NotBefore,
+		NotAfter:     pair.Leaf.NotAfter,
+		UpdatedAt:    now,
 	})
 	if err != nil {
 		return 0, fmt.Errorf("store issued certificate: %w", err)

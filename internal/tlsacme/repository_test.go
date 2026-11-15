@@ -66,10 +66,11 @@ func runRepositorySuite(t *testing.T, open func(testing.TB) *db.DB) {
 		repo := tlsacme.NewRepository(open(t))
 		ctx := t.Context()
 		first := tlsacme.StoredCertificate{
-			Domain: domain, ChainSealed: []byte("chain-1"), KeySealed: []byte("key-1"),
+			Domain: domain, DirectoryURL: stagingDirectory, ChainSealed: []byte("chain-1"), KeySealed: []byte("key-1"),
 			NotBefore: start(), NotAfter: start().Add(90 * 24 * time.Hour), UpdatedAt: start(),
 		}
 		second := first
+		second.DirectoryURL = productionDirectory
 		second.ChainSealed, second.KeySealed = []byte("chain-2"), []byte("key-2")
 		second.NotAfter = start().Add(120 * 24 * time.Hour)
 		second.UpdatedAt = start().Add(time.Hour)
@@ -82,6 +83,9 @@ func runRepositorySuite(t *testing.T, open func(testing.TB) *db.DB) {
 		got, ok, err := repo.LoadCertificate(ctx, domain)
 		if err != nil || !ok {
 			t.Fatalf("LoadCertificate = ok %v, err %v; want true, nil", ok, err)
+		}
+		if got.DirectoryURL != second.DirectoryURL {
+			t.Errorf("DirectoryURL = %q, want the second save %q", got.DirectoryURL, second.DirectoryURL)
 		}
 		if !bytes.Equal(got.ChainSealed, second.ChainSealed) || !bytes.Equal(got.KeySealed, second.KeySealed) {
 			t.Errorf("sealed = %q/%q, want the second save %q/%q", got.ChainSealed, got.KeySealed, second.ChainSealed, second.KeySealed)

@@ -198,6 +198,7 @@ func runServe(ctx context.Context, cfg serveConfig, logger *slog.Logger, deps se
 		return fmt.Errorf("build certificate issuer: %w", err)
 	}
 	mgr, err := tlsacme.NewManager(acmeRepo, cfg.DataKey, iss, cfg.FQDN,
+		tlsacme.WithDirectoryURL(cfg.ACMEDirectoryURL),
 		tlsacme.WithMeter(metrics.Meter()),
 		tlsacme.WithErrorHandler(func(ctx context.Context, err error) {
 			logger.WarnContext(ctx, "certificate renewal failed", "error", err)
