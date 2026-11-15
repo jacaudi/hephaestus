@@ -261,6 +261,28 @@ func TestDiscover_Conflict(t *testing.T) {
 	}
 }
 
+// TestDiscover_JunkPatternUUIDNeverMatchesValidUUIDMachine pins that a report
+// with a junk-pattern UUID is its own machine, never the valid-UUID machine that
+// owns the MAC it names.
+func TestDiscover_JunkPatternUUIDNeverMatchesValidUUIDMachine(t *testing.T) {
+	g := newRig(t)
+	g.boot(bootQ)
+	g.setState(fleet.StateInstalled)
+
+	g.discoverOK(discoverForm("uuid", zeroUUID, "serial", "S2"))
+
+	m := g.machine()
+	if m.Junk || m.State != fleet.StateInstalled {
+		t.Errorf("valid-UUID machine = junk %v, state %s; want not junk, still installed", m.Junk, m.State)
+	}
+	if n := g.count("SELECT count(*) FROM machines"); n != 2 {
+		t.Errorf("machines = %d, want 2 (the report got its own record)", n)
+	}
+	if n := g.count("SELECT count(*) FROM audit_events WHERE action = 'alert.uuid_conflict'"); n != 0 {
+		t.Errorf("alert rows = %d, want 0", n)
+	}
+}
+
 func TestDiscover_NewMachineChargedOnce(t *testing.T) {
 	g := newRig(t, WithLimiter(1, discoverWindow, limiterCapacity))
 

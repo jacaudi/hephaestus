@@ -120,8 +120,9 @@ type Repository struct {
 // NewRepository returns a Repository over d.
 func NewRepository(d *db.DB) *Repository { return &Repository{bdb: d.Bun()} }
 
-// Lookup finds the machine an Identity belongs to. A junk UUID says nothing
-// about the machine, so it is found by the MAC it owns. Otherwise the UUID
+// Lookup finds the machine an Identity belongs to. A junk-pattern UUID says
+// nothing about the machine, so it is found by the MAC it owns, and only when
+// that machine is itself keyed by a junk-pattern UUID. Otherwise the UUID
 // finds it; when every machine holding that UUID is junk, the one owning the
 // MAC wins, then the oldest with the same serial and product.
 func (r *Repository) Lookup(ctx context.Context, id Identity) (Machine, bool, error) {
@@ -396,13 +397,21 @@ func storedUnknownAction(ctx context.Context, q bun.IDB) (string, error) {
 	return value, nil
 }
 
+// lookupMachine finds the machine id names. A request with a junk-pattern UUID
+// is keyed by its MAC, but only to a machine that is itself keyed by a
+// junk-pattern UUID: a machine with a valid UUID is never that request, so the
+// request gets its own record and cannot mark or move the valid one.
 func lookupMachine(ctx context.Context, q bun.IDB, id Identity) (Machine, bool, error) {
 	if JunkPattern(id.UUID) {
 		owner, err := macOwner(ctx, q, id.MAC)
 		if err != nil || owner == "" {
 			return Machine{}, false, err
 		}
-		return foundMachine(loadMachine(ctx, q, owner))
+		m, ok, err := foundMachine(loadMachine(ctx, q, owner))
+		if err != nil || !ok || !JunkPattern(m.UUID) {
+			return Machine{}, false, err
+		}
+		return m, true, nil
 	}
 
 	var cands []Machine

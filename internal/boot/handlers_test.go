@@ -381,6 +381,44 @@ func TestBoot_JunkPatternUUIDConflictViaMAC(t *testing.T) {
 	}
 }
 
+// TestBoot_JunkPatternUUIDNeverMatchesValidUUIDMachine pins that a request with
+// no or a junk-pattern UUID is its own machine, never the valid-UUID machine that
+// owns the MAC it names: that machine keeps its UUID and its state.
+func TestBoot_JunkPatternUUIDNeverMatchesValidUUIDMachine(t *testing.T) {
+	const noUUID = "mac=aa-bb-cc-00-00-01&arch=x86_64&serial=%s&product=P1"
+	tests := []struct {
+		name  string
+		query string
+	}{
+		{"zero UUID, other serial", zeroQuery("S2")},
+		{"zero UUID, same serial and product", zeroQuery("S1")},
+		{"no UUID, other serial", fmt.Sprintf(noUUID, "S2")},
+		{"no UUID, same serial and product", fmt.Sprintf(noUUID, "S1")},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			g := newRig(t)
+			g.boot(bootQ)
+			g.setState(fleet.StateInstalling)
+
+			if body := g.boot(tc.query); strings.Contains(body, holdingConflict) {
+				t.Errorf("body = %q, want no identity conflict", body)
+			}
+
+			m := g.machine()
+			if m.Junk || m.State != fleet.StateInstalling {
+				t.Errorf("valid-UUID machine = junk %v, state %s; want not junk, still installing", m.Junk, m.State)
+			}
+			if n := g.count("SELECT count(*) FROM machines"); n != 2 {
+				t.Errorf("machines = %d, want 2 (the request got its own record)", n)
+			}
+			if n := g.count("SELECT count(*) FROM audit_events WHERE action = 'alert.uuid_conflict'"); n != 0 {
+				t.Errorf("alert rows = %d, want 0", n)
+			}
+		})
+	}
+}
+
 func TestBoot_AssignedHoldsOnAssets(t *testing.T) {
 	g := newRig(t)
 	g.boot(bootQ)

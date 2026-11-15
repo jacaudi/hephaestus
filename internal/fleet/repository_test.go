@@ -297,6 +297,31 @@ func runRepositorySuite(t *testing.T, open func(testing.TB) *db.DB) {
 		wantMACs(t, mustGet(t, r, a.ID))
 	})
 
+	t.Run("JunkPatternNeverMatchesValidUUIDMachine", func(t *testing.T) {
+		d := open(t)
+		r := NewRepository(d)
+		a := firstContact(t, r, originalIdentity(), t0)
+		for _, uuid := range []string{"", zeroUUID, "ffffffff-ffff-ffff-ffff-ffffffffffff"} {
+			if got, ok := lookup(t, r, Identity{UUID: uuid, MAC: macN(1), Serial: "S1", Product: "P1"}); ok {
+				t.Errorf("Lookup(UUID %q, the MAC of a valid-UUID machine) = %s, want not found", uuid, got.ID)
+			}
+		}
+
+		obs, err := r.Observe(t.Context(), Identity{UUID: zeroUUID, MAC: macN(1), Serial: "S2", Product: "P1"}, ArchAMD64, t0.Add(time.Minute))
+		if err != nil {
+			t.Fatalf("Observe: %v", err)
+		}
+		if !obs.Created || obs.Alerted || obs.Machine.ID == a.ID || !obs.Machine.Junk {
+			t.Fatalf("Observe = %+v, want a new junk machine without an alert", obs)
+		}
+		if got := mustGet(t, r, a.ID); got.Junk || got.State != StateDiscovered {
+			t.Fatalf("valid-UUID machine = junk %v, state %s; want untouched", got.Junk, got.State)
+		}
+		if n := scalar[int](t, d, "SELECT count(*) FROM audit_events WHERE action = 'alert.uuid_conflict'"); n != 0 {
+			t.Fatalf("alerts = %d, want 0", n)
+		}
+	})
+
 	t.Run("FleetFull", func(t *testing.T) {
 		d := open(t)
 		r := NewRepository(d)
