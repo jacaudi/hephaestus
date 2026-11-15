@@ -13,7 +13,7 @@ task build
 | Variable | Default | Meaning |
 |---|---|---|
 | `HEPHAESTUS_FQDN` | required | Name the boot HTTPS certificate covers |
-| `HEPHAESTUS_PROVISIONING_INTERFACE` | required | Interface proxyDHCP listens on |
+| `HEPHAESTUS_PROVISIONING_INTERFACE` | required | Interface proxyDHCP listens on; it must exist and hold the provisioning address |
 | `HEPHAESTUS_PROVISIONING_ADDRESS` | required | This host's IPv4 address on the provisioning subnet |
 | `HEPHAESTUS_PROVISIONING_SUBNET` | required | Provisioning subnet, as an IPv4 CIDR prefix |
 | `HEPHAESTUS_DATA_KEY` or `HEPHAESTUS_DATA_KEY_FILE` | required (set exactly one) | Base64 32-byte key that seals stored secrets |
@@ -38,15 +38,23 @@ export HEPHAESTUS_PROVISIONING_SUBNET=10.10.20.0/24
 ./bin/hephaestus serve
 ```
 
-Ports 67, 69, 80, 443 and 4011 (proxyDHCP, TFTP, HTTP, HTTPS) are privileged. The container image grants the binary `cap_net_bind_service`, which covers them, so it runs as UID 65532; a bare binary needs the same capability or root.
+Ports 67, 69, 80 and 443 (proxyDHCP, TFTP, HTTP, HTTPS) are privileged; proxyDHCP also listens on 4011. The container image grants the binary `cap_net_bind_service`, which covers them, so it runs as UID 65532; a bare binary needs the same capability or root.
 
 ## Run the image
 
-The image's default state directory is `/var/lib/hephaestus`, owned by UID 65532. Mount persistent storage there: the SQLite database holds the sealed ACME account and certificate, so losing it forces a re-issue. A bind mount must be owned by 65532. Pass the variables from the env table above. proxyDHCP listens on a host interface, so the container uses the host network.
+The image's default state directory is `/var/lib/hephaestus`, owned by UID 65532. Mount persistent storage there: the SQLite database holds the sealed ACME account and certificate, so losing it forces a re-issue. A bind mount must be owned by 65532. Pass the variables from the env table above.
 
 ```sh
-docker run --rm --network host -v hephaestus-data:/var/lib/hephaestus --env-file hephaestus.env hephaestus:dev
+docker run --rm --network host --stop-timeout 60 -v hephaestus-data:/var/lib/hephaestus --env-file hephaestus.env hephaestus:dev
 ```
+
+What the host must provide:
+
+- `CAP_NET_BIND_SERVICE` kept. The image fails under `--cap-drop ALL` unless you also pass `--cap-add NET_BIND_SERVICE`.
+- Host networking, on the provisioning VLAN interface. proxyDHCP binds that interface (UDP 67 and 4011); TFTP, HTTP and HTTPS bind its primary address, `HEPHAESTUS_PROVISIONING_ADDRESS`.
+- A LAN DNS record for `HEPHAESTUS_FQDN` that points at that address.
+- Ports 80 and 443 on that address free: the host's own web UI must not bind 0.0.0.0:80 or 0.0.0.0:443.
+- A stop timeout of at least `HEPHAESTUS_SHUTDOWN_GRACE` (default 60s): `docker stop` waits only 10s unless you set `--stop-timeout` (compose: `stop_grace_period`).
 
 ## Prerequisites
 
@@ -77,7 +85,7 @@ Machines PXE-boot, chain into iPXE over TFTP, then fetch their boot script over 
 task ci            # fmt and tidy checks, lint, vuln, hadolint, go test -race, cross-compile,
                    # Postgres integration tests, coverage gate (needs DOCKER_HOST)
 task ipxe:build    # rebuild the embedded iPXE binaries (needs DOCKER_HOST)
-task image:build   # build hephaestus:dev for linux/arm64 (needs DOCKER_HOST)
+task image:build   # build hephaestus:dev for linux/arm64; PLATFORM=linux/amd64 overrides (needs DOCKER_HOST)
 ```
 
 With colima, set `DOCKER_HOST=unix:///Users/<you>/.colima/default/docker.sock`. The Dockerfile builds linux/amd64 and linux/arm64 by cross-compiling on the build platform; the final image is distroless and runs as `65532:65532`.

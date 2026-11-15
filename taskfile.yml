@@ -53,10 +53,11 @@ tasks:
     cmds:
       - docker run --rm --platform linux/arm64 -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" -v "{{.ROOT_DIR}}:/src" hephaestus-ipxe-builder:local sh /src/build/ipxe/build.sh testca "{{.TEST_CA}}"
   image:build:
-    desc: Build and load hephaestus:dev for linux/arm64 (needs DOCKER_HOST)
+    desc: Build and load hephaestus:dev for PLATFORM, default linux/arm64, e.g. task image:build PLATFORM=linux/amd64 (needs DOCKER_HOST)
     vars:
+      PLATFORM: '{{.PLATFORM | default "linux/arm64"}}'
       VERSION: {sh: git describe --tags --always --dirty}
       COMMIT: {sh: git rev-parse --short HEAD}
       DATE: {sh: date -u +%Y-%m-%dT%H:%M:%SZ}
     cmds:
-      - docker buildx build --platform linux/arm64 --load --progress=plain --build-arg VERSION={{.VERSION}} --build-arg COMMIT={{.COMMIT}} --build-arg DATE={{.DATE}} -t hephaestus:dev .
+      - docker buildx build --platform {{.PLATFORM}} --load --progress=plain --build-arg VERSION={{.VERSION}} --build-arg COMMIT={{.COMMIT}} --build-arg DATE={{.DATE}} -t hephaestus:dev .

@@ -19,7 +19,7 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags "-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=${DATE}" -o /out/hephaestus ./cmd/hephaestus \
     && setcap cap_net_bind_service=+ep /out/hephaestus \
     && getcap /out/hephaestus \
-    && mkdir /out/data
+    && mkdir -m 0700 /out/data
 
 FROM gcr.io/distroless/static-debian13:nonroot@sha256:aafe993665bf6200db38a02c11a9351e782a84b6a45e7f33b6695638c88e3931
 ARG VERSION=dev
