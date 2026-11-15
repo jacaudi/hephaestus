@@ -27,6 +27,7 @@ Not copied: `pkg/dhcp/boot_contract_test.go`. It imports provider-internal packa
 2. `proxy.go`: the `github.com/siderolabs/gen/xslices` `Map` call in `validateDHCP` replaced by a plain loop building the same `[]string`; the `siderolabs/gen` dependency is dropped.
 3. `proxy_test.go`: the import of the provider's own `github.com/siderolabs/omni-infra-provider-bare-metal/pkg/dhcp` rewritten to `go.jacaudi.dev/hephaestus/internal/third_party/omniprovider/dhcp`.
 4. `dhcp.go`, `export_test.go`: unchanged apart from the provenance line.
+5. `tftp_server.go`: `NewServer` takes the provisioning subnet, and `handleRead` refuses a request whose peer address is outside it (or that does not name one), the UDP counterpart of the HTTP source-subnet guard. `tftp/tftp_server_test.go` is original to this repository.
 
 Tests keep `testify`. Upstream log levels are kept: this directory is exempt from the "no Info or above in `internal/**`" rule.
 
