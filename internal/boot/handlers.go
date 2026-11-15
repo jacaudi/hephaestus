@@ -46,8 +46,8 @@ const (
 // value over maxValueBytes, wrapped with the key it came from.
 var errValueTooLong = errors.New("boot: value too long")
 
-// Handlers serves the boot routes: the iPXE chain scripts and the iPXE binaries
-// over plain HTTP, and /boot and /discover over TLS.
+// Handlers serves the boot routes: the iPXE chain scripts over plain HTTP, the
+// iPXE binaries over plain HTTP and TLS, and /boot and /discover over TLS.
 type Handlers struct {
 	repo   *fleet.Repository
 	fqdn   string
@@ -135,12 +135,13 @@ func (h *Handlers) PlainHTTP() http.Handler {
 	return RequireSubnet(h.subnet, mux)
 }
 
-// TLS returns the handler for the TLS listener: /boot and /discover, behind the
-// subnet guard.
+// TLS returns the handler for the TLS listener: /boot, /discover and the iPXE
+// binaries, behind the subnet guard.
 func (h *Handlers) TLS() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /boot", h.boot)
 	mux.HandleFunc("POST /discover", h.discover)
+	mux.HandleFunc("GET /tftp/{arch}/snp.efi", h.tftp)
 	return RequireSubnet(h.subnet, mux)
 }
 

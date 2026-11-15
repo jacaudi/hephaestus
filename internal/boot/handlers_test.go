@@ -720,13 +720,37 @@ func TestTFTPRoute_EmbeddedBinaries(t *testing.T) {
 	}
 }
 
-func TestTFTPRoute_NotOnTLSMux(t *testing.T) {
-	g := newRig(t)
+func TestTFTPRoute_OnBothMuxes(t *testing.T) {
+	files, err := ipxe.Files()
+	if err != nil {
+		t.Fatalf("ipxe.Files: %v", err)
+	}
+	h, err := NewHandlers(fleet.NewRepository(dbtest.SQLite(t)), testFQDN, testSubnet(), files, WithClock(testNow))
+	if err != nil {
+		t.Fatalf("NewHandlers: %v", err)
+	}
 
-	rec := httptest.NewRecorder()
-	g.h.TLS().ServeHTTP(rec, newRequest(t, "/tftp/amd64/snp.efi", true))
+	for _, mux := range []struct {
+		name    string
+		handler http.Handler
+		secure  bool
+	}{
+		{"plain HTTP", h.PlainHTTP(), false},
+		{"TLS", h.TLS(), true},
+	} {
+		for _, arch := range []string{"amd64", "arm64"} {
+			rec := httptest.NewRecorder()
+			mux.handler.ServeHTTP(rec, newRequest(t, "/tftp/"+arch+"/snp.efi", mux.secure))
 
-	wantStatus(t, rec, http.StatusNotFound)
+			if rec.Code != http.StatusOK {
+				t.Errorf("%s %s: status = %d, want 200", mux.name, arch, rec.Code)
+				continue
+			}
+			if want := files[arch+"/snp.efi"]; len(want) == 0 || !bytes.Equal(rec.Body.Bytes(), want) {
+				t.Errorf("%s %s: served %d bytes, want the %d embedded bytes", mux.name, arch, rec.Body.Len(), len(want))
+			}
+		}
+	}
 }
 
 func TestTFTPRoute_DeadlineOnRealConn(t *testing.T) {

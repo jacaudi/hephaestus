@@ -236,9 +236,9 @@ func runServe(ctx context.Context, cfg serveConfig, logger *slog.Logger, deps se
 	adminHandler := telemetry.WideEvents(admin.NewHandler(registry, life, metrics.Handler(), info), logger, slog.LevelInfo)
 	// Plaintext by design (design §5.10): the embedded chain script carries no
 	// domain and chains to http://${proxydhcp/next-server}/start, and the iPXE
-	// artifact routes (/tftp/{arch}/snp.efi) are plain too. Every other boot
-	// route redirects to HTTPS. (All binaries, BIOS included, are built with
-	// HTTPS support; TLS is not what is missing here.)
+	// artifact routes (/tftp/{arch}/snp.efi) are served here too, as well as on
+	// HTTPS. Every other boot route redirects to HTTPS. (All binaries, BIOS
+	// included, are built with HTTPS support; TLS is not what is missing here.)
 	httpHandler := telemetry.WideEvents(metrics.Instrument(handlers.PlainHTTP(), "boot-http"), logger, slog.LevelInfo)
 	httpsHandler := telemetry.WideEvents(metrics.Instrument(handlers.TLS(), "boot-https"), logger, slog.LevelInfo)
 
