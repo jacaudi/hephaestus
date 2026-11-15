@@ -13,7 +13,12 @@ CREATE TABLE machines (
     cluster_id    TEXT,
     host_name     TEXT,
     created_at    TIMESTAMPTZ NOT NULL,
-    last_seen_at  TIMESTAMPTZ NOT NULL
+    last_seen_at  TIMESTAMPTZ NOT NULL,
+    -- A lifecycle shape Next can produce: cordoned remembers a prior state, and only an
+    -- orphaned machine, or one cordoned over orphaned, remembers the state it was orphaned from.
+    CHECK ((state = 'cordoned') = (prior_state IS NOT NULL)),
+    CHECK (orphaned_from IS NULL OR state = 'orphaned' OR (state = 'cordoned' AND prior_state = 'orphaned')),
+    CHECK (state <> 'orphaned' OR orphaned_from IS NOT NULL)
 );
 CREATE UNIQUE INDEX machines_valid_uuid ON machines (smbios_uuid) WHERE NOT junk;
 CREATE INDEX machines_uuid ON machines (smbios_uuid);

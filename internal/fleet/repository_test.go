@@ -395,13 +395,48 @@ func runRepositorySuite(t *testing.T, open func(testing.TB) *db.DB) {
 		r := NewRepository(d)
 		m := firstContact(t, r, originalIdentity(), t0)
 		for _, s := range storedStates() {
-			if err := execRaw(t, d, "UPDATE machines SET state = ? WHERE id = ?", string(s), m.ID); err != nil {
+			// The shape Next gives the state: cordoned remembers a prior state and
+			// orphaned the bound state it left.
+			var prior, orphanedFrom any
+			if s == StateCordoned {
+				prior = string(StateDiscovered)
+			}
+			if s == StateOrphaned {
+				orphanedFrom = string(StateInstalled)
+			}
+			if err := execRaw(t, d, "UPDATE machines SET state = ?, prior_state = ?, orphaned_from = ? WHERE id = ?",
+				string(s), prior, orphanedFrom, m.ID); err != nil {
 				t.Errorf("store state %q: %v", s, err)
 				continue
 			}
 			if got := mustGet(t, r, m.ID).State; got != s {
 				t.Errorf("state read back as %q, want %q", got, s)
 			}
+		}
+		// Cordoned over orphaned keeps the bound state the machine was orphaned from.
+		if err := execRaw(t, d, "UPDATE machines SET state = 'cordoned', prior_state = 'orphaned', orphaned_from = 'installed' WHERE id = ?", m.ID); err != nil {
+			t.Errorf("store cordoned over orphaned: %v", err)
+		}
+	})
+
+	t.Run("CorruptShapeRejected", func(t *testing.T) {
+		d := open(t)
+		r := NewRepository(d)
+		m := firstContact(t, r, originalIdentity(), t0)
+		tests := []struct{ name, set string }{
+			{"cordoned without prior", "state = 'cordoned', prior_state = NULL, orphaned_from = NULL"},
+			{"prior on a state that is not cordoned", "state = 'discovered', prior_state = 'installed', orphaned_from = NULL"},
+			{"orphaned_from on a state that is not orphaned", "state = 'discovered', prior_state = NULL, orphaned_from = 'installed'"},
+			{"orphaned_from on cordoned over another state", "state = 'cordoned', prior_state = 'installed', orphaned_from = 'installed'"},
+			{"orphaned without orphaned_from", "state = 'orphaned', prior_state = NULL, orphaned_from = NULL"},
+		}
+		for _, tc := range tests {
+			if err := execRaw(t, d, "UPDATE machines SET "+tc.set+" WHERE id = ?", m.ID); err == nil {
+				t.Errorf("%s: stored, want a CHECK violation", tc.name)
+			}
+		}
+		if got := mustGet(t, r, m.ID); got.State != StateDiscovered || got.Prior != StateNone || got.OrphanedFrom != StateNone {
+			t.Fatalf("machine = %s/%q/%q, want the rejected updates left it discovered", got.State, got.Prior, got.OrphanedFrom)
 		}
 	})
 
