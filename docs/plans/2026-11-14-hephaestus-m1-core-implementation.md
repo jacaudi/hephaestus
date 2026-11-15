@@ -47,7 +47,7 @@
 - EFI iPXE reports `${memsize}` as 0 (EFI builds use `MEMMAP_NULL`); hephaestus stores and displays `unknown` for 0. `MEMMAP_SETTINGS` stays enabled for BIOS.
 - CPUID facts (`${cpuvendor}`, `${cpumodel}`) may be absent on BIOS builds (`CPUID_SETTINGS` is not enabled there, design §5.10 "where available").
 
-**Not in M1:** auth and UI (M4); store, catalog, mirror, prefetch (M2); clusters, render, secrets, `/config`, tickets (M3); backup and recover (M4); the `/start`-without-`/boot` alert evaluator and the menu-preview endpoint (M4, with the UI and the other alert surfaces).
+**Not in M1:** auth and UI (M4); store, catalog, mirror, prefetch (M2); clusters, render, secrets, `/config`, tickets (M3); backup and recover (M4); the `/start`-without-`/boot` alert evaluator and the menu-preview endpoint (M4, with the UI and the other alert surfaces); certificate-expiry alerting beyond the `/health` warn and the days-left gauge (audit event, alerts counter, UI) (M4).
 
 **Controller rulings this plan relies on:**
 1. M1 = skeleton + standards + boot plane; auth moves to M4.
@@ -94,11 +94,19 @@
 - Ruling: /discover creating a machine writes its "discovered" audit event in the same transaction (design §5.2); test it.
 - Ruling: an ACME account row that fails to decrypt also stops serve, same as the certificate row; test it.
 - Ruling: add FuzzXxx with seed corpora (run as seeds by plain go test) for NormalizeMAC, NormalizeUUID, db.ParseURL, the /boot query parser and the /discover form parser, in their owning tasks; /health reports uptime (WL:421); add --log-format flag/HEPHAESTUS_LOG_FORMAT (WL:468).
-- Ruling: x/crypto is bumped to v0.59.0, the first tagged version after GO-2026-5932's fix (`0.58.1-0.20261009181718-2f1f834330b2`); hephaestus never imports `golang.org/x/crypto/openpgp`.
+- Ruling: x/crypto goes to v0.59.0, the first tagged version after GO-2026-5932's fix (`0.58.1-0.20261009181718-2f1f834330b2`), under the pass-2 rule below; hephaestus never imports `golang.org/x/crypto/openpgp`.
 - Ruling: `/discover` handles an identity conflict like row 2: it marks the UUID junk and records the alert once, then answers 409.
 - Ruling: `Observe` returns an `Observation` struct (machine plus `Created` and `Alerted` flags) so the handler can charge and alert correctly; `Repository.Transition` takes a `TransitionRequest`.
 - Ruling: `serve` builds its issuer through a factory in `serveDeps` (`newIssuer`), because the ACME account check needs the opened database; tests pass a factory that returns `tlsacmetest.SelfSigned`.
 - Ruling: transition rejection reasons are snake_case tokens (`junk_uuid`, `host_not_found`, `host_bound`, `reset_not_confirmed`, `not_bound`, `already_cordoned`, `not_cordoned`, `not_allowed`); `host_not_found` takes precedence over `host_bound`.
+
+**Rulings from plan-gate pass 2 (verbatim):**
+- Ruling (B-1): After `go mod tidy`, if go.mod's require block lists golang.org/x/crypto below v0.59.0, run `go get golang.org/x/crypto@v0.59.0` and tidy again; if tidy drops the line, x/crypto is not built and needs no bump. (x/crypto enters the graph at Task 5 via pgx at v0.58.0 but is only imported via lego certcrypto→ocsp at Task 15.)
+- Ruling (S-1): model fields for TEXT columns that hold bytes (acme_accounts.registration, inventory_reports.facts, audit_events.detail, and any other) are string-typed; []byte appears only at the repository boundary (convert on read/write). SQLite STRICT rejects a BLOB bound into a TEXT column, and Postgres would store `\x…` hex.
+- Ruling (S-2): every error after a successful Obtain (tls.X509KeyPair, leaf parse, SaveCertificate) and a freshly issued cert whose RenewAt <= now count as failures and back off, with the same schedule as an Obtain error (first wait 10 minutes).
+- Ruling (S-3): certificate-expiry alerting beyond the /health warn and gauge (audit event, alerts counter, UI) moves to M4.
+- Ruling: `machines.manufacturer` is written from `/discover` facts (`RecordReport` sets it when the report carries a non-empty manufacturer); `/boot` creations leave it `''`.
+- Ruling: a plain-HTTP `/boot` request never parses its query, so an oversize parameter still gets the row-1 chain script (no 400); an unexpected repository error on `/discover` answers 500 with `application/problem+json`.
 
 ## Parked gate findings
 
@@ -122,7 +130,7 @@ Every task's requirements include these.
 - Colima shares only `$HOME`: never bind-mount `/tmp` into a container; container scratch lives inside the container or under the repo's gitignored `build/ipxe/.work/`.
 - If `DOCKER_HOST=… docker info --format '{{.ServerVersion}}'` fails (28.4.0 at plan time), stop with `PLAN: BLOCKED — environment: docker unreachable at DOCKER_HOST`. Never fabricate binaries or skip Postgres tests.
 - Commits: one or more per task on `feat/hephaestus-m1-core`, signed, message ends with `-m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"`. A signing failure pauses the run. Builders never reset, rebase, force or delete commits; a failed task's commits are left for the controller.
-- Dependencies, exact versions (verified against the module source on 2026-11-14; add each with `rtk proxy go get <module>@<version>` in the task that first imports it, and run `rtk proxy go mod tidy` after implementing, before the gate; when `rtk proxy go list -m golang.org/x/crypto` shows a version below v0.59.0 after a task's `go get` or tidy, run `rtk proxy go get golang.org/x/crypto@v0.59.0` in that task):
+- Dependencies, exact versions (verified against the module source on 2026-11-14; add each with `rtk proxy go get <module>@<version>` in the task that first imports it, and run `rtk proxy go mod tidy` after implementing, before the gate; after `go mod tidy`, if go.mod's require block lists golang.org/x/crypto below v0.59.0, run `rtk proxy go get golang.org/x/crypto@v0.59.0` and tidy again; if tidy drops the line, x/crypto is not built and needs no bump):
 
 | Module | Version | First task |
 |---|---|---|
@@ -144,7 +152,7 @@ Every task's requirements include these.
 | golang.org/x/sync | v0.25.0 | 12 |
 | github.com/stretchr/testify (vendored tests only) | v1.12.1 | 12 |
 | github.com/go-acme/lego/v4 | v4.35.2 | 15 |
-| golang.org/x/crypto (indirect; GO-2026-5932) | v0.59.0 | first task that pulls it in |
+| golang.org/x/crypto (GO-2026-5932; only built once lego imports `certcrypto`→`ocsp`) | v0.59.0 | 15 |
 
 - If `go mod tidy` changes `go.mod`/`go.sum` in a task that does not list them, include them in that task's commit (dependency bookkeeping only; never a version other than the table's).
 - Tools pinned by `go run`: golangci-lint `github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0`, govulncheck `golang.org/x/vuln/cmd/govulncheck@v1.9.0`. hadolint is the host binary.
@@ -152,6 +160,7 @@ Every task's requirements include these.
 - Every commit step's Expected includes: `rtk proxy sh -c "git cat-file commit HEAD | grep -c '^gpgsig'"` prints `1`.
 - RED steps: a test that cannot compile is the expected failure; builders never add stubs to reach a different failure.
 - Fuzz tests (`FuzzXxx`) seed `f.Add` with every input of the matching table test, so plain `go test` replays them; the owning task also runs each for 30 s once (`-run '^$' -fuzz=FuzzXxx -fuzztime=30s`), and a crasher it finds is committed under `testdata/fuzz/` with the fix.
+- bun model fields for TEXT columns are `string` even when the repository API speaks `[]byte` (`facts`, `detail`, `registration`); convert at the repository boundary. BLOB/BYTEA columns (`*_sealed`) are `[]byte`.
 - Listeners in production code and tests use `net.ListenConfig{}` `.Listen(ctx, …)` (noctx).
 - Fixtures shared by tests: FQDN `hephaestus.example.test`; provisioning subnet `10.10.20.0/24`, address `10.10.20.5`, client `10.10.20.50`; UUID `4c4c4544-0042-3510-8052-b4c04f4e4d32`; MACs `aa:bb:cc:00:00:01` upward; data key `AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=` (bytes 0x00–0x1f).
 
@@ -216,7 +225,9 @@ Expected: PASS, 5 tests.
 `.taskfiles/repo.yml`: `git -C ~/Projects/github/go-tricorder show 5300050deb1b743f93ce92a7b6adedec391dd285:.taskfiles/repo.yml > .taskfiles/repo.yml` (verbatim).
 
 `.golangci.yml`: `git -C ~/Projects/github/go-tricorder show 5300050deb1b743f93ce92a7b6adedec391dd285:config/golangci.yml > .golangci.yml`, then exactly these six edits:
-1. Replace the first comment line with `# hephaestus: go-tricorder baseline (config/golangci.yml @ 5300050) minus the tricorder plugin, which cannot resolve (private repo). Restore it with .custom-gcl.yml once it does.`
+1. Replace the five head comment lines (lines 1–5, from `# go-tricorder baseline:` through `# tricorder plugin. Consumers: set goimports local-prefixes to your module path.`) with exactly these two lines:
+   `# hephaestus: go-tricorder baseline (config/golangci.yml @ 5300050) minus the tricorder plugin, which cannot resolve (private repo).`
+   `# Stock golangci-lint v2.14.0 loads this file; restore the plugin with .custom-gcl.yml once it resolves. Deviations from the fleet floor keep their "deviation:" comments.`
 2. Delete the two lines `    # go-tricorder's own analyzers` and `    - tricorder` under `linters.enable`.
 3. Delete the whole `settings.custom` block (from `    # go-tricorder's analyzers (design §4.3)…` through `          disable: []`).
 4. Delete the exclusion rule whose `path` is `^internal/analyzers/`: its comment line (`# deviation: var Analyzer is the go/analysis idiom…`) and its four lines (`- path: ^internal/analyzers/`, `linters:`, `- gochecknoglobals`, `text: ^Analyzer is a global variable`).
@@ -417,7 +428,7 @@ func TestWideEvents_OneLinePerRequest(t *testing.T)   // handler: AddAttrs(ctx, 
 func TestWideEvents_NoQueryKeyWithoutQuery(t *testing.T) // GET /start → decoded line has no "query" key
 func TestWideEvents_DefaultStatus200(t *testing.T)       // handler only writes "x" → status 200
 func TestWideEvents_ResponseControllerReachesConn(t *testing.T) // httptest.NewServer(WideEvents(h,…)); h calls http.NewResponseController(w).SetWriteDeadline(time.Now().Add(time.Second)) → err == nil, then writes "ok"; client sees 200 "ok"
-func TestAddAttrs_NoEventIsNoop(t *testing.T)            // AddAttrs(context.Background(), slog.Int("x",1)) does not panic
+func TestAddAttrs_NoEventIsNoop(t *testing.T)            // AddAttrs(t.Context(), slog.Int("x",1)) does not panic
 func TestNewMetrics_BuildInfoAndRuntime(t *testing.T)    // NewMetrics("v1.2.3","abc1234"); GET Handler() body contains `hephaestus_build_info{` and `version="v1.2.3"` and `commit="abc1234"` and `go_goroutine_count`
 func TestInstrument_RecordsRED(t *testing.T)             // serve one request through Instrument(h,"boot") → metrics body contains "http_server_request_duration_seconds"
 ```
@@ -464,7 +475,7 @@ The only change to existing files is dependency additions (`Kind: rewrite` per t
 - Response contract:
   - `/healthz`: 200 `{"status":"ok"}` unless lifecycle is `Stopped` (503 `{"status":"stopped"}`).
   - `/readyz`: 200 body `ok\n` when lifecycle is `Ready` and every critical check's latest result is `pass`; otherwise 503 with one line per problem: `fail: lifecycle: <state>\n`, `fail: <name>: <output>\n`, `fail: <name>: pending\n` (never ran). `?verbose` appends `<status>: <name>\n` for every check, sorted by name.
-  - `/health`: `Content-Type: application/health+json`; body `{"status":…, "version": info.Version, "releaseId": info.ReleaseID, "serviceId":"hephaestus", "checks": {"<name>":[{"status","observedValue","observedUnit","time","output"}]}}` (`observedValue`, `observedUnit`, `output` omitted when empty; `time` RFC 3339 UTC of the run). `checks` always also holds `"uptime"` (`pass`, observed seconds since `info.Started` as float64, unit `s`, WL:421) and `"lifecycle"` (`pass` when Ready, else `fail` with the state name as output, e.g. `draining`). The lifecycle entry counts as critical. One rule decides both probes: a critical `fail` or a pending critical makes `/readyz` 503 and `/health` `fail` 503; otherwise any `warn` or informational `fail` makes `/health` `warn` 200; else `pass` 200.
+  - `/health`: `Content-Type: application/health+json`; body `{"status":…, "version": info.Version, "releaseId": info.ReleaseID, "serviceId":"hephaestus", "checks": {"<name>":[{"status","observedValue","observedUnit","time","output"}]}}` (`observedValue`, `observedUnit`, `output` omitted when empty; `time` RFC 3339 UTC of the run). `checks` always also holds `"uptime"` (`pass`, observed seconds since `info.Started` as float64, unit `s`, WL:421) and `"lifecycle"` (`pass` when Ready, else `fail` with the state name as output, e.g. `draining`). The lifecycle entry counts as critical. One rule decides both probes: a critical check whose latest result is anything but `pass` (`warn`, `fail` or pending) makes `/readyz` 503 and `/health` `fail` 503; `/readyz` is 200 only when every critical check is `pass`; otherwise any `warn` or informational `fail` makes `/health` `warn` 200; else `pass` 200.
 
 - [ ] **Step 1: Add dependencies**
 
@@ -479,9 +490,10 @@ func TestHealthz(t *testing.T)                        // Ready → 200 `{"status
 func TestReadyz_PendingCriticalCheck(t *testing.T)    // Ready, critical "database:ping" never run → 503, body contains "fail: database:ping: pending"
 func TestReadyz_AllPass(t *testing.T)                 // after RunOnce with a passing critical check → 200 "ok\n"
 func TestReadyz_InformationalNeverFails(t *testing.T) // informational check returning fail → 200
+func TestReadyz_CriticalWarnIs503(t *testing.T)     // critical check returning warn → /readyz 503 and /health 503 status "fail"
 func TestReadyz_Draining(t *testing.T)                // lifecycle Draining → 503 body contains "fail: lifecycle: draining"
 func TestReadyz_Verbose(t *testing.T)                 // ?verbose lists "pass: a" and "warn: b" lines
-func TestHealth_Format(t *testing.T)                  // critical "database:ping" pass observed 1.5 "ms"; informational "tls:expiry" warn observed 10 "d" output "certificate expires in 10 days"; Info{"v1.2.3","abc1234"} → 200, content-type "application/health+json", status "warn", version "v1.2.3", releaseId "abc1234", serviceId "hephaestus", checks["database:ping"][0] status "pass" observedValue 1.5 observedUnit "ms", time parses as RFC 3339, checks["tls:expiry"][0].output as given
+func TestHealth_Format(t *testing.T)                  // critical "database:ping" pass observed 1.5 "ms"; informational "tls:expiry" warn observed 10 "d" output "certificate expires in 10 days"; Info{Version: "v1.2.3", ReleaseID: "abc1234", Started: time.Now()} → 200, content-type "application/health+json", status "warn", version "v1.2.3", releaseId "abc1234", serviceId "hephaestus", checks["database:ping"][0] status "pass" observedValue 1.5 observedUnit "ms", time parses as RFC 3339, checks["tls:expiry"][0].output as given
 func TestHealth_CriticalFail503(t *testing.T)         // critical fail → 503, status "fail"
 func TestHealth_InformationalFailIsWarn(t *testing.T) // informational fail only → 200, status "warn"
 func TestHealth_Uptime(t *testing.T)                  // Info.Started = time.Now().Add(-90*time.Second) → checks["uptime"][0]: status "pass", observedUnit "s", observedValue >= 90
@@ -502,7 +514,7 @@ Expected: FAIL, `undefined: NewRegistry`.
 - [ ] **Step 5: Run to verify pass**
 
 Run: `rtk proxy go test ./internal/admin/ -race -v`
-Expected: PASS, 16 tests.
+Expected: PASS, 17 tests.
 
 - [ ] **Step 6: Gate and commit**
 
@@ -534,9 +546,9 @@ Kind: rewrite
   - `func (d *DB) Checks() []admin.Check` — `database:ping` (critical; observed ping time float64 ms, unit `ms`) and `database:migrations` (critical; `fail` output `pending migrations` when `Pending` is true).
 - Produces (package `dbtest`, a test-helper package):
   - `const PostgresImage = "postgres:18-alpine@sha256:1018733457011bf88d81db98cf43aac6d5150afc18787dbe204771fedf80ff95"`.
-  - `func SQLite(t testing.TB) *db.DB` — opens `sqlite:<t.TempDir()>/test.db`, migrates, `t.Cleanup(Close)`.
-  - `func RunWithPostgres(m *testing.M) int` — `docker run -d --rm --label hephaestus-dbtest=1 -e POSTGRES_USER=hephaestus -e POSTGRES_PASSWORD=hephaestus -e POSTGRES_DB=hephaestus -p 127.0.0.1::5432 <PostgresImage>` via `exec.CommandContext` (inherits `DOCKER_HOST`; each call carries `//nolint:gosec // G204: fixed docker CLI args in tests`), reads the port from `docker port <id> 5432/tcp`, waits until a pgx ping succeeds (every 250 ms, 60 s limit; a TCP connect alone is not readiness: colima's forwarder accepts early), runs `m.Run()`, then `docker rm -f <id>`. On any docker failure it prints `dbtest: start postgres: <err> (is DOCKER_HOST set?)` to stderr and returns 1.
-  - `func Postgres(t testing.TB) *db.DB` — `t.Fatal("dbtest: Postgres needs TestMain to call dbtest.RunWithPostgres")` when the container is not running; otherwise `CREATE DATABASE t_<16 lowercase hex>`, opens it, migrates, and on cleanup closes and `DROP DATABASE`.
+  - `func SQLite(tb testing.TB) *db.DB` — opens `sqlite:<tb.TempDir()>/test.db`, migrates, `tb.Cleanup(Close)`.
+  - `func RunWithPostgres(m *testing.M) int` — `docker run -d --rm --label hephaestus-dbtest=1 -e POSTGRES_USER=hephaestus -e POSTGRES_PASSWORD=hephaestus -e POSTGRES_DB=hephaestus -p 127.0.0.1::5432 <PostgresImage>` via `exec.CommandContext` (inherits `DOCKER_HOST`; only calls whose arguments are not all constants, such as `docker port <id>` and `docker rm -f <id>`, carry `//nolint:gosec // G204: fixed docker CLI args in tests`; nolintlint rejects an unused directive), reads the port from `docker port <id> 5432/tcp`, waits until a pgx ping succeeds (every 250 ms, 60 s limit; a TCP connect alone is not readiness: colima's forwarder accepts early), runs `m.Run()`, then `docker rm -f <id>`. On any docker failure it prints `dbtest: start postgres: <err> (is DOCKER_HOST set?)` to stderr and returns 1.
+  - `func Postgres(tb testing.TB) *db.DB` — `tb.Fatal("dbtest: Postgres needs TestMain to call dbtest.RunWithPostgres")` when the container is not running; otherwise `CREATE DATABASE t_<16 lowercase hex>`, opens it, migrates, and on cleanup closes and `DROP DATABASE`.
   - The container address is one package-level variable marked `//nolint:gochecknoglobals // process-wide test container shared by RunWithPostgres and Postgres`.
 
 **Schema (version 00001, both dialects, identical table and column names).** SQLite file, exactly:
@@ -694,7 +706,7 @@ Run: `rtk proxy go test ./internal/db/ -run '^$' -fuzz=FuzzParseURL -fuzztime=30
 
 Run: `rtk proxy sh -c "task --list-all >/dev/null && echo taskfile-ok"` — Expected: `taskfile-ok`.
 Run: `DOCKER_HOST=unix://$HOME/.colima/default/docker.sock rtk proxy task ci`
-Expected: exit 0; `cover:db` prints nothing.
+Expected: exit 0; `cover:db` prints no `not executed:` line.
 Run: `rtk proxy git add go.mod go.sum .taskfiles/go.yml internal/db` then `rtk proxy git commit -m "feat: bun database with goose migrations for SQLite and Postgres" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"`
 Expected: one new commit; `rtk proxy sh -c "git cat-file commit HEAD | grep -c '^gpgsig'"` prints `1`.
 
@@ -884,9 +896,9 @@ Kind: rewrite
   - `const MaxMachines = 1024`; `const BootEventsKept = 500`; `const MACsKept = 16`; `var ErrFleetFull = errors.New("fleet is full: 1024 machines recorded")`; `var ErrNotFound = errors.New("machine not found")`; `var ErrUnidentifiable = errors.New("machine cannot be identified: no valid UUID and no MAC")`.
   - `type Identity struct { UUID, MAC, Serial, Product string }` (UUID and MAC already normalized; `""` when absent or malformed).
   - `type BootEvent struct { Row int; Action, Reason string }`; `type BootRecord struct { Identity Identity; Arch Arch; MachineID string; Trigger Trigger; Conflict, MarkJunk bool; Event BootEvent; At time.Time }` (`Conflict` = the decision matched row 2).
-  - `func NewRepository(d *db.DB) *Repository`.
+  - `func NewRepository(d *db.DB) *Repository`. Unexported bun models for `machine_macs`, `boot_events`, `audit_events` (its `detail` field is `string`), `inventory_reports` (`facts` is `string`) and `settings` live in `repository.go`.
   - `func (r *Repository) Lookup(ctx context.Context, id Identity) (Machine, bool, error)` — algorithm, exactly: (1) if `JunkPattern(id.UUID)`: when `id.MAC == ""` → not found; else the machine owning `id.MAC` in `machine_macs`. (2) Else load machines with `smbios_uuid = id.UUID`: none → not found; a non-junk one → it; all junk → the one owning `id.MAC`, else the oldest whose serial and product equal `id.Serial`/`id.Product`, else not found.
-  - `func (r *Repository) RecordBoot(ctx context.Context, rec BootRecord) (Machine, error)` — one transaction: (a) `MachineID == ""` requires `Trigger == TriggerFirstContact` (else `ErrInvalidTransition`): `JunkPattern(UUID) && MAC == ""` → `ErrUnidentifiable`; count ≥ `MaxMachines` → `ErrFleetFull`; insert `{ID: rand.Text(), Junk: JunkPattern(UUID) || any machine already has this UUID, State: discovered, Created/LastSeen: At}` and the MAC. (b) Known + `Conflict`: when `MarkJunk`, set `junk` on every machine with that UUID and insert audit `{actor "system", action "alert.uuid_conflict", machine_id, detail JSON {"uuid","mac","stored_serial","stored_product","seen_serial","seen_product"}}`; in every case do not attach the MAC, touch `last_seen_at` or apply a trigger. (c) Known otherwise: upsert the MAC with `seen_at = At` (`ON CONFLICT (mac) DO UPDATE SET machine_id = EXCLUDED.machine_id, seen_at = EXCLUDED.seen_at`), then delete the machine's MACs beyond the newest `MACsKept` by `seen_at` (ties broken by `mac`); set `arch` and `last_seen_at`; when `Trigger == TriggerNextBoot` apply `Next` and update the state. (d) Insert the boot event (`from_state`/`to_state` set only when the state changed) unless `Event.Action == "hold"` and the machine's most recent boot event is a hold with the same reason whose `at` is after `At − 1h`; after an insert, delete the machine's boot events beyond the newest `BootEventsKept` (by `id`). Returns the machine as stored. Every MAC upsert anywhere in the repository (here, creation, `RecordReport`) uses the same helper, so the 16-MAC cap always applies.
+  - `func (r *Repository) RecordBoot(ctx context.Context, rec BootRecord) (Machine, error)` — one transaction: (a) `MachineID == ""` requires `Trigger == TriggerFirstContact` (else `ErrInvalidTransition`): `JunkPattern(UUID) && MAC == ""` → `ErrUnidentifiable`; count ≥ `MaxMachines` → `ErrFleetFull`; insert `{ID: rand.Text(), UUID (smbios_uuid): Identity.UUID, Serial: Identity.Serial, Product: Identity.Product, Manufacturer: "", Arch: rec.Arch, Junk: JunkPattern(UUID) || any machine already has this UUID, State: discovered, CreatedAt and LastSeenAt: At}` and the MAC. (b) Known + `Conflict`: when `MarkJunk`, set `junk` on every machine with that UUID and insert audit `{actor "system", action "alert.uuid_conflict", machine_id, detail JSON {"uuid","mac","stored_serial","stored_product","seen_serial","seen_product"}}`; in every case do not attach the MAC, touch `last_seen_at` or apply a trigger. (c) Known otherwise: upsert the MAC with `seen_at = At` (`ON CONFLICT (mac) DO UPDATE SET machine_id = EXCLUDED.machine_id, seen_at = EXCLUDED.seen_at`), then delete the machine's MACs beyond the newest `MACsKept` by `seen_at` (ties broken by `mac`); set `arch` and `last_seen_at`; when `Trigger == TriggerNextBoot` apply `Next` and update the state. (d) Insert the boot event (`from_state`/`to_state` set only when the state changed) unless `Event.Action == "hold"` and the machine's most recent boot event is a hold with the same reason whose `at` is after `At − 1h`; after an insert, delete the machine's boot events beyond the newest `BootEventsKept` (by `id`). Returns the machine as stored. Every MAC upsert anywhere in the repository (here, creation, `RecordReport`) uses the same helper, so the 16-MAC cap always applies.
   - `type TransitionRequest struct { MachineID string; Trigger Trigger; Guard Guard; Actor string; At time.Time }`; `func (r *Repository) Transition(ctx context.Context, req TransitionRequest) (Machine, error)` — one transaction: load (`ErrNotFound`), `req.Guard.Junk = m.Junk`, `Next`; on error no write; `StateNone` deletes the machine (cascade); else update `state`, `prior_state`, `orphaned_from`; insert audit `{actor, action "transition."+trigger, machine_id, detail {"from": <state>, "to": <state or "none">}}`.
   - `func (r *Repository) Get(ctx context.Context, id string) (Machine, error)` — `ErrNotFound` when absent.
 
@@ -928,7 +940,7 @@ Expected: PASS, 20 subtests.
 
 - [ ] **Step 5: Gate and commit**
 
-Run: `DOCKER_HOST=unix://$HOME/.colima/default/docker.sock rtk proxy task ci` — Expected: exit 0; `cover:db` prints nothing.
+Run: `DOCKER_HOST=unix://$HOME/.colima/default/docker.sock rtk proxy task ci` — Expected: exit 0; `cover:db` prints no `not executed:` line.
 Run: `rtk proxy git add .taskfiles/go.yml internal/fleet` then `rtk proxy git commit -m "feat: fleet repository with identity resolution, boot events and audited transitions" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"`
 Expected: one new commit; `rtk proxy sh -c "git cat-file commit HEAD | grep -c '^gpgsig'"` prints `1`.
 
@@ -949,7 +961,7 @@ The new methods live in `repository.go` so the `cover:db` gate (which matches `r
   - `const ReportsKept = 10`; `var ErrIdentityConflict = errors.New("identity conflict: stored serial/product differ from the report")`.
   - `type Observation struct { Machine Machine; Created, Alerted bool }`; `func (r *Repository) Observe(ctx context.Context, id Identity, arch Arch, at time.Time) (Observation, error)` — one transaction: `Lookup`; unknown → create exactly as `RecordBoot` (a) does (same unexported helper; same `ErrUnidentifiable`/`ErrFleetFull`) and, in the same transaction, insert audit `{actor "system", action "transition.first_contact", machine_id, detail {"from":"none","to":"discovered"}}` (design §5.2: a transition is applied with its event; `/boot` creations carry a boot event instead), `Created` true; known with serial or product different from `id` → the row-2 treatment of `RecordBoot` (b) (mark the UUID junk and insert the `alert.uuid_conflict` audit row only when the machine is not yet junk; `Alerted` reports whether it did), no other write, return the Observation with `ErrIdentityConflict`; known otherwise → `last_seen_at = at`.
   - `func (r *Repository) LatestReport(ctx context.Context, machineID string) ([]byte, bool, error)`.
-  - `func (r *Repository) RecordReport(ctx context.Context, machineID string, facts []byte, macs []string, at time.Time) (bool, error)` — one transaction: upsert every MAC to the machine; `last_seen_at = at`; when `facts` equals the latest report byte for byte return false; else insert `{source "ipxe", facts, received_at at}`, delete all but the newest `ReportsKept` reports for the machine, return true.
+  - `type Report struct { Facts []byte; MACs []string; Manufacturer string; At time.Time }`; `func (r *Repository) RecordReport(ctx context.Context, machineID string, rep Report) (bool, error)` — one transaction: upsert every MAC to the machine; `last_seen_at = rep.At`; when `rep.Manufacturer != ""` set `machines.manufacturer` to it; when `facts` equals the latest report byte for byte return false; else insert `{source "ipxe", facts (stored as string), received_at rep.At}`, delete all but the newest `ReportsKept` reports for the machine, return true.
   - `func (r *Repository) UnknownAction(ctx context.Context) (UnknownAction, error)` — `settings.unknown_action`, decoded with `UnmarshalText`; a missing row reads as `UnknownActionLocal`.
   - `func (r *Repository) SetUnknownAction(ctx context.Context, a UnknownAction, actor string, at time.Time) error` — upsert plus audit `{actor, action "settings.unknown_action", detail {"from","to"}}`.
 
@@ -959,6 +971,8 @@ The new methods live in `repository.go` so the `cover:db` gate (which matches `r
   - `ObserveTouches`: known, Observe at t0+1m → LastSeenAt.Equal(t0+1m), Created false.
   - `ReportStoredThenDeduped`: RecordReport `{"serial":"S1"}` at t0 → true; same at t0+30s → false; 1 report row; LastSeenAt.Equal(t0+30s).
   - `ReportRetention`: 12 distinct reports (`{"n":1}`…`{"n":12}`) → 10 rows; the remaining facts are `{"n":3}`…`{"n":12}`.
+  - `ReportBytesRoundTrip`: facts `{"serial":"S\u00dc1 \u2713","memsize":"unknown"}` written as UTF-8 bytes containing `Ü` and `✓` → `LatestReport` returns byte-identical bytes (both databases).
+  - `ReportSetsManufacturer`: Report{Manufacturer "ACME"} → Get.Manufacturer "ACME"; a later Report with Manufacturer "" leaves it "ACME".
   - `ReportMACsRecorded`: macs ["aa:bb:cc:00:00:31","aa:bb:cc:00:00:32"] → Get.MACs contains both.
   - `LatestReport`: none → ok false; after one report → bytes equal.
   - `UnknownActionDefaultLocal`: fresh database → `UnknownActionLocal`.
@@ -974,7 +988,7 @@ Expected: FAIL, `r.Observe undefined` (compile error).
 - [ ] **Step 4: Run to verify pass on both databases**
 
 Run: `rtk proxy go test ./internal/fleet/ -race -v` — Expected: PASS.
-Run: `DOCKER_HOST=unix://$HOME/.colima/default/docker.sock rtk proxy go test -tags integration ./internal/fleet/ -race -run Postgres -v` — Expected: PASS, 29 subtests.
+Run: `DOCKER_HOST=unix://$HOME/.colima/default/docker.sock rtk proxy go test -tags integration ./internal/fleet/ -race -run Postgres -v` — Expected: PASS, 31 subtests.
 
 - [ ] **Step 5: Gate and commit**
 
@@ -1072,6 +1086,7 @@ func TestStartScript(t *testing.T) // StartScript("hephaestus.example.test") == 
 func TestHoldScript(t *testing.T)  // == "#!ipxe\necho hephaestus: holding: awaiting approval\nsleep 30\nchain --replace https://hephaestus.example.test/boot?<bootQuery>\n"
 func TestExitScript(t *testing.T)  // == "#!ipxe\nexit\n"
 func TestReportScript(t *testing.T) // ReportScript(fqdn, HoldScript(fqdn,"awaiting approval")): HasPrefix "#!ipxe\nparams\nparam uuid ${uuid}\n"; contains "imgfetch --name hephaestus-report https://hephaestus.example.test/discover##params"; HasSuffix "echo hephaestus: holding: awaiting approval\nsleep 30\nchain --replace https://hephaestus.example.test/boot?"+bootQuery+"\n"; strings.Count(s, "#!ipxe") == 1
+func TestReportScript_ExitExact(t *testing.T) // ReportScript(fqdn, ExitScript()) == "#!ipxe\n" + the reportBlock text above with <fqdn> = hephaestus.example.test, every line including "imgfree hephaestus-report ||" ending in "\n" + "exit\n" (written out in full as the test's want literal)
 func TestRender(t *testing.T)      // chain_tls, exit, hold, Report+exit map to the functions above; utility and install → errors.Is(err, ErrUnsupportedAction)
 ```
 
@@ -1173,6 +1188,7 @@ exit
 ```
 `build/ipxe/Dockerfile`:
 ```dockerfile
+# syntax=docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
 FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
 
 ARG IPXE_COMMIT=9261ebe38af0c0b38ac332adeec125a518845013
@@ -1268,12 +1284,14 @@ Run: `rtk proxy go test ./internal/boot/ipxe/ -race -v` — Expected: PASS, 7 te
 - [ ] **Step 5: Prove reproducibility**
 
 Run: `mkdir -p build/ipxe/.work && cp internal/boot/ipxe/bin/SHA256SUMS build/ipxe/.work/SHA256SUMS.first`
+Expected: exit 0; `build/ipxe/.work/SHA256SUMS.first` has 3 lines.
 Run: `DOCKER_HOST=unix://$HOME/.colima/default/docker.sock rtk proxy task ipxe:build` then `cmp build/ipxe/.work/SHA256SUMS.first internal/boot/ipxe/bin/SHA256SUMS && echo reproducible`
 Expected: `reproducible` (the rebuild is byte-identical). If it differs, compare `BUILDINFO`, fix the non-determinism in `build.sh`, and repeat Steps 2–5.
 
 - [ ] **Step 6: Build the test-CA variant once and confirm it stays out of the embedded set**
 
 Run: `openssl req -x509 -newkey rsa:2048 -nodes -keyout build/ipxe/.work/test-ca.key -out build/ipxe/.work/test-ca.pem -days 1 -subj /CN=hephaestus-test-ca`
+Expected: exit 0; `build/ipxe/.work/test-ca.pem` starts with `-----BEGIN CERTIFICATE-----`.
 Run: `DOCKER_HOST=unix://$HOME/.colima/default/docker.sock rtk proxy task ipxe:build:testca TEST_CA=build/ipxe/.work/test-ca.pem` then `cmp build/ipxe/.work/SHA256SUMS.first internal/boot/ipxe/bin/SHA256SUMS && echo embedded-untouched` then `rtk proxy sh -c "git status --porcelain build/ipxe/out build/ipxe/.work | wc -l | tr -d ' '"`
 Expected: exit 0; `build/ipxe/out/testca/` holds three binaries; `embedded-untouched`; `0` (both directories are gitignored).
 
@@ -1317,11 +1335,11 @@ The only change to existing files is dependency additions (`Kind: rewrite` per t
 
 Run: `rtk proxy go get github.com/insomniacslk/dhcp@v0.0.0-20261014062924-c6bb46ad3f3a github.com/pin/tftp/v3@v3.2.0 golang.org/x/sync@v0.25.0 github.com/stretchr/testify@v1.12.1` — Expected: exit 0.
 
-- [ ] **Step 2: Write the failing contract test** `contract_test.go` (`package dhcp_test`, testify):
+- [ ] **Step 2: Write the failing contract test** `contract_test.go` (`package dhcp_test`, stdlib `testing` only; the vendored files keep testify):
 
 ```go
 func TestAdvertisedBootFilesAreServed(t *testing.T)
-// files, err := ipxe.Files(); require.NoError
+// files, err := ipxe.Files(); err == nil else t.Fatal
 // offer(fw) = dhcp.OfferDHCP(PXE REQUEST, "10.10.20.5", 80, fw, dhcp.Port4011)
 // FirmwareX86PC, FirmwareX86EFI, FirmwareARMEFI: resp.BootFileName is a key of files
 // FirmwareX86Ipxe: strings.TrimPrefix(url.Path, "/") of BootFileNameOption() is a key of files
@@ -1365,7 +1383,7 @@ Expected: one new commit; `rtk proxy sh -c "git cat-file commit HEAD | grep -c '
 - Route behaviour:
   - Script responses: `Content-Type: text/plain; charset=utf-8`; per-route write deadline `http.NewResponseController(w).SetWriteDeadline(now+10s)`, ignoring only `http.ErrNotSupported`.
   - `/start`: always `StartScript(fqdn)`; reads nothing from the request.
-  - `/boot` query (`parseBootQuery`): `uuid` → `NormalizeUUID`; `mac` → `NormalizeMAC` (an error means `""`); `serial`, `product`; `arch` → `ArchFromBuildArch`. Any of these values longer than `maxValueBytes` → `400` with an empty body. Plain HTTP (`r.TLS == nil`): `Decide(Input{TLS: false})` and its script, no DB access. TLS: `Lookup` → `UnknownAction` → `Decide` (M1 passes `BootNext ""` and `UtilityReady`, `AssetsReady`, `Drift` false) → `m1Fallback` → `RecordBoot{Identity, Arch, MachineID (when known), Trigger, Conflict: d.Row == 2, MarkJunk, Event{Row, string(Action), Reason}, At now}` → `Render`. `ErrFleetFull` and `ErrUnidentifiable` from `RecordBoot` are not errors: the script is still served and the wide event gets `fleet_full=true` or `unidentified=true`. Any other repository error → `500` body `internal error\n` with the error in the wide event (`error` key). Counters: decisions +1 per rendered decision; alerts `{kind: uuid_conflict}` +1 when `Alert`. Wide event attrs: `decision_row`, `action`, `hold_reason` (when hold), `machine_id` (when known), `state` (the machine's state as `RecordBoot` returned it, i.e. after the transition).
+  - `/boot` query (`parseBootQuery`): `uuid` → `NormalizeUUID`; `mac` → `NormalizeMAC` (an error means `""`); `serial`, `product`; `arch` → `ArchFromBuildArch`. Any of these values longer than `maxValueBytes` → `400` with an empty body. Plain HTTP (`r.TLS == nil`): the query is never parsed; `Decide(Input{TLS: false})` and its script (row 1), no DB access, so an oversize parameter still gets the chain script. TLS: `Lookup` → `UnknownAction` → `Decide` (M1 passes `BootNext ""` and `UtilityReady`, `AssetsReady`, `Drift` false) → `m1Fallback` → `RecordBoot{Identity, Arch, MachineID (when known), Trigger, Conflict: d.Row == 2, MarkJunk, Event{Row, string(Action), Reason}, At now}` → `Render`. `ErrFleetFull` and `ErrUnidentifiable` from `RecordBoot` are not errors: the script is still served and the wide event gets `fleet_full=true` or `unidentified=true`. Any other repository error → `500` body `internal error\n` with the error in the wide event (`error` key). Counters: decisions +1 per rendered decision; alerts `{kind: uuid_conflict}` +1 when `Alert`. Wide event attrs: `decision_row`, `action`, `hold_reason` (when hold), `machine_id` (when known), `state` (the machine's state as `RecordBoot` returned it, i.e. after the transition).
   - `/tftp/{arch}/snp.efi`: `arch` must be `amd64` or `arm64` (else 404); serves `files[arch+"/snp.efi"]` with `http.ServeContent(w, r, "snp.efi", time.Time{}, bytes.NewReader(b))` and `Content-Type: application/octet-stream`, through an idle-write wrapper that calls `SetWriteDeadline(now+30s)` before every `Write` (implements `Unwrap`).
 
 - [ ] **Step 1: Write the failing tests.** Requests use `httptest.NewRequestWithContext` with `RemoteAddr = "10.10.20.50:40000"`; TLS requests set `req.TLS = &tls.ConnectionState{}`; repository from `dbtest.SQLite(t)`; files `{"amd64/snp.efi": []byte("amd64-efi"), "arm64/snp.efi": []byte("arm64-efi")}`; boot query `q := "uuid=4c4c4544-0042-3510-8052-b4c04f4e4d32&mac=aa-bb-cc-00-00-01&arch=x86_64&serial=S1&product=P1"`.
@@ -1381,7 +1399,8 @@ func TestBoot_IdentityConflictHolds(t *testing.T)       // first boot S1; second
 func TestBoot_AssignedHoldsOnAssets(t *testing.T)       // machine set to assigned (raw update) → body contains "holding: boot assets not ready"
 func TestBoot_InstalledExits(t *testing.T)              // installed → body == "#!ipxe\nexit\n"
 func TestBoot_InstallingBecomesUnconfirmed(t *testing.T) // installing → exit; Get → install-unconfirmed
-func TestBoot_OversizeParamRejected(t *testing.T)       // serial of 300 "a" → 400; 0 machines
+func TestBoot_OversizeParamRejected(t *testing.T)       // TLS: serial of 300 "a" → 400; 0 machines
+func TestBootPlain_OversizeStillChains(t *testing.T)    // PlainHTTP: serial of 300 "a" → 200, body == StartScript(fqdn)
 func TestBoot_MetricsCount(t *testing.T)                // WithMeter(metrics.Meter()); one unknown-local boot → metrics body contains `hephaestus_boot_decisions_total{action="exit",decision_row="7"`
 func TestM1Fallback(t *testing.T)                       // {10, install, NeedsTicket} → {10, hold, "ticket minting not available (M3)"}; {3, utility, Utility "memtest", ClearBootNext} → {3, hold, "utility boot not available (M2)"}; {6, exit} unchanged
 func TestTFTPRoute(t *testing.T)                        // GET /tftp/amd64/snp.efi → 200 "amd64-efi", Content-Type application/octet-stream; /tftp/riscv64/snp.efi → 404; Range "bytes=0-3" → 206, body "amd6"
@@ -1426,19 +1445,20 @@ Kind: rewrite
   - `func WithLimiter(limit int, window time.Duration, capacity int) Option` (tests only shrink it; defaults are the constants).
   - `type discoverInput struct { Identity fleet.Identity; Facts facts; MACs []string }`; `func parseDiscoverForm(form url.Values) (discoverInput, error)` — the validation rules below, before any I/O; `memsize` `""` or `"0"` is stored as `"unknown"` (EFI reports 0, see Known limitations).
   - `type nic struct { Index int "index"; MAC string "mac"; Chip string "chip" }` and `type facts struct` with JSON fields, in this order: `uuid`, `mac`, `serial`, `manufacturer`, `product`, `cpuvendor`, `cpumodel`, `memsize`, `platform`, `arch`, `nics` (all strings except `nics []nic`). Stored bytes are `json.Marshal(facts)`.
-- `POST /discover` behaviour, in order: `http.MaxBytesReader(w, r.Body, maxFormBytes)` then `ParseForm` (a `*http.MaxBytesError` → 413, other errors → 400); any value longer than `maxValueBytes` → 400; `nic<N>_mac` for N in 0..15 (`nic<N>_chip` alongside) normalized with `NormalizeMAC` (an invalid one → 400); `mac` normalized (invalid → 400); no valid UUID and no MAC → 400. Identity = {NormalizeUUID(uuid), mac, serial, product}. Unknown machine: `limiter.Allow(source)` false → 429 + `Retry-After: 600`; `Observe` → `ErrFleetFull` → 503 + `Retry-After: 600`, `ErrUnidentifiable` → 400. Known machine: `Observe` → `ErrIdentityConflict` → 409 (the repository has marked the UUID junk and recorded the alert as row 2 does; when `Alerted` the `hephaestus.alerts{kind=uuid_conflict}` counter +1). Then: a machine created by this request (`Created`) is never charged a second token, so `RecordReport` follows directly; otherwise `LatestReport`: equal bytes → `RecordReport` (returns false) and 200 without charging; different → `limiter.Allow` (false → 429 + `Retry-After: 600`, the same header as the first 429 path) then `RecordReport`. `RecordReport` gets the normalized NIC MACs plus `mac`. Success → 200 `ok\n`. The counter `hephaestus.discovery.reports` gets `outcome` ∈ `stored`, `unchanged`, `rate_limited`, `fleet_full`, `conflict`, `invalid`; the wide event gets `outcome` and `machine_id`.
+- `POST /discover` behaviour, in order: `http.MaxBytesReader(w, r.Body, maxFormBytes)` then `ParseForm` (a `*http.MaxBytesError` → 413, other errors → 400); any value longer than `maxValueBytes` → 400; `nic<N>_mac` for N in 0..15 (`nic<N>_chip` alongside) normalized with `NormalizeMAC` (an invalid one → 400); `mac` normalized (invalid → 400); no valid UUID and no MAC → 400. Identity = {NormalizeUUID(uuid), mac, serial, product}. Unknown machine: `limiter.Allow(source)` false → 429 + `Retry-After: 600`; `Observe` → `ErrFleetFull` → 503 + `Retry-After: 600`, `ErrUnidentifiable` → 400. Known machine: `Observe` → `ErrIdentityConflict` → 409 (the repository has marked the UUID junk and recorded the alert as row 2 does; when `Alerted` the `hephaestus.alerts{kind=uuid_conflict}` counter +1). Then: a machine created by this request (`Created`) is never charged a second token, so `RecordReport` follows directly; otherwise `LatestReport`: equal bytes → `RecordReport` (returns false) and 200 without charging; different → `limiter.Allow` (false → 429 + `Retry-After: 600`, the same header as the first 429 path) then `RecordReport`. `RecordReport` gets `fleet.Report{Facts, MACs: the normalized NIC MACs plus mac, Manufacturer: facts.manufacturer, At: now}`. Success → 200 `ok\n`. Any other repository error → 500 with `Content-Type: application/problem+json` and body `{"type":"about:blank","title":"Internal Server Error","status":500}`, the error in the wide event (`error` key). The counter `hephaestus.discovery.reports` gets `outcome` ∈ `stored`, `unchanged`, `rate_limited`, `fleet_full`, `conflict`, `invalid`; the wide event gets `outcome` and `machine_id`.
 
 - [ ] **Step 1: Write the failing tests**
 
 ```go
 func TestWindowLimiter(t *testing.T)   // fake clock: limit 8 → 8 Allow true then false; after window+1s true again; another key independent; capacity 2: third key false until the window passes, then true
-func TestDiscover_StoresReport(t *testing.T) // form: uuid fixture, mac aa:bb:cc:00:00:01, serial S1, product P1, manufacturer ACME, nic0_mac aa:bb:cc:00:00:01, nic0_chip r8169, nic1_mac aa:bb:cc:00:00:02, nic1_chip igc, memsize 17179869184, arch x86_64, platform efi → 200 "ok\n"; machine discovered with both MACs; one report, source "ipxe", decoded facts: manufacturer "ACME", len(nics)==2, nics[1].chip "igc", memsize "17179869184"
+func TestDiscover_StoresReport(t *testing.T) // form: uuid fixture, mac aa:bb:cc:00:00:01, serial S1, product P1, manufacturer ACME, nic0_mac aa:bb:cc:00:00:01, nic0_chip r8169, nic1_mac aa:bb:cc:00:00:02, nic1_chip igc, memsize 17179869184, arch x86_64, platform efi → 200 "ok\n"; machine discovered with both MACs and Manufacturer "ACME"; one report, source "ipxe", decoded facts: manufacturer "ACME", len(nics)==2, nics[1].chip "igc", memsize "17179869184"
 func TestDiscover_UnchangedNotCharged(t *testing.T) // WithLimiter(8, 10m, 4096); same form 20 times → all 200; 1 report row
 func TestDiscover_RateLimited(t *testing.T)          // 9 distinct unknown machines (UUIDs ending …001…009, MACs …01…09) from one source → 9th is 429 with Retry-After "600"
 func TestDiscover_Conflict(t *testing.T)             // machine S1/P1 exists; post serial S2 → 409; no report; machine Junk; one alert.uuid_conflict audit row
 func TestDiscover_NewMachineChargedOnce(t *testing.T) // WithLimiter(1, 10m, 4096): one unknown machine → 200 (one token covers creation and its first report); a second, changed report from the same source → 429 with Retry-After "600"
 func TestDiscover_FirstContactAudited(t *testing.T)   // new machine → one audit row "transition.first_contact"
 func TestDiscover_MemsizeZeroIsUnknown(t *testing.T)  // memsize "0" → stored facts.memsize "unknown"
+func TestDiscover_RepositoryErrorIsProblemJSON(t *testing.T) // repository's database closed before the request → 500, Content-Type "application/problem+json", decoded body status 500 and title "Internal Server Error"
 func FuzzParseDiscoverForm(f *testing.F)              // seeds: every form above, as raw bodies fed through url.ParseQuery (parse errors skip); property: never panics; on success every string in Facts is at most maxValueBytes, len(Facts.NICs) <= maxNICs, every entry of MACs is 17 chars
 func TestDiscover_RejectsOversizeAndMalformed(t *testing.T) // table → status: serial of 257 bytes → 400; 17 KiB body → 413; nic0_mac "zz" → 400; no uuid and no mac → 400; GET /discover → 405; 0 reports after all
 func TestDiscover_HostileTextStoredVerbatim(t *testing.T)   // serial "<script>alert(1)</script>" → 200; decoded stored facts.serial equals it exactly
@@ -1481,18 +1501,18 @@ Kind: rewrite
 - Consumes: `db.DB`, `datakey.Key`, `datakey.ErrDecrypt`, `secret.Secret`, `admin.Check`, `admin.Result`, `dbtest`.
 - Produces (package `tlsacme`; all its tests are `package tlsacme_test` to avoid an import cycle with `tlsacmetest`):
   - `type Certificate struct { ChainPEM, KeyPEM []byte }`; `type Issuer interface { Obtain(ctx context.Context, domain string) (Certificate, error) }` (implementors: `*LegoIssuer`, `*tlsacmetest.SelfSigned`).
-  - Repository: `func NewRepository(d *db.DB) *Repository`; `type Account struct { DirectoryURL string; KeySealed, Registration []byte; CreatedAt time.Time }`; `type StoredCertificate struct { Domain string; ChainSealed, KeySealed []byte; NotBefore, NotAfter, UpdatedAt time.Time }`; `SaveAccount(ctx, Account) error` (upsert); `LoadAccount(ctx, directoryURL string) (Account, bool, error)`; `SaveCertificate(ctx, StoredCertificate) error` (upsert by domain); `LoadCertificate(ctx, domain string) (StoredCertificate, bool, error)`. bun models map `acme_accounts` (`registration` TEXT ↔ `[]byte`) and `tls_certificates`.
-  - `type LegoConfig struct { DirectoryURL string; CloudflareToken secret.Secret; Repo *Repository; Key *datakey.Key }`; `func NewLegoIssuer(cfg LegoConfig) *LegoIssuer`; `(*LegoIssuer).Load(ctx) error` — no account row for `DirectoryURL` → nil; a row whose key does not open → `fmt.Errorf("stored ACME account for %s cannot be decrypted with the configured data key: %w", directoryURL, err)` (wraps `datakey.ErrDecrypt`); `serve` calls it at startup, so a wrong data key stops startup for the account row exactly as for the certificate row; `(*LegoIssuer).Obtain` — returns `ctx.Err()` before any network call when ctx is done; account: `LoadAccount(DirectoryURL)`, else generate an ECDSA P-256 key, `client.Registration.Register(registration.RegisterOptions{TermsOfServiceAgreed: true})`, and only after `Register` succeeds save the PKCS#8 key sealed with AAD `acme_accounts/key/<directory url>` and the registration as JSON; client: `lego.NewConfig(user)`, `CADirURL = DirectoryURL`, `Certificate.KeyType = certcrypto.RSA2048`, `UserAgent = "hephaestus"`; DNS-01: `cloudflare.NewDefaultConfig()` with `AuthToken = CloudflareToken.Expose()`, `cloudflare.NewDNSProviderConfig`, `client.Challenge.SetDNS01Provider`; `client.Certificate.Obtain(certificate.ObtainRequest{Domains: []string{domain}, Bundle: true})` → `Certificate{ChainPEM: res.Certificate, KeyPEM: res.PrivateKey}`. Errors wrap as `acme: <step>: %w`.
+  - Repository: `func NewRepository(d *db.DB) *Repository`; `type Account struct { DirectoryURL string; KeySealed, Registration []byte; CreatedAt time.Time }` (the bun model stores `registration` as a `string` field and converts at the boundary; `key_sealed` is `[]byte`); `type StoredCertificate struct { Domain string; ChainSealed, KeySealed []byte; NotBefore, NotAfter, UpdatedAt time.Time }`; `SaveAccount(ctx, Account) error` (upsert); `LoadAccount(ctx, directoryURL string) (Account, bool, error)`; `SaveCertificate(ctx, StoredCertificate) error` (upsert by domain); `LoadCertificate(ctx, domain string) (StoredCertificate, bool, error)`. Unexported bun models map `acme_accounts` and `tls_certificates`.
+  - `type LegoConfig struct { DirectoryURL string; CloudflareToken secret.Secret; Repo *Repository; Key *datakey.Key }`; `func NewLegoIssuer(cfg LegoConfig) *LegoIssuer`; `LegoConfig` and `LegoIssuer` both implement `Format(fmt.State, rune)` and `LogValue() slog.Value` printing `DirectoryURL` and `CloudflareToken: ****` only (go-standards §15.2: `LegoIssuer` holds the config in an unexported field, which fmt cannot reach); `(*LegoIssuer).Load(ctx) error` — no account row for `DirectoryURL` → nil; a row whose key does not open → `fmt.Errorf("stored ACME account for %s cannot be decrypted with the configured data key: %w", directoryURL, err)` (wraps `datakey.ErrDecrypt`); `serve` calls it at startup, so a wrong data key stops startup for the account row exactly as for the certificate row; `(*LegoIssuer).Obtain` — returns `ctx.Err()` before any network call when ctx is done; account: `LoadAccount(DirectoryURL)`, else generate an ECDSA P-256 key, `client.Registration.Register(registration.RegisterOptions{TermsOfServiceAgreed: true})`, and only after `Register` succeeds save the PKCS#8 key sealed with AAD `acme_accounts/key/<directory url>` and the registration as JSON; client: `lego.NewConfig(user)`, `CADirURL = DirectoryURL`, `Certificate.KeyType = certcrypto.RSA2048`, `UserAgent = "hephaestus"`; DNS-01: `cloudflare.NewDefaultConfig()` with `AuthToken = CloudflareToken.Expose()`, `cloudflare.NewDNSProviderConfig`, `client.Challenge.SetDNS01Provider`; `client.Certificate.Obtain(certificate.ObtainRequest{Domains: []string{domain}, Bundle: true})` → `Certificate{ChainPEM: res.Certificate, KeyPEM: res.PrivateKey}`. Errors wrap as `acme: <step>: %w`.
   - `var ErrNoCertificate = errors.New("tlsacme: no certificate loaded yet")`; `func RenewAt(notBefore, notAfter time.Time) time.Time` = `notBefore + (notAfter−notBefore)*2/3`.
   - `type Option func(*Manager)`; `WithClock(func() time.Time)`, `WithErrorHandler(func(context.Context, error))`, `WithMeter(metric.Meter)` (default noop).
   - `func NewManager(repo *Repository, key *datakey.Key, iss Issuer, domain string, opts ...Option) (*Manager, error)` — registers `hephaestus.tls.certificate.days_left` (Float64ObservableGauge; observes only while a certificate is loaded) and `hephaestus.tls.renewal.failures` (Int64Counter).
   - `(*Manager).Load(ctx) error` — no stored row → nil, nothing loaded; a row that does not open → `fmt.Errorf("stored TLS certificate for %s cannot be decrypted with the configured data key: %w", domain, err)` (wraps `datakey.ErrDecrypt`); a leaf that does not cover `domain` → nil, nothing loaded.
-  - `(*Manager).Reconcile(ctx) (time.Duration, error)` — loaded and `now < RenewAt` → `RenewAt−now`, nil. Otherwise `Obtain`, run in its own goroutine that sends to a buffered channel of size 1; when ctx is done first, `Reconcile` returns `0, ctx.Err()` and the abandoned result is discarded (lego v4.35.2 `Obtain` takes no context; the next start retries); on error: failures++, last error recorded, the error handler gets `obtain certificate for <domain>: <err>`, the counter +1, returns `min(10m·2^(failures−1), 6h)` and the error. On success: `tls.X509KeyPair` and leaf parse; a leaf whose `DNSNames` lacks `domain` → error `issued certificate does not cover <domain>` (counted as a failure); save sealed with AADs `tls_certificates/chain/<domain>` and `tls_certificates/key/<domain>`; load it; reset failures; return `RenewAt−now`.
+  - `(*Manager).Reconcile(ctx) (time.Duration, error)` — loaded and `now < RenewAt` → `RenewAt−now`, nil. Otherwise `Obtain`, run in its own goroutine that sends to a buffered channel of size 1; when ctx is done first, `Reconcile` returns `0, ctx.Err()` and the abandoned result is discarded (lego v4.35.2 `Obtain` takes no context; the next start retries); on error: failures++, last error recorded, the error handler gets `obtain certificate for <domain>: <err>`, the counter +1, returns `min(10m·2^(failures−1), 6h)` and the error. On success: `tls.X509KeyPair`, then leaf parse, then a leaf whose `DNSNames` lacks `domain` → error `issued certificate does not cover <domain>`, then `SaveCertificate` (sealed with AADs `tls_certificates/chain/<domain>` and `tls_certificates/key/<domain>`); an error at any of these steps is a failure exactly like an `Obtain` error (failures++, handler, counter, `min(10m·2^(failures−1), 6h)` wait, nothing loaded). Then load it; when the fresh certificate's `RenewAt <= now` it stays loaded (it is valid) but the call is a failure with error `issued certificate for <domain> is already due for renewal` and the backoff wait; otherwise reset failures and return `RenewAt−now`.
   - `(*Manager).Run(ctx) error` — loops `Reconcile` with a `time.Timer` until ctx is done; returns nil then, without waiting for an abandoned `Obtain`.
   - `(*Manager).GetCertificate(*tls.ClientHelloInfo) (*tls.Certificate, error)` — `ErrNoCertificate` until loaded. `GetCertificate`, `Status` and the checks are safe for concurrent use with `Run` (the current certificate sits behind an `atomic.Pointer` or a mutex).
   - `type Status struct { Loaded bool; NotAfter time.Time; Failures int; LastError string }`; `(*Manager).Status() Status`.
   - `(*Manager).Checks() []admin.Check` — both checks have `Interval: time.Second` (they read in-memory status, so readiness follows a fresh issue within a second) — `tls:certificate` (critical): pass when loaded (output `valid until <RFC3339>`), else fail `no certificate loaded`; `tls:expiry` (informational, observed days left float64, unit `d`): pass at ≥14 days, warn `certificate expires in <n> days` below (n = whole days, rounded down), fail `certificate expired` at ≤0, fail `no certificate loaded` when none.
-- Produces (package `tlsacmetest`): `type SelfSigned struct { NotBefore, NotAfter time.Time; Domain string; Err error; Block <-chan struct{}; Calls atomic.Int64 }`; `(*SelfSigned).Obtain(ctx, domain) (tlsacme.Certificate, error)` — counts the call; when `Block` is non-nil it waits for it to close (ignoring ctx, like lego); returns `Err` when set; else a self-signed ECDSA P-256 certificate for `Domain` (or the requested domain when `Domain == ""`) with the given validity, PEM-encoded (`CERTIFICATE`, `PRIVATE KEY` PKCS#8).
+- Produces (package `tlsacmetest`): `type SelfSigned struct { NotBefore, NotAfter time.Time; Domain string; Err error; Malformed bool; Block <-chan struct{}; Calls atomic.Int64 }`; `(*SelfSigned).Obtain(ctx, domain) (tlsacme.Certificate, error)` — counts the call; when `Block` is non-nil it waits for it to close (ignoring ctx, like lego); returns `Err` when set; when `Malformed` returns `Certificate{ChainPEM: []byte("not a certificate"), KeyPEM: []byte("not a key")}`; else a self-signed ECDSA P-256 certificate for `Domain` (or the requested domain when `Domain == ""`) with the given validity, PEM-encoded (`CERTIFICATE`, `PRIVATE KEY` PKCS#8).
 
 - [ ] **Step 1: Add the dependency**
 
@@ -1509,16 +1529,19 @@ func TestLoad_ReusesStoredCertificate(t *testing.T)    // second Manager on the 
 func TestLoad_WrongDataKeyFailsLoudly(t *testing.T)    // Manager with the other key: Load → errors.Is(err, datakey.ErrDecrypt) and message contains "cannot be decrypted with the configured data key"
 func TestLoad_OtherDomainIgnored(t *testing.T)         // stored for other.example.test; Manager for hephaestus.example.test: Load → nil, !Loaded
 func TestReconcile_FailureBacksOff(t *testing.T)       // issuer Err set: seven Reconciles → waits [10m 20m 40m 80m 160m 320m 360m]; handler got 7 errors containing "obtain certificate for hephaestus.example.test"; Status().Failures == 7
+func TestReconcile_MalformedPEMBacksOff(t *testing.T)  // issuer Malformed → wait == 10*time.Minute, err != nil; Status().Failures == 1; !Loaded; no stored certificate row
+func TestReconcile_ShortLivedCertBacksOff(t *testing.T) // issuer NotBefore t0-90d, NotAfter t0+1h → wait == 10*time.Minute, error contains "already due for renewal"; Status().Loaded; Failures == 1
 func TestReconcile_RejectsCertForWrongName(t *testing.T) // issuer Domain "other.example.test" → error contains "does not cover hephaestus.example.test"; !Loaded
 func TestGetCertificate_NoneYet(t *testing.T)          // errors.Is(err, ErrNoCertificate)
 func TestChecks(t *testing.T)                          // not loaded: tls:certificate fail "no certificate loaded"; loaded, clock t0+60d (30 days left): both pass, expiry observed 30.0 unit "d"; clock t0+80d: expiry warn "certificate expires in 10 days"; clock t0+91d: expiry fail "certificate expired"
 func TestDaysLeftMetric(t *testing.T)                  // WithMeter(telemetry metrics); after issuing → metrics body contains "hephaestus_tls_certificate_days_left"
 func TestRun_StopsOnCancel(t *testing.T)               // goleak; Run in a goroutine; cancel after the first issue (poll Status().Loaded); Run returns nil
 func TestRun_AbandonsBlockedObtain(t *testing.T)       // issuer Block = an open channel; Run; cancel after 50ms → Run returns nil within 1s; then close(Block); goleak.VerifyNone (the abandoned goroutine has exited)
+func TestLegoIssuer_Redacts(t *testing.T)            // CloudflareToken "cf-secret": fmt.Sprintf("%v %+v %#v", cfg, cfg, cfg), the same for *issuer, and a slog JSON line of both → none contains "cf-secret"
 func TestLegoIssuer_LoadWrongKeyFails(t *testing.T)    // SaveAccount sealed under the fixture key (AAD "acme_accounts/key/<dir>"); NewLegoIssuer with the other key: Load → errors.Is(err, datakey.ErrDecrypt), message contains "stored ACME account for" and "cannot be decrypted with the configured data key"; empty repo → Load nil
 func TestLegoIssuer_CanceledContext(t *testing.T)      // canceled ctx → errors.Is(err, context.Canceled); no account row
 func TestLegoIssuer_BadDirectory(t *testing.T)         // DirectoryURL = httptest server answering 404 → error with prefix "acme: "; no account row
-func runRepositorySuite(t *testing.T, open func(testing.TB) *db.DB) // subtests: "AccountRoundTrip" (save, load equal, missing → false); "CertificateUpsert" (save twice for one domain → load returns the second; NotAfter Equal); "CertificateMissing" (false)
+func runRepositorySuite(t *testing.T, open func(testing.TB) *db.DB) // subtests: "AccountRoundTrip" (save with Registration = UTF-8 JSON bytes containing "Ü", load → Registration and KeySealed byte-identical; missing → false); "CertificateUpsert" (save twice for one domain → load returns the second; NotAfter Equal); "CertificateMissing" (false)
 func TestRepository_SQLite(t *testing.T)   // runRepositorySuite(t, dbtest.SQLite)
 func TestRepository_Postgres(t *testing.T) // integration file; TestMain in main_integration_test.go
 ```
@@ -1536,7 +1559,7 @@ Run: `DOCKER_HOST=unix://$HOME/.colima/default/docker.sock rtk proxy go test -ta
 
 - [ ] **Step 6: Gate and commit**
 
-Run: `DOCKER_HOST=unix://$HOME/.colima/default/docker.sock rtk proxy task ci` — Expected: exit 0; `cover:db` prints nothing.
+Run: `DOCKER_HOST=unix://$HOME/.colima/default/docker.sock rtk proxy task ci` — Expected: exit 0; `cover:db` prints no `not executed:` line.
 Run: `rtk proxy git add go.mod go.sum .taskfiles/go.yml internal/tlsacme` then `rtk proxy git commit -m "feat: Let's Encrypt certificates via DNS-01 on Cloudflare, sealed under the data key" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"`
 Expected: one new commit; `rtk proxy sh -c "git cat-file commit HEAD | grep -c '^gpgsig'"` prints `1`.
 
@@ -1614,7 +1637,7 @@ Kind: rewrite
 
 `Dockerfile`:
 ```dockerfile
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
 FROM --platform=$BUILDPLATFORM golang:1.27.4-trixie@sha256:b54b2639de8c1bfe538ec5ffc45f29b1932235ac5f6d63c059853646677112d9 AS build
 ARG TARGETOS
 ARG TARGETARCH
@@ -1656,6 +1679,7 @@ bin
 build/ipxe/.work
 build/ipxe/out
 docs
+.superpowers
 ```
 `taskfile.yml` addition:
 ```yaml
