@@ -39,22 +39,83 @@ func nthMachineForm(n int) url.Values {
 	return discoverForm("uuid", fmt.Sprintf("00000000-0000-4000-8000-%012d", n), "mac", mac, "nic0_mac", mac, "nic1_mac", "")
 }
 
-// discoverBodies are the raw bodies the tests post: every form the handler
-// tests build. FuzzParseDiscoverForm seeds with them.
-func discoverBodies() []string {
-	forms := []url.Values{
-		discoverForm(), nthMachineForm(1), nthMachineForm(9),
-		discoverForm("serial", "S2"), discoverForm("memsize", "0"), discoverForm("memsize", ""),
-		discoverForm("serial", "<script>alert(1)</script>"), discoverForm("serial", strings.Repeat("a", maxValueBytes+1)),
-		discoverForm("nic0_mac", "zz"), discoverForm("nic1_mac", ""), discoverForm("nic16_mac", "aa:bb:cc:00:00:10"),
-		discoverForm("manufacturer", "AC\x00ME"), discoverForm("manufacturer", "AC\xffME"),
-		discoverForm("serial", "S\x001\xff"), discoverForm("uuid", "", "mac", ""), discoverForm("uuid", zeroUUID),
+// bodyCase is a raw /discover body and the status it must be refused with.
+type bodyCase struct {
+	name string
+	body string
+	want int
+}
+
+// rejectCases are the TestDiscover_RejectsOversizeAndMalformed bodies.
+func rejectCases() []bodyCase {
+	long := strings.Repeat("a", maxValueBytes+1)
+	return []bodyCase{
+		{"serial of 257 bytes", discoverForm("serial", long).Encode(), http.StatusBadRequest},
+		{"chip of 257 bytes", discoverForm("nic0_chip", long).Encode(), http.StatusBadRequest},
+		{"17 KiB body", "serial=" + strings.Repeat("a", 17<<10), http.StatusRequestEntityTooLarge},
+		{"nic MAC zz", discoverForm("nic0_mac", "zz").Encode(), http.StatusBadRequest},
+		{"MAC zz", discoverForm("mac", "zz").Encode(), http.StatusBadRequest},
+		{"no uuid and no mac", discoverForm("uuid", "", "mac", "").Encode(), http.StatusBadRequest},
+		{"malformed uuid and no mac", discoverForm("uuid", "nope", "mac", "").Encode(), http.StatusBadRequest},
+		{"malformed form", "%zz=1", http.StatusBadRequest},
 	}
-	bodies := make([]string, 0, len(forms))
-	for _, form := range forms {
+}
+
+// invalidTextCases are the TestDiscover_InvalidFactsTextRejected forms.
+func invalidTextCases() []struct{ name, key, value string } {
+	return []struct{ name, key, value string }{
+		{"NUL in manufacturer", "manufacturer", "AC\x00ME"},
+		{"invalid UTF-8 in manufacturer", "manufacturer", "AC\xffME"},
+		{"NUL in cpumodel", "cpumodel", "Xe\x00on"},
+		{"invalid UTF-8 in chip", "nic1_chip", "i\xc3gc"},
+	}
+}
+
+// discoverBodies are the raw bodies FuzzParseDiscoverForm seeds with: every
+// input of TestParseDiscoverForm, TestDiscover_RejectsOversizeAndMalformed and
+// TestDiscover_InvalidFactsTextRejected, and every other form the handler tests post.
+func discoverBodies() []string {
+	var bodies []string
+	parseCases := discoverParseCases()
+	for i := range parseCases {
+		bodies = append(bodies, parseCases[i].form.Encode())
+	}
+	for _, tc := range rejectCases() {
+		bodies = append(bodies, tc.body)
+	}
+	for _, tc := range invalidTextCases() {
+		bodies = append(bodies, discoverForm(tc.key, tc.value).Encode())
+	}
+	for _, form := range []url.Values{
+		nthMachineForm(1), nthMachineForm(9), discoverForm("serial", "S2"), discoverForm("memsize", ""),
+		discoverForm("memsize", "1"), discoverForm("memsize", "34359738368"), discoverForm("uuid", zeroUUID),
+		discoverForm("uuid", zeroUUID, "mac", ""), discoverForm("serial", "<script>alert(1)</script>"),
+		discoverForm("serial", "S2", "mac", "zz"),
+	} {
 		bodies = append(bodies, form.Encode())
 	}
 	return bodies
+}
+
+// wantProblem requires an RFC 9457 refusal: status, application/problem+json,
+// and a body of type about:blank, the status text as title and the status.
+func wantProblem(t *testing.T, rec *httptest.ResponseRecorder, status int) {
+	t.Helper()
+	wantStatus(t, rec, status)
+	if got, want := rec.Header().Get("Content-Type"), "application/problem+json"; got != want {
+		t.Errorf("Content-Type = %q, want %q", got, want)
+	}
+	var p struct {
+		Type   string `json:"type"`
+		Title  string `json:"title"`
+		Status int    `json:"status"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &p); err != nil {
+		t.Fatalf("body %q is not JSON: %v", rec.Body.String(), err)
+	}
+	if p.Type != "about:blank" || p.Title != http.StatusText(status) || p.Status != status {
+		t.Errorf("problem = %+v, want about:blank, %q, %d", p, http.StatusText(status), status)
+	}
 }
 
 // newDiscoverRequest is a TLS POST /discover from the provisioning subnet.
@@ -106,7 +167,8 @@ func (g *rig) discoverWide(form url.Values) (*httptest.ResponseRecorder, map[str
 	return rec, line
 }
 
-// storedFacts decodes the newest stored report of the fixture machine.
+// storedFacts decodes the newest stored report in the database; it assumes the
+// test has recorded reports for one machine only.
 func (g *rig) storedFacts() facts {
 	g.t.Helper()
 	var raw string
@@ -172,7 +234,7 @@ func TestDiscover_RateLimited(t *testing.T) {
 	}
 	rec := g.discover(nthMachineForm(9))
 
-	wantStatus(t, rec, http.StatusTooManyRequests)
+	wantProblem(t, rec, http.StatusTooManyRequests)
 	if got := rec.Header().Get("Retry-After"); got != "600" {
 		t.Errorf("Retry-After = %q, want 600", got)
 	}
@@ -187,7 +249,7 @@ func TestDiscover_Conflict(t *testing.T) {
 
 	rec := g.discover(discoverForm("serial", "S2"))
 
-	wantStatus(t, rec, http.StatusConflict)
+	wantProblem(t, rec, http.StatusConflict)
 	if n := g.reportCount(); n != 0 {
 		t.Errorf("reports = %d, want 0", n)
 	}
@@ -205,7 +267,7 @@ func TestDiscover_NewMachineChargedOnce(t *testing.T) {
 	g.discoverOK(discoverForm())
 	rec := g.discover(discoverForm("memsize", "34359738368"))
 
-	wantStatus(t, rec, http.StatusTooManyRequests)
+	wantProblem(t, rec, http.StatusTooManyRequests)
 	if got := rec.Header().Get("Retry-After"); got != "600" {
 		t.Errorf("Retry-After = %q, want 600", got)
 	}
@@ -266,26 +328,12 @@ func TestDiscover_RepositoryErrorIsProblemJSON(t *testing.T) {
 }
 
 func TestDiscover_RejectsOversizeAndMalformed(t *testing.T) {
-	cases := []struct {
-		name string
-		body string
-		want int
-	}{
-		{"serial of 257 bytes", discoverForm("serial", strings.Repeat("a", maxValueBytes+1)).Encode(), http.StatusBadRequest},
-		{"chip of 257 bytes", discoverForm("nic0_chip", strings.Repeat("a", maxValueBytes+1)).Encode(), http.StatusBadRequest},
-		{"17 KiB body", "serial=" + strings.Repeat("a", 17<<10), http.StatusRequestEntityTooLarge},
-		{"nic MAC zz", discoverForm("nic0_mac", "zz").Encode(), http.StatusBadRequest},
-		{"MAC zz", discoverForm("mac", "zz").Encode(), http.StatusBadRequest},
-		{"no uuid and no mac", discoverForm("uuid", "", "mac", "").Encode(), http.StatusBadRequest},
-		{"malformed uuid and no mac", discoverForm("uuid", "nope", "mac", "").Encode(), http.StatusBadRequest},
-		{"malformed form", "%zz=1", http.StatusBadRequest},
-	}
 	g := newRig(t)
-	for _, tc := range cases {
+	for _, tc := range rejectCases() {
 		t.Run(tc.name, func(t *testing.T) {
 			rec := g.discoverBody(tc.body)
 
-			wantStatus(t, rec, tc.want)
+			wantProblem(t, rec, tc.want)
 		})
 	}
 	t.Run("GET", func(t *testing.T) {
@@ -306,18 +354,12 @@ func TestDiscover_RejectsOversizeAndMalformed(t *testing.T) {
 }
 
 func TestDiscover_InvalidFactsTextRejected(t *testing.T) {
-	cases := []struct{ name, key, value string }{
-		{"NUL in manufacturer", "manufacturer", "AC\x00ME"},
-		{"invalid UTF-8 in manufacturer", "manufacturer", "AC\xffME"},
-		{"NUL in cpumodel", "cpumodel", "Xe\x00on"},
-		{"invalid UTF-8 in chip", "nic1_chip", "i\xc3gc"},
-	}
 	g := newRig(t)
-	for _, tc := range cases {
+	for _, tc := range invalidTextCases() {
 		t.Run(tc.name, func(t *testing.T) {
 			rec := g.discover(discoverForm(tc.key, tc.value))
 
-			wantStatus(t, rec, http.StatusBadRequest)
+			wantProblem(t, rec, http.StatusBadRequest)
 		})
 	}
 	if n := g.reportCount(); n != 0 {
@@ -371,7 +413,7 @@ func TestDiscover_FleetFull(t *testing.T) {
 
 	rec := g.discover(discoverForm())
 
-	wantStatus(t, rec, http.StatusServiceUnavailable)
+	wantProblem(t, rec, http.StatusServiceUnavailable)
 	if got := rec.Header().Get("Retry-After"); got != "600" {
 		t.Errorf("Retry-After = %q, want 600", got)
 	}
@@ -383,7 +425,7 @@ func TestDiscover_UnidentifiableIs400(t *testing.T) {
 	// A junk-pattern UUID and no MAC cannot key a machine.
 	rec := g.discover(discoverForm("uuid", zeroUUID, "mac", ""))
 
-	wantStatus(t, rec, http.StatusBadRequest)
+	wantProblem(t, rec, http.StatusBadRequest)
 	if n := g.count("SELECT count(*) FROM machines"); n != 0 {
 		t.Errorf("machines = %d, want 0", n)
 	}

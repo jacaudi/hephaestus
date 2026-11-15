@@ -42,8 +42,9 @@ const (
 	alertKindUUIDConflict = "uuid_conflict"
 )
 
-// errValueTooLong is returned by parseBootQuery for a value over maxValueBytes.
-var errValueTooLong = errors.New("boot: query value too long")
+// errValueTooLong is returned by parseBootQuery and parseDiscoverForm for a
+// value over maxValueBytes, wrapped with the key it came from.
+var errValueTooLong = errors.New("boot: value too long")
 
 // Handlers serves the boot routes: the iPXE chain scripts and the iPXE binaries
 // over plain HTTP, and /boot and /discover over TLS.
@@ -71,7 +72,9 @@ type limiterConfig struct {
 // Option configures Handlers.
 type Option func(*Handlers)
 
-// WithClock sets the clock that stamps recorded boots; the default is time.Now.
+// WithClock sets the clock that stamps recorded boots and /discover reports and
+// drives the /discover limiter windows; the default is time.Now. A frozen clock
+// never expires a window.
 func WithClock(now func() time.Time) Option {
 	return func(h *Handlers) { h.now = now }
 }

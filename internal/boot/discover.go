@@ -45,7 +45,6 @@ const (
 	memsizeUnknown = "unknown"
 
 	contentTypeProblem = "application/problem+json"
-	problemInternal    = `{"type":"about:blank","title":"Internal Server Error","status":500}`
 )
 
 // The outcome attribute values of the hephaestus.discovery.reports counter.
@@ -65,7 +64,9 @@ var (
 	// errInvalidMAC is returned for a mac or nic<N>_mac that is not a 48-bit MAC.
 	errInvalidMAC = errors.New("boot: discover: invalid MAC address")
 	// errInvalidText is returned for a facts value with a NUL byte or invalid
-	// UTF-8, which a Postgres TEXT column rejects and SQLite would accept.
+	// UTF-8. The stored facts are JSON, which escapes the NUL and replaces the
+	// invalid UTF-8, so those fields would be silently mangled; Manufacturer is
+	// stored raw in a column, which Postgres rejects and SQLite accepts.
 	errInvalidText = errors.New("boot: discover: value has a NUL byte or invalid UTF-8")
 )
 
@@ -103,15 +104,17 @@ type discoverInput struct {
 // parseDiscoverForm validates a /discover form before any I/O. A value over
 // maxValueBytes, a malformed mac or nic<N>_mac, and a report with neither a
 // valid UUID nor a MAC are errors. Identity text goes through cleanText, as
-// /boot's does, so both routes match a machine the same way; every other text
-// value must be valid UTF-8 without NUL, so what is stored does not depend on
-// the database. A NIC without a MAC is left out. memsize "" or "0" is stored as
-// "unknown".
+// /boot's does, so both routes match a machine the same way. Every other text
+// value must be valid UTF-8 without NUL: Manufacturer is stored raw, and the
+// facts are JSON-encoded, which would silently mangle the rest (NUL escaped,
+// invalid UTF-8 replaced). A NIC without a MAC is left out. memsize "" or "0" is
+// stored as "unknown".
 func parseDiscoverForm(form url.Values) (discoverInput, error) {
-	for _, values := range form {
+	for key, values := range form {
 		for _, v := range values {
 			if len(v) > maxValueBytes {
-				return discoverInput{}, errValueTooLong
+				// key is the client's; bound it in the error that reaches the wide event.
+				return discoverInput{}, fmt.Errorf("%w: %q", errValueTooLong, key[:min(len(key), maxValueBytes)])
 			}
 		}
 	}
@@ -259,8 +262,9 @@ func (h *Handlers) readReport(w http.ResponseWriter, r *http.Request) (report, b
 	return report{in: in, payload: payload, source: source}, true
 }
 
-// admit finds or creates the machine the report describes. A machine it
-// creates is charged one limiter token here, and nowhere else.
+// admit finds or creates the machine the report describes. An unknown machine
+// is charged one limiter token here, before it is created, and store does not
+// charge that request again.
 func (h *Handlers) admit(w http.ResponseWriter, r *http.Request, rep report) (fleet.Observation, bool) {
 	ctx := r.Context()
 	_, known, err := h.repo.Lookup(ctx, rep.in.Identity)
@@ -328,8 +332,9 @@ func (h *Handlers) store(w http.ResponseWriter, r *http.Request, rep report, obs
 	}
 }
 
-// discoverReply counts outcome and answers with status and no body; err, when
-// not nil, is left on the wide event. The overload statuses carry Retry-After.
+// discoverReply counts outcome and refuses with status as a problem document;
+// err, when not nil, is left on the wide event. The overload statuses carry
+// Retry-After.
 func (h *Handlers) discoverReply(w http.ResponseWriter, r *http.Request, outcome string, status int, err error) {
 	ctx := r.Context()
 	if err != nil {
@@ -339,7 +344,19 @@ func (h *Handlers) discoverReply(w http.ResponseWriter, r *http.Request, outcome
 	if status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable {
 		w.Header().Set("Retry-After", retryAfterSeconds)
 	}
+	writeProblem(ctx, w, status)
+}
+
+// writeProblem answers status with an RFC 9457 problem document: type
+// about:blank and the status text as the title, so nothing about the failure
+// reaches the machine.
+func writeProblem(ctx context.Context, w http.ResponseWriter, status int) {
+	w.Header().Set("Content-Type", contentTypeProblem)
 	w.WriteHeader(status)
+	// The title is a fixed ASCII status text, so %q is valid JSON.
+	if _, err := fmt.Fprintf(w, `{"type":"about:blank","title":%q,"status":%d}`, http.StatusText(status), status); err != nil {
+		telemetry.AddAttrs(ctx, slog.String("write_error", err.Error()))
+	}
 }
 
 // countReport counts a /discover outcome and notes it on the wide event.
@@ -348,13 +365,9 @@ func (h *Handlers) countReport(ctx context.Context, outcome string) {
 	h.reports.Add(ctx, 1, metric.WithAttributes(attribute.String("outcome", outcome)))
 }
 
-// discoverInternalError answers 500 with a fixed problem document, and leaves
-// the cause on the wide event, so nothing about the failure reaches the machine.
+// discoverInternalError answers 500 with the problem document, and leaves the
+// cause on the wide event.
 func (h *Handlers) discoverInternalError(w http.ResponseWriter, r *http.Request, err error) {
 	telemetry.AddAttrs(r.Context(), slog.String("error", err.Error()))
-	w.Header().Set("Content-Type", contentTypeProblem)
-	w.WriteHeader(http.StatusInternalServerError)
-	if _, werr := io.WriteString(w, problemInternal); werr != nil {
-		telemetry.AddAttrs(r.Context(), slog.String("write_error", werr.Error()))
-	}
+	writeProblem(r.Context(), w, http.StatusInternalServerError)
 }
