@@ -4,6 +4,7 @@ vars:
   GOLANGCI: go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0
   VERSION: {sh: git describe --tags --always --dirty}
   COMMIT: {sh: git rev-parse --short HEAD}
+  DB_PKGS: ./internal/db/...
   DATE: {sh: date -u +%Y-%m-%dT%H:%M:%SZ}
 
 tasks:
@@ -16,6 +17,8 @@ tasks:
       - task: vuln
       - task: test
       - task: cross
+      - task: test-integration
+      - task: cover:db
   lint:
     desc: golangci-lint v2.14.0 with the go-tricorder baseline (stock binary; see .golangci.yml head)
     cmds:
@@ -55,4 +58,19 @@ tasks:
         set -eu
         for p in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
           GOOS="${p%/*}" GOARCH="${p#*/}" go build -o /dev/null ./...
+        done
+  test-integration:
+    desc: Integration tests (Postgres via docker; needs DOCKER_HOST)
+    cmds:
+      - go test -tags integration ./... -race
+  cover:db:
+    desc: Every exported method in db.go and repository.go files runs on SQLite and on Postgres (WL database rule 2)
+    cmds:
+      - mkdir -p bin
+      - go test -coverprofile=bin/cover-sqlite.out {{.DB_PKGS}}
+      - go test -tags integration -run Postgres -coverprofile=bin/cover-postgres.out {{.DB_PKGS}}
+      - |
+        set -eu
+        for f in bin/cover-sqlite.out bin/cover-postgres.out; do
+          go tool cover -func="$f" | awk -v f="$f" '$1 ~ /\/(db|repository)\.go:/ && $2 ~ /^[A-Z]/ && $3 == "0.0%" {print f ": not executed: " $1 " " $2; bad=1} END {exit bad}'
         done

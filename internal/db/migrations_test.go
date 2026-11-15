@@ -1,0 +1,110 @@
+package db_test
+
+import (
+	"os"
+	"slices"
+	"strings"
+	"testing"
+
+	"go.jacaudi.dev/hephaestus/internal/admin"
+	"go.jacaudi.dev/hephaestus/internal/db"
+	"go.jacaudi.dev/hephaestus/internal/db/dbtest"
+)
+
+const fixtureUUID = "4c4c4544-0042-3510-8052-b4c04f4e4d32"
+
+func TestMigrations_SameVersions(t *testing.T) {
+	versions := func(dir string) []string {
+		t.Helper()
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatalf("read %s: %v", dir, err)
+		}
+		var out []string
+		for _, e := range entries {
+			v, _, _ := strings.Cut(e.Name(), "_")
+			out = append(out, v)
+		}
+		return out
+	}
+	got, want := versions("migrations/sqlite"), versions("migrations/postgres")
+	if len(got) == 0 {
+		t.Fatal("no sqlite migrations")
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("sqlite versions %v != postgres versions %v", got, want)
+	}
+}
+
+func TestMigrate_SQLite(t *testing.T) { runMigrateSuite(t, dbtest.SQLite) }
+
+// runMigrateSuite is the schema suite both databases run: TestMigrate_SQLite
+// untagged, TestMigrate_Postgres under the integration tag.
+func runMigrateSuite(t *testing.T, open func(testing.TB) *db.DB) {
+	t.Helper()
+	d := open(t)
+
+	t.Run("Tables", func(t *testing.T) {
+		query := "SELECT name FROM sqlite_master WHERE type = 'table'"
+		if d.Dialect() == db.DialectPostgres {
+			query = "SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema()"
+		}
+		var got []string
+		if err := d.Bun().NewRaw(query).Scan(t.Context(), &got); err != nil {
+			t.Fatalf("list tables: %v", err)
+		}
+		for _, want := range []string{"machines", "machine_macs", "inventory_reports", "boot_events", "audit_events", "settings", "acme_accounts", "tls_certificates"} {
+			if !slices.Contains(got, want) {
+				t.Errorf("table %q missing; have %v", want, got)
+			}
+		}
+	})
+
+	t.Run("SeededUnknownAction", func(t *testing.T) {
+		var got string
+		if err := d.Bun().NewRaw("SELECT value FROM settings WHERE key = 'unknown_action'").Scan(t.Context(), &got); err != nil {
+			t.Fatalf("read unknown_action: %v", err)
+		}
+		if got != "local" {
+			t.Fatalf("unknown_action = %q, want %q", got, "local")
+		}
+	})
+
+	t.Run("Idempotent", func(t *testing.T) {
+		if err := d.Migrate(t.Context()); err != nil {
+			t.Fatalf("second Migrate: %v", err)
+		}
+		pending, err := d.Pending(t.Context())
+		if err != nil || pending {
+			t.Fatalf("Pending = %v, %v; want false, nil", pending, err)
+		}
+	})
+
+	t.Run("UniqueValidUUID", func(t *testing.T) {
+		if err := insertMachine(t, d, "m1", false); err != nil {
+			t.Fatalf("first valid machine: %v", err)
+		}
+		if err := insertMachine(t, d, "m2", false); err == nil {
+			t.Fatal("second valid machine with the same UUID succeeded, want a unique violation")
+		}
+		if err := insertMachine(t, d, "m3", true); err != nil {
+			t.Fatalf("junk machine with the same UUID: %v", err)
+		}
+	})
+
+	t.Run("ChecksPass", func(t *testing.T) {
+		for _, c := range d.Checks() {
+			if got := c.Run(t.Context()); got.Status != admin.StatusPass {
+				t.Errorf("%s = %+v, want pass", c.Name, got)
+			}
+		}
+	})
+}
+
+func insertMachine(t *testing.T, d *db.DB, id string, junk bool) error {
+	t.Helper()
+	_, err := d.Bun().ExecContext(t.Context(),
+		"INSERT INTO machines (id, smbios_uuid, junk, serial, product, arch, state, created_at, last_seen_at) VALUES (?, ?, ?, 's', 'p', 'amd64', 'discovered', '2026-11-14T12:00:00Z', '2026-11-14T12:00:00Z')",
+		id, fixtureUUID, junk)
+	return err
+}
