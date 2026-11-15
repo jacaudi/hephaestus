@@ -240,8 +240,8 @@ func runServe(ctx context.Context, cfg serveConfig, logger *slog.Logger, deps se
 	// artifact routes (/tftp/{arch}/snp.efi) are served here too, as well as on
 	// HTTPS. Every other boot route redirects to HTTPS. (All binaries, BIOS
 	// included, are built with HTTPS support; TLS is not what is missing here.)
-	httpHandler := telemetry.WideEvents(metrics.Instrument(handlers.PlainHTTP(), "boot-http"), logger, slog.LevelInfo)
-	httpsHandler := telemetry.WideEvents(metrics.Instrument(handlers.TLS(), "boot-https"), logger, slog.LevelInfo)
+	httpHandler := telemetry.WideEvents(metrics.Instrument(handlers.PlainHTTP(), "boot-http", deps.httpLn.Addr().String()), logger, slog.LevelInfo)
+	httpsHandler := telemetry.WideEvents(metrics.Instrument(handlers.TLS(), "boot-https", deps.httpsLn.Addr().String()), logger, slog.LevelInfo)
 
 	httpsSrv := newServer(deps.httpsLn, httpsHandler, time.Minute, logger)
 	httpsSrv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS13, GetCertificate: mgr.GetCertificate}

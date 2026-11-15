@@ -68,9 +68,11 @@ func (m *Metrics) Handler() http.Handler {
 }
 
 // Instrument wraps h to record request rate, errors and duration under the
-// given operation name.
-func (m *Metrics) Instrument(h http.Handler, operation string) http.Handler {
-	return otelhttp.NewHandler(h, operation, otelhttp.WithMeterProvider(m.mp))
+// given operation name. serverName is the address of the listener h serves, as
+// host:port. It labels the metrics, so the client's Host header never does;
+// the port is part of it because otelhttp takes a missing port from that header.
+func (m *Metrics) Instrument(h http.Handler, operation, serverName string) http.Handler {
+	return otelhttp.NewHandler(h, operation, otelhttp.WithMeterProvider(m.mp), otelhttp.WithServerName(serverName))
 }
 
 // Shutdown stops the meter provider.

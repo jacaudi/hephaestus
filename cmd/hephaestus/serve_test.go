@@ -329,6 +329,45 @@ func TestRunServe_ServesAndDrains(t *testing.T) {
 	}
 }
 
+// TestRunServe_MetricsIgnoreHostHeader pins that the boot listeners' request
+// metrics carry the listener's address, not whatever Host a client sends.
+func TestRunServe_MetricsIgnoreHostHeader(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	cfg := testServeConfig(t)
+	deps := testDeps(t, selfSignedIssuer(nil))
+	stop, done := startServe(t, cfg, discardLogger(), deps)
+	waitStatus(t, deps.adminURL()+"/readyz", done)
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, deps.httpURL()+"/start", http.NoBody)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Host = "random-host-1.example:8123"
+	resp, err := testClient(nil).Do(req)
+	if err != nil {
+		t.Fatalf("GET /start: %v", err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatalf("close body: %v", err)
+	}
+
+	metrics := get(t, testClient(nil), deps.adminURL()+"/metrics")
+	if !strings.Contains(metrics.body, "http_server_request_duration_seconds") {
+		t.Fatalf("GET /metrics lacks the request duration:\n%s", metrics.body)
+	}
+	for _, unwanted := range []string{"random-host-1", "8123"} {
+		if strings.Contains(metrics.body, unwanted) {
+			t.Errorf("GET /metrics contains the client-supplied %q", unwanted)
+		}
+	}
+
+	stop()
+	if err := waitDone(t, done, 10*time.Second); err != nil {
+		t.Errorf("runServe after cancel = %v, want nil", err)
+	}
+}
+
 func TestRunServe_TLS12Refused(t *testing.T) {
 	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 
