@@ -1,0 +1,382 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+// hephaestus: vendored from github.com/siderolabs/omni-infra-provider-bare-metal v0.15.0 (13d64d3ec8e1a4f90f50af160380b086030f2343), pkg/dhcp/proxy.go. Changes: zap replaced by log/slog (levels unchanged); the siderolabs/gen xslices.Map call in validateDHCP replaced by a loop.
+
+package dhcp
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net"
+	"strconv"
+
+	"github.com/insomniacslk/dhcp/dhcpv4"
+	"github.com/insomniacslk/dhcp/dhcpv4/server4"
+	"github.com/insomniacslk/dhcp/iana"
+	"golang.org/x/sync/errgroup"
+)
+
+const (
+	// port67 is the standard DHCP server port, used for broadcast DHCPDISCOVER.
+	port67 = 67
+	// port4011 is the PXE proxy DHCP port, used for unicast DHCPREQUEST.
+	port4011 = 4011
+)
+
+// Proxy is a DHCP proxy server, adding PXE boot options to the DHCP responses.
+type Proxy struct {
+	logger                   *slog.Logger
+	apiAdvertiseAddress      string
+	proxyIfaceOrIP           string
+	apiPort                  int
+	disableBroadcastListener bool
+}
+
+// NewProxy creates a new DHCP proxy server.
+func NewProxy(apiAdvertiseAddress string, apiPort int, proxyIfaceOrIP string, disableBroadcastListener bool, logger *slog.Logger) *Proxy {
+	return &Proxy{
+		apiAdvertiseAddress:      apiAdvertiseAddress,
+		apiPort:                  apiPort,
+		proxyIfaceOrIP:           proxyIfaceOrIP,
+		disableBroadcastListener: disableBroadcastListener,
+		logger:                   logger,
+	}
+}
+
+// Run starts the DHCP proxy server on port 67 and port 4011.
+//
+// Per the PXE specification (section 2.5.1.1), the redirection service must be prepared
+// to receive DHCPDISCOVER on port 67 and DHCPREQUEST on port 4011.
+//
+// Port 67 handles the broadcast DHCPDISCOVER from PXE clients and responds with DHCPOFFER.
+// Port 4011 handles the unicast DHCPREQUEST from PXE clients that follow the two-phase
+// proxy DHCP flow, and responds with DHCPACK.
+//
+// When disableBroadcastListener is true, only port 4011 is used. This is for deployments
+// where the proxy runs on the same host as the DHCP server and cannot bind to port 67.
+func (p *Proxy) Run(ctx context.Context) error {
+	iface, err := p.determineInterface(p.proxyIfaceOrIP)
+	if err != nil {
+		return fmt.Errorf("failed to determine interface: %w", err)
+	}
+
+	eg, ctx := errgroup.WithContext(ctx)
+
+	if !p.disableBroadcastListener {
+		p.logger.Info("starting DHCP proxy broadcast listener on port 67", slog.String("interface", iface))
+
+		eg.Go(func() error {
+			return p.runServer(ctx, iface, port67)
+		})
+	}
+
+	p.logger.Info("starting DHCP proxy direct listener on port 4011", slog.String("interface", iface))
+
+	eg.Go(func() error {
+		return p.runServer(ctx, iface, port4011)
+	})
+
+	return eg.Wait()
+}
+
+func (p *Proxy) runServer(ctx context.Context, iface string, port int) error {
+	laddr := &net.UDPAddr{Port: port}
+
+	server, err := server4.NewServer(iface, laddr, p.handlePacket(port))
+	if err != nil {
+		return fmt.Errorf("failed to create DHCP server on port %d: %w", port, err)
+	}
+
+	eg, ctx := errgroup.WithContext(ctx)
+
+	eg.Go(func() error {
+		if serveErr := server.Serve(); serveErr != nil {
+			if errors.Is(serveErr, net.ErrClosed) {
+				return nil
+			}
+
+			return fmt.Errorf("failed to run DHCP server on port %d: %w", port, serveErr)
+		}
+
+		return nil
+	})
+
+	eg.Go(func() error {
+		<-ctx.Done()
+
+		return server.Close()
+	})
+
+	return eg.Wait()
+}
+
+func (p *Proxy) determineInterface(ifaceOrIP string) (string, error) {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return "", fmt.Errorf("failed to get network interfaces: %w", err)
+	}
+
+	targetIP := net.ParseIP(ifaceOrIP)
+
+	for _, iface := range interfaces {
+		if iface.Name == ifaceOrIP {
+			return iface.Name, nil
+		}
+
+		if targetIP == nil { // not an IP address, we are matching only against interfaces, skip
+			continue
+		}
+
+		addrs, addrsErr := iface.Addrs()
+		if addrsErr != nil {
+			p.logger.Error("failed to list addresses for interface", slog.String("interface", iface.Name), slog.Any("error", addrsErr))
+		}
+
+		for _, addr := range addrs {
+			// Extract IP from address
+			var ip net.IP
+
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+
+			if ip != nil && ip.Equal(targetIP) {
+				return iface.Name, nil
+			}
+		}
+	}
+
+	return "", fmt.Errorf("no interface found for: %s", ifaceOrIP)
+}
+
+func (p *Proxy) handlePacket(port int) func(conn net.PacketConn, peer net.Addr, m *dhcpv4.DHCPv4) {
+	return func(conn net.PacketConn, peer net.Addr, m *dhcpv4.DHCPv4) {
+		logger := p.logger.With(slog.String("source", m.ClientHWAddr.String()), slog.Int("port", port))
+
+		if err := isBootDHCP(m, port); err != nil {
+			logger.Debug("ignoring packet", slog.Any("error", err))
+
+			return
+		}
+
+		fwtype, err := validateDHCP(m)
+		if err != nil {
+			logger.Debug("invalid packet", slog.Any("error", err))
+
+			return
+		}
+
+		resp, err := offerDHCP(m, p.apiAdvertiseAddress, p.apiPort, fwtype, port)
+		if err != nil {
+			logger.Error("failed to construct ProxyDHCP response", slog.Any("error", err))
+
+			return
+		}
+
+		logger.Info("offering boot response", slog.String("boot_filename", resp.BootFileNameOption()), slog.String("message_type", resp.MessageType().String()))
+
+		_, err = conn.WriteTo(resp.ToBytes(), peer)
+		if err != nil {
+			logger.Error("failure sending response", slog.Any("error", err))
+		}
+	}
+}
+
+// isBootDHCP checks if the packet is a PXE boot DHCP packet appropriate for the given port.
+//
+// Per the PXE spec (section 2.5.1.1, page 35):
+//   - Port 67 receives DHCPDISCOVER (broadcast from PXE clients)
+//   - Port 4011 receives DHCPREQUEST (unicast/direct from PXE clients in the two-phase flow)
+func isBootDHCP(pkt *dhcpv4.DHCPv4, port int) error {
+	var expectedType dhcpv4.MessageType
+
+	switch port {
+	case port4011:
+		expectedType = dhcpv4.MessageTypeRequest
+	default:
+		expectedType = dhcpv4.MessageTypeDiscover
+	}
+
+	if pkt.MessageType() != expectedType {
+		return fmt.Errorf("packet is %s, not %s", pkt.MessageType(), expectedType)
+	}
+
+	if pkt.Options[93] == nil {
+		return errors.New("not a PXE boot request (missing option 93)")
+	}
+
+	return nil
+}
+
+func validateDHCP(m *dhcpv4.DHCPv4) (fwtype firmware, err error) {
+	arches := m.ClientArch()
+
+	for _, arch := range arches {
+		switch arch { //nolint:exhaustive
+		case iana.INTEL_X86PC:
+			fwtype = firmwareX86PC
+		case iana.EFI_IA32, iana.EFI_X86_64, iana.EFI_BC:
+			fwtype = firmwareX86EFI
+		case iana.EFI_ARM64, iana.UBOOT_ARM64:
+			fwtype = firmwareARMEFI
+		case iana.EFI_X86_HTTP, iana.EFI_X86_64_HTTP:
+			fwtype = firmwareX86HTTP
+		case iana.EFI_ARM64_HTTP, iana.UBOOT_ARM64_HTTP:
+			fwtype = firmwareARMHTTP
+		}
+	}
+
+	if fwtype == firmwareUnsupported {
+		names := make([]string, 0, len(arches))
+		for _, a := range arches {
+			names = append(names, a.String())
+		}
+
+		return 0, fmt.Errorf("unsupported client arch: %v", names)
+	}
+
+	// Now, identify special sub-breeds of client firmware based on
+	// the user-class option. Note these only change the "firmware
+	// type", not the architecture we're reporting to Booters. We need
+	// to identify these as part of making the internal chainloading
+	// logic work properly.
+	if userClasses := m.UserClass(); len(userClasses) > 0 {
+		// If the client has had iPXE burned into its ROM (or is a VM
+		// that uses iPXE as the PXE "ROM"), special handling is
+		// needed because in this mode the client is using iPXE native
+		// drivers and chainloading to a UNDI stack won't work.
+		if userClasses[0] == "iPXE" && fwtype == firmwareX86PC {
+			fwtype = firmwareX86Ipxe
+		}
+	}
+
+	guid := m.GetOneOption(dhcpv4.OptionClientMachineIdentifier)
+	switch len(guid) {
+	case 0:
+		// A missing GUID is invalid according to the spec, however
+		// there are PXE ROMs in the wild that omit the GUID and still
+		// expect to boot. The only thing we do with the GUID is
+		// mirror it back to the client if it's there, so we might as
+		// well accept these buggy ROMs.
+	case 17:
+		if guid[0] != 0 {
+			return 0, errors.New("malformed client GUID (option 97), leading byte must be zero")
+		}
+	default:
+		return 0, errors.New("malformed client GUID (option 97), wrong size")
+	}
+
+	return fwtype, nil
+}
+
+// offerDHCP constructs the DHCP response for a PXE boot request.
+//
+// On port 67, this is a DHCPOFFER in response to DHCPDISCOVER.
+// On port 4011, this is a DHCPACK in response to DHCPREQUEST.
+func offerDHCP(req *dhcpv4.DHCPv4, apiAdvertiseAddress string, apiPort int, fwtype firmware, port int) (*dhcpv4.DHCPv4, error) {
+	serverIP := net.ParseIP(apiAdvertiseAddress)
+	if serverIP == nil {
+		return nil, fmt.Errorf("invalid API advertise address %q: not a valid IP", apiAdvertiseAddress)
+	}
+
+	ipPort := net.JoinHostPort(serverIP.String(), strconv.Itoa(apiPort))
+
+	var replyType dhcpv4.MessageType
+
+	switch port {
+	case port4011:
+		replyType = dhcpv4.MessageTypeAck
+	default:
+		replyType = dhcpv4.MessageTypeOffer
+	}
+
+	modifiers := []dhcpv4.Modifier{
+		dhcpv4.WithMessageType(replyType),
+		dhcpv4.WithServerIP(serverIP),
+		dhcpv4.WithOptionCopied(req, dhcpv4.OptionClientMachineIdentifier),
+		dhcpv4.WithOptionCopied(req, dhcpv4.OptionClassIdentifier),
+		// RFC 2131 (table 3) requires the server identifier (option 54) in every DHCPOFFER and DHCPACK, and the PXE
+		// specification lists it in the proxyDHCP offer as well. EDK2-based UEFI firmware (most vendor PXE stacks and
+		// OVMF) drops an offer without it before its PXE code even looks at it, so the machine never requests the boot
+		// file and fails with PXE-E16.
+		dhcpv4.WithOption(dhcpv4.OptServerIdentifier(serverIP)),
+	}
+
+	resp, err := dhcpv4.NewReplyFromRequest(
+		req,
+		modifiers...,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.GetOneOption(dhcpv4.OptionClassIdentifier) == nil {
+		resp.UpdateOption(dhcpv4.OptClassIdentifier("PXEClient"))
+	}
+
+	// For the standard PXE TFTP firmware types below, the boot filename is also written to the BOOTP
+	// `file` header field in addition to DHCP option 67. U-Boot's ProxyDHCP code path reads the filename
+	// from the header directly and never processes DHCP options, so without this the BOOTP file field
+	// would be empty. iPXE and HTTP-boot firmwares are not included here since they process DHCP options
+	// correctly.
+	switch fwtype {
+	case firmwareX86PC:
+		// This is completely standard PXE: just load a file from TFTP.
+		resp.UpdateOption(dhcpv4.OptTFTPServerName(serverIP.String()))
+		resp.BootFileName = "undionly.kpxe"
+		resp.UpdateOption(dhcpv4.OptBootFileName(resp.BootFileName))
+	case firmwareX86Ipxe:
+		// Almost standard PXE, but the boot filename needs to be a URL.
+		urlHost := serverIP.String()
+		if serverIP.To4() == nil { // IPv6 host must be bracketed in a URL authority per RFC 3986
+			urlHost = "[" + urlHost + "]"
+		}
+
+		resp.UpdateOption(dhcpv4.OptBootFileName(fmt.Sprintf("tftp://%s/undionly.kpxe", urlHost)))
+	case firmwareX86EFI:
+		// This is completely standard PXE: just load a file from TFTP.
+		resp.UpdateOption(dhcpv4.OptTFTPServerName(serverIP.String()))
+		resp.BootFileName = "snp.efi"
+		resp.UpdateOption(dhcpv4.OptBootFileName(resp.BootFileName))
+	case firmwareARMEFI:
+		// This is completely standard PXE: just load a file from TFTP.
+		resp.UpdateOption(dhcpv4.OptTFTPServerName(serverIP.String()))
+		resp.BootFileName = "snp-arm64.efi"
+		resp.UpdateOption(dhcpv4.OptBootFileName(resp.BootFileName))
+	case firmwareX86HTTP:
+		// This is completely standard HTTP-boot: just load a file from HTTP.
+		resp.UpdateOption(dhcpv4.OptBootFileName(fmt.Sprintf("http://%s/tftp/amd64/snp.efi", ipPort)))
+	case firmwareARMHTTP:
+		// This is completely standard HTTP-boot: just load a file from HTTP.
+		resp.UpdateOption(dhcpv4.OptBootFileName(fmt.Sprintf("http://%s/tftp/arm64/snp.efi", ipPort)))
+	case firmwareUnsupported:
+		fallthrough
+	default:
+		return nil, fmt.Errorf("unsupported firmware type %d", fwtype)
+	}
+
+	return resp, nil
+}
+
+// firmware describes a kind of firmware attempting to boot.
+//
+// This should only be used for selecting the right bootloader,
+// kernel selection should key off the more generic architecture.
+type firmware int
+
+// The bootloaders that we know how to handle.
+const (
+	firmwareUnsupported firmware = iota // Unsupported
+	firmwareX86PC                       // "Classic" x86 BIOS with PXE/UNDI support
+	firmwareX86EFI                      // EFI x86
+	firmwareARMEFI                      // EFI ARM64
+	firmwareX86Ipxe                     // "Classic" x86 BIOS running iPXE (no UNDI support)
+	firmwareX86HTTP                     // HTTP Boot X86
+	firmwareARMHTTP                     // ARM64 HTTP Boot
+)
