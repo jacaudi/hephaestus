@@ -4,7 +4,7 @@ vars:
   GOLANGCI: go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0
   VERSION: {sh: git describe --tags --always --dirty}
   COMMIT: {sh: git rev-parse --short HEAD}
-  DB_PKGS: ./internal/db/...
+  DB_PKGS: ./internal/db/... ./internal/fleet/...
   DATE: {sh: date -u +%Y-%m-%dT%H:%M:%SZ}
 
 tasks:
