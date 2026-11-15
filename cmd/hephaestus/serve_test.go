@@ -525,6 +525,53 @@ func TestRunServe_ShutdownAbandonsObtain(t *testing.T) {
 	}
 }
 
+// holdOpen connects to addr and sends the start of a request without finishing
+// it, so the server counts the connection as in flight until it is cut. The
+// connection is closed when the test ends.
+func holdOpen(t *testing.T, addr string) {
+	t.Helper()
+
+	conn, err := (&net.Dialer{}).DialContext(t.Context(), "tcp", addr)
+	if err != nil {
+		t.Fatalf("dial %s: %v", addr, err)
+	}
+	t.Cleanup(func() {
+		if err := conn.Close(); err != nil {
+			t.Errorf("close %s: %v", addr, err)
+		}
+	})
+	if _, err := io.WriteString(conn, "GET /start HTTP/1.1\r\nHost: held\r\n"); err != nil {
+		t.Fatalf("write to %s: %v", addr, err)
+	}
+}
+
+// TestRunServe_DrainSharesOneGrace pins that the boot servers and the admin
+// server drain against one HEPHAESTUS_SHUTDOWN_GRACE deadline, not one each:
+// with both stuck on an unfinished request, the process must still stop within
+// roughly one grace, or a stop timeout equal to the grace ends in SIGKILL.
+func TestRunServe_DrainSharesOneGrace(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	cfg := testServeConfig(t)
+	cfg.ShutdownGrace = 2 * time.Second
+	deps := testDeps(t, selfSignedIssuer(nil))
+	stop, done := startServe(t, cfg, discardLogger(), deps)
+	waitStatus(t, deps.adminURL()+"/readyz", done)
+	holdOpen(t, deps.httpLn.Addr().String())
+	holdOpen(t, deps.adminLn.Addr().String())
+
+	start := time.Now()
+	stop()
+	err := waitDone(t, done, cfg.ShutdownGrace+time.Second)
+
+	if elapsed := time.Since(start); elapsed < cfg.ShutdownGrace {
+		t.Errorf("runServe returned after %s, before the %s grace: the held connections were not draining", elapsed, cfg.ShutdownGrace)
+	}
+	if err == nil || !strings.Contains(err.Error(), "context deadline exceeded") {
+		t.Errorf("runServe after a drain that hit the grace = %v, want a deadline error", err)
+	}
+}
+
 func TestRunServe_AdminWideEvents(t *testing.T) {
 	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 

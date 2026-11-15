@@ -335,19 +335,20 @@ func (p *plane) run(ctx context.Context) error {
 	p.life.Set(admin.Draining)
 	p.logger.InfoContext(base, "draining")
 
+	// One deadline for both server drains, set now: a stop timeout equal to
+	// ShutdownGrace must not end in SIGKILL because each drain took a full grace.
+	drainCtx, cancelDrain := context.WithTimeout(base, p.cfg.ShutdownGrace)
+	defer cancelDrain()
+
 	stopProxy()
 	proxyErr := proxy.wait()
 
-	webCtx, cancelWeb := context.WithTimeout(base, p.cfg.ShutdownGrace)
-	defer cancelWeb()
-	webErr := errors.Join(shutdownAll(webCtx, p.httpSrv, p.httpsSrv), web.wait())
+	webErr := errors.Join(shutdownAll(drainCtx, p.httpSrv, p.httpsSrv), web.wait())
 
 	stopWork()
 	workErr := work.wait()
 
-	admCtx, cancelAdm := context.WithTimeout(base, p.cfg.ShutdownGrace)
-	defer cancelAdm()
-	admErr := errors.Join(shutdownAll(admCtx, p.adminSrv), adm.wait())
+	admErr := errors.Join(shutdownAll(drainCtx, p.adminSrv), adm.wait())
 
 	p.life.Set(admin.Stopped)
 	p.logger.InfoContext(base, "stopped")
