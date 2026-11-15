@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -193,16 +194,70 @@ func waitStatus(t *testing.T, url string, done <-chan error) {
 	t.Fatalf("%s did not answer 200 within 10s", url)
 }
 
-// requireNeverServed fails if url still answers; call it after runServe returned.
-func requireNeverServed(t *testing.T, url string) {
+// probeResult is how the service met a probe: err is nil with the HTTP status
+// it answered, or the error that ended the connection unanswered.
+type probeResult struct {
+	status int
+	err    error
+}
+
+// probeReadyz connects to the admin listener and sends GET /readyz before
+// runServe starts, so the request waits in the open listener's backlog. If the
+// admin server ever starts serving it answers the probe; if runServe returns
+// without serving, closing the listener ends the connection unanswered.
+// (A request sent after runServe returned would be refused whatever the
+// service did, which proves nothing.)
+func probeReadyz(t *testing.T, deps serveDeps) <-chan probeResult {
 	t.Helper()
 
-	resp, err := getE(t.Context(), testClient(nil), url)
-	if err == nil {
-		if cerr := resp.Body.Close(); cerr != nil {
-			t.Errorf("close %s: %v", url, cerr)
+	ctx := t.Context()
+	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", deps.adminLn.Addr().String())
+	if err != nil {
+		t.Fatalf("dial admin listener: %v", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, deps.adminURL()+"/readyz", http.NoBody)
+	if err != nil {
+		t.Fatalf("build probe: %v", err)
+	}
+	req.Close = true
+	if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatalf("set probe deadline: %v", err)
+	}
+	if err := req.Write(conn); err != nil {
+		t.Fatalf("send probe: %v", err)
+	}
+
+	out := make(chan probeResult, 1)
+	go func() {
+		var res probeResult
+		resp, err := http.ReadResponse(bufio.NewReader(conn), req)
+		if err != nil {
+			res.err = err
+		} else {
+			res.status = resp.StatusCode
+			if cerr := resp.Body.Close(); cerr != nil {
+				t.Errorf("close probe body: %v", cerr)
+			}
 		}
-		t.Errorf("%s answered %d, want a refused connection", url, resp.StatusCode)
+		if cerr := conn.Close(); cerr != nil {
+			t.Errorf("close probe connection: %v", cerr)
+		}
+		out <- res
+	}()
+	return out
+}
+
+// requireUnanswered fails if the service answered the probe; call it after runServe returned.
+func requireUnanswered(t *testing.T, probe <-chan probeResult) {
+	t.Helper()
+
+	select {
+	case res := <-probe:
+		if res.err == nil {
+			t.Errorf("the admin listener answered /readyz with status %d, want the connection dropped unanswered", res.status)
+		}
+	case <-time.After(5 * time.Second):
+		t.Error("the /readyz probe was still pending 5s after runServe returned")
 	}
 }
 
@@ -319,6 +374,7 @@ func TestRunServe_WrongDataKeyFails(t *testing.T) {
 	}
 	cfg.DataKey = other
 	deps = testDeps(t, selfSignedIssuer(nil))
+	probe := probeReadyz(t, deps)
 	_, done = startServe(t, cfg, discardLogger(), deps)
 
 	err = waitDone(t, done, 10*time.Second)
@@ -328,7 +384,7 @@ func TestRunServe_WrongDataKeyFails(t *testing.T) {
 	if want := "cannot be decrypted with the configured data key"; !strings.Contains(err.Error(), want) {
 		t.Errorf("second run error = %v, want it to contain %q", err, want)
 	}
-	requireNeverServed(t, deps.adminURL()+"/readyz")
+	requireUnanswered(t, probe)
 }
 
 func TestServeCmd_InvalidConfig(t *testing.T) {
@@ -366,15 +422,18 @@ func TestRunServe_IssuerFactoryErrorStops(t *testing.T) {
 
 	cfg := testServeConfig(t)
 	deps := testDeps(t, func(context.Context, *tlsacme.Repository, *datakey.Key) (tlsacme.Issuer, error) {
+		// Give an admin server that started too early time to answer the probe.
+		time.Sleep(200 * time.Millisecond)
 		return nil, errors.New("account check failed")
 	})
+	probe := probeReadyz(t, deps)
 	_, done := startServe(t, cfg, discardLogger(), deps)
 
 	err := waitDone(t, done, 10*time.Second)
 	if err == nil || !strings.Contains(err.Error(), "account check failed") {
 		t.Errorf("runServe = %v, want an error containing %q", err, "account check failed")
 	}
-	requireNeverServed(t, deps.adminURL()+"/readyz")
+	requireUnanswered(t, probe)
 }
 
 func TestRunServe_ShutdownAbandonsObtain(t *testing.T) {
@@ -436,5 +495,4 @@ func TestRunServe_ComponentFailureStopsEverything(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "boot http server") {
 		t.Errorf("runServe = %v, want an error from the boot http server", err)
 	}
-	requireNeverServed(t, deps.adminURL()+"/healthz")
 }
