@@ -103,3 +103,18 @@ func TestVersionCmd_StrayArgIsUsageError(t *testing.T) {
 		t.Errorf("exitCode(%v) = %d, want 2", err, got)
 	}
 }
+
+func TestRoot_LogFormatFlagIsPersistent(t *testing.T) {
+	flag := newRootCmd().PersistentFlags().Lookup("log-format")
+	if flag == nil {
+		t.Fatal("root has no persistent --log-format flag")
+	}
+	if flag.DefValue != "" {
+		t.Errorf("default = %q, want empty (the env or json default applies)", flag.DefValue)
+	}
+
+	// A subcommand accepts it too: it is persistent, not local to the root.
+	if _, err := execute(t, "version", "--log-format=text"); err != nil {
+		t.Errorf("version --log-format=text: %v", err)
+	}
+}

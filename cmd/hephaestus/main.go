@@ -73,6 +73,7 @@ Run "hephaestus version" to print the build version.`,
 			return cmd.Help()
 		},
 	}
+	root.PersistentFlags().String("log-format", "", "log format: json or text (overrides HEPHAESTUS_LOG_FORMAT)")
 	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error {
 		return usageError{err}
 	})
