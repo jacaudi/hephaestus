@@ -1,6 +1,7 @@
 package fleet
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"slices"
@@ -102,6 +103,26 @@ func mustTransition(t *testing.T, r *Repository, id string, trigger Trigger, at 
 		t.Fatalf("%s: %v", trigger, err)
 	}
 	return m
+}
+
+// auditRows reads every audit event, oldest first.
+func auditRows(t *testing.T, d *db.DB) []auditEventRow {
+	t.Helper()
+	var rows []auditEventRow
+	if err := d.Bun().NewSelect().Model(&rows).Order("id").Scan(t.Context()); err != nil {
+		t.Fatalf("read audit: %v", err)
+	}
+	return rows
+}
+
+// mustReport stores a report and returns whether it was new.
+func mustReport(t *testing.T, r *Repository, machineID string, rep Report) bool {
+	t.Helper()
+	stored, err := r.RecordReport(t.Context(), machineID, rep)
+	if err != nil {
+		t.Fatalf("RecordReport: %v", err)
+	}
+	return stored
 }
 
 func wantMACs(t *testing.T, got Machine, want ...string) {
@@ -520,6 +541,209 @@ func runRepositorySuite(t *testing.T, open func(testing.TB) *db.DB) {
 		r := NewRepository(open(t))
 		if _, err := r.Get(t.Context(), "nope"); !errors.Is(err, ErrNotFound) {
 			t.Fatalf("Get error = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("ObserveCreates", func(t *testing.T) {
+		d := open(t)
+		r := NewRepository(d)
+		obs, err := r.Observe(t.Context(), originalIdentity(), ArchAMD64, t0)
+		if err != nil {
+			t.Fatalf("Observe: %v", err)
+		}
+		if !obs.Created || obs.Alerted || obs.Machine.State != StateDiscovered {
+			t.Fatalf("observation = %+v, want created, not alerted, discovered", obs)
+		}
+		rows := auditRows(t, d)
+		if len(rows) != 1 || rows[0].Action != "transition.first_contact" || rows[0].Actor != "system" ||
+			rows[0].MachineID != obs.Machine.ID || rows[0].Detail != `{"from":"none","to":"discovered"}` {
+			t.Fatalf("audit rows = %+v, want one system transition.first_contact for %s", rows, obs.Machine.ID)
+		}
+	})
+
+	t.Run("ObserveUnidentifiableWritesNothing", func(t *testing.T) {
+		d := open(t)
+		r := NewRepository(d)
+		if _, err := r.Observe(t.Context(), Identity{UUID: zeroUUID}, ArchAMD64, t0); !errors.Is(err, ErrUnidentifiable) {
+			t.Fatalf("Observe error = %v, want ErrUnidentifiable", err)
+		}
+		if n := scalar[int](t, d, "SELECT count(*) FROM machines"); n != 0 {
+			t.Fatalf("machines = %d, want 0", n)
+		}
+		if rows := auditRows(t, d); len(rows) != 0 {
+			t.Fatalf("audit rows = %+v, want none", rows)
+		}
+	})
+
+	t.Run("ObserveConflict", func(t *testing.T) {
+		d := open(t)
+		r := NewRepository(d)
+		m := firstContact(t, r, originalIdentity(), t0)
+		clone := Identity{UUID: fixtureUUID, MAC: macN(1), Serial: "S2", Product: "P1"}
+		observe := func(at time.Time) Observation {
+			t.Helper()
+			obs, err := r.Observe(t.Context(), clone, ArchAMD64, at)
+			if !errors.Is(err, ErrIdentityConflict) {
+				t.Fatalf("Observe error = %v, want ErrIdentityConflict", err)
+			}
+			return obs
+		}
+		alerts := func() int {
+			t.Helper()
+			return scalar[int](t, d, "SELECT count(*) FROM audit_events WHERE action = 'alert.uuid_conflict' AND machine_id = ?", m.ID)
+		}
+
+		first := observe(t0.Add(10 * time.Second))
+		if !first.Alerted || !first.Machine.Junk || first.Machine.ID != m.ID {
+			t.Fatalf("first observation = %+v, want alerted junk %s", first, m.ID)
+		}
+		got := mustGet(t, r, m.ID)
+		if !got.Junk || !got.LastSeenAt.Equal(t0) {
+			t.Fatalf("machine = junk %v seen %v, want junk and last_seen_at untouched at %v", got.Junk, got.LastSeenAt, t0)
+		}
+		if n := alerts(); n != 1 {
+			t.Fatalf("alerts = %d, want 1", n)
+		}
+
+		if second := observe(t0.Add(40 * time.Second)); second.Alerted {
+			t.Fatalf("second observation = %+v, want not alerted", second)
+		}
+		if n := alerts(); n != 1 {
+			t.Fatalf("alerts after repeat = %d, want 1", n)
+		}
+	})
+
+	t.Run("ObserveTouches", func(t *testing.T) {
+		r := NewRepository(open(t))
+		m := firstContact(t, r, originalIdentity(), t0)
+		obs, err := r.Observe(t.Context(), originalIdentity(), ArchAMD64, t0.Add(time.Minute))
+		if err != nil {
+			t.Fatalf("Observe: %v", err)
+		}
+		if obs.Created || obs.Alerted || obs.Machine.ID != m.ID || !obs.Machine.LastSeenAt.Equal(t0.Add(time.Minute)) {
+			t.Fatalf("observation = %+v, want machine %s seen at t0+1m", obs, m.ID)
+		}
+		if got := mustGet(t, r, m.ID); !got.LastSeenAt.Equal(t0.Add(time.Minute)) {
+			t.Fatalf("stored LastSeenAt = %v, want t0+1m", got.LastSeenAt)
+		}
+	})
+
+	t.Run("ReportStoredThenDeduped", func(t *testing.T) {
+		d := open(t)
+		r := NewRepository(d)
+		m := firstContact(t, r, originalIdentity(), t0)
+		facts := []byte(`{"serial":"S1"}`)
+		if !mustReport(t, r, m.ID, Report{Facts: facts, At: t0}) {
+			t.Fatal("first report: stored = false, want true")
+		}
+		if mustReport(t, r, m.ID, Report{Facts: facts, At: t0.Add(30 * time.Second)}) {
+			t.Fatal("identical report: stored = true, want false")
+		}
+		if n := scalar[int](t, d, "SELECT count(*) FROM inventory_reports WHERE machine_id = ?", m.ID); n != 1 {
+			t.Fatalf("reports = %d, want 1", n)
+		}
+		if got := mustGet(t, r, m.ID); !got.LastSeenAt.Equal(t0.Add(30 * time.Second)) {
+			t.Fatalf("LastSeenAt = %v, want t0+30s", got.LastSeenAt)
+		}
+	})
+
+	t.Run("ReportRetention", func(t *testing.T) {
+		d := open(t)
+		r := NewRepository(d)
+		m := firstContact(t, r, originalIdentity(), t0)
+		for i := 1; i <= ReportsKept+2; i++ {
+			mustReport(t, r, m.ID, Report{Facts: fmt.Appendf(nil, `{"n":%d}`, i), At: t0.Add(time.Duration(i) * time.Second)})
+		}
+		var got []string
+		if err := d.Bun().NewRaw("SELECT facts FROM inventory_reports WHERE machine_id = ? ORDER BY id", m.ID).Scan(t.Context(), &got); err != nil {
+			t.Fatalf("read reports: %v", err)
+		}
+		var want []string
+		for i := 3; i <= ReportsKept+2; i++ {
+			want = append(want, fmt.Sprintf(`{"n":%d}`, i))
+		}
+		if !slices.Equal(got, want) {
+			t.Fatalf("reports = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("ReportBytesRoundTrip", func(t *testing.T) {
+		r := NewRepository(open(t))
+		m := firstContact(t, r, originalIdentity(), t0)
+		facts := []byte("{\"serial\":\"SÜ1 ✓\",\"memsize\":\"unknown\"}")
+		mustReport(t, r, m.ID, Report{Facts: facts, At: t0})
+		got, ok, err := r.LatestReport(t.Context(), m.ID)
+		if err != nil || !ok {
+			t.Fatalf("LatestReport = %v, %v", ok, err)
+		}
+		if !bytes.Equal(got, facts) {
+			t.Fatalf("LatestReport = %q, want %q", got, facts)
+		}
+	})
+
+	t.Run("ReportSetsManufacturer", func(t *testing.T) {
+		r := NewRepository(open(t))
+		m := firstContact(t, r, originalIdentity(), t0)
+		mustReport(t, r, m.ID, Report{Facts: []byte(`{"n":1}`), Manufacturer: "ACME", At: t0})
+		if got := mustGet(t, r, m.ID).Manufacturer; got != "ACME" {
+			t.Fatalf("Manufacturer = %q, want ACME", got)
+		}
+		mustReport(t, r, m.ID, Report{Facts: []byte(`{"n":2}`), At: t0.Add(time.Second)})
+		if got := mustGet(t, r, m.ID).Manufacturer; got != "ACME" {
+			t.Fatalf("Manufacturer after a report without one = %q, want ACME", got)
+		}
+	})
+
+	t.Run("ReportMACsRecorded", func(t *testing.T) {
+		r := NewRepository(open(t))
+		m := firstContact(t, r, originalIdentity(), t0)
+		mustReport(t, r, m.ID, Report{Facts: []byte(`{"n":1}`), MACs: []string{macN(0x31), macN(0x32)}, At: t0})
+		wantMACs(t, mustGet(t, r, m.ID), macN(1), macN(0x31), macN(0x32))
+	})
+
+	t.Run("LatestReport", func(t *testing.T) {
+		r := NewRepository(open(t))
+		m := firstContact(t, r, originalIdentity(), t0)
+		if got, ok, err := r.LatestReport(t.Context(), m.ID); err != nil || ok || got != nil {
+			t.Fatalf("LatestReport before any report = %q, %v, %v; want nil, false, nil", got, ok, err)
+		}
+		mustReport(t, r, m.ID, Report{Facts: []byte(`{"n":1}`), At: t0})
+		mustReport(t, r, m.ID, Report{Facts: []byte(`{"n":2}`), At: t0.Add(time.Second)})
+		got, ok, err := r.LatestReport(t.Context(), m.ID)
+		if err != nil || !ok || string(got) != `{"n":2}` {
+			t.Fatalf("LatestReport = %q, %v, %v; want the newest report", got, ok, err)
+		}
+	})
+
+	t.Run("UnknownActionDefaultLocal", func(t *testing.T) {
+		d := open(t)
+		r := NewRepository(d)
+		read := func(when string) {
+			t.Helper()
+			if got, err := r.UnknownAction(t.Context()); err != nil || got != UnknownActionLocal {
+				t.Fatalf("UnknownAction %s = %q, %v; want %q", when, got, err, UnknownActionLocal)
+			}
+		}
+		read("on a fresh database")
+		if err := execRaw(t, d, "DELETE FROM settings WHERE key = 'unknown_action'"); err != nil {
+			t.Fatalf("delete setting: %v", err)
+		}
+		read("with the row missing")
+	})
+
+	t.Run("SetUnknownAction", func(t *testing.T) {
+		d := open(t)
+		r := NewRepository(d)
+		if err := r.SetUnknownAction(t.Context(), UnknownActionHold, "admin", t0); err != nil {
+			t.Fatalf("SetUnknownAction: %v", err)
+		}
+		if got, err := r.UnknownAction(t.Context()); err != nil || got != UnknownActionHold {
+			t.Fatalf("UnknownAction = %q, %v; want %q", got, err, UnknownActionHold)
+		}
+		rows := auditRows(t, d)
+		if len(rows) != 1 || rows[0].Action != "settings.unknown_action" || rows[0].Actor != "admin" || rows[0].MachineID != "" ||
+			!rows[0].At.Equal(t0) || rows[0].Detail != `{"from":"local","to":"hold"}` {
+			t.Fatalf("audit rows = %+v, want one settings.unknown_action local -> hold by admin", rows)
 		}
 	})
 }

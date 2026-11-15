@@ -16,12 +16,24 @@ import (
 )
 
 const (
+	// ReportsKept is how many inventory reports are stored per machine; the
+	// oldest are dropped.
+	ReportsKept = 10
+
 	actorSystem        = "system"
 	actionUUIDConflict = "alert.uuid_conflict"
 	actionHold         = "hold"
+	actionSetting      = "settings.unknown_action"
 	// holdCoalesceWindow is how long an identical hold is folded into the last one.
 	holdCoalesceWindow = time.Hour
+
+	reportSourceIPXE  = "ipxe"
+	settingUnknownKey = "unknown_action"
 )
+
+// ErrIdentityConflict is returned by Observe when the stored serial or product
+// of the machine holding the reported UUID differs from the report's.
+var ErrIdentityConflict = errors.New("identity conflict: stored serial/product differ from the report")
 
 // machineMAC is the machine_macs table.
 type machineMAC struct {
@@ -56,6 +68,32 @@ type auditEventRow struct {
 	Action    string    `bun:"action"`
 	MachineID string    `bun:"machine_id,nullzero"`
 	Detail    string    `bun:"detail"`
+}
+
+// inventoryReportRow is the inventory_reports table. Facts is TEXT holding the
+// report's bytes.
+type inventoryReportRow struct {
+	bun.BaseModel `bun:"table:inventory_reports"`
+
+	ID         int64     `bun:"id,pk,autoincrement"`
+	MachineID  string    `bun:"machine_id"`
+	Source     string    `bun:"source"`
+	Facts      string    `bun:"facts"`
+	ReceivedAt time.Time `bun:"received_at"`
+}
+
+// settingRow is the settings table.
+type settingRow struct {
+	bun.BaseModel `bun:"table:settings"`
+
+	Key   string `bun:"key,pk"`
+	Value string `bun:"value"`
+}
+
+// settingDetail is the detail of a settings.* audit event.
+type settingDetail struct {
+	From string `json:"from"`
+	To   string `json:"to"`
 }
 
 // conflictDetail is the detail of an alert.uuid_conflict audit event.
@@ -144,6 +182,218 @@ func (r *Repository) Transition(ctx context.Context, req TransitionRequest) (Mac
 		return Machine{}, fmt.Errorf("fleet: transition %s: %w", req.Trigger, err)
 	}
 	return out, nil
+}
+
+// Observation is what Observe found: the machine, whether the call created it
+// and whether the call raised the UUID-conflict alert.
+type Observation struct {
+	Machine          Machine
+	Created, Alerted bool
+}
+
+// Observe records one /discover observation in a single transaction. An
+// unknown machine is created exactly as a first /boot creates it, with a
+// transition.first_contact audit event. A known machine whose serial or product
+// differs from id is a clone: Observe marks its UUID junk and alerts once (the
+// first call reports Alerted), writes nothing else, and returns the
+// Observation with ErrIdentityConflict. Any other known machine is touched.
+func (r *Repository) Observe(ctx context.Context, id Identity, arch Arch, at time.Time) (Observation, error) {
+	var (
+		obs      Observation
+		conflict bool
+	)
+	err := r.bdb.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
+		var err error
+		obs, conflict, err = observe(ctx, tx, id, arch, at)
+		return err
+	})
+	if err != nil {
+		return Observation{}, fmt.Errorf("fleet: observe: %w", err)
+	}
+	if conflict {
+		return obs, fmt.Errorf("fleet: observe: %w", ErrIdentityConflict)
+	}
+	return obs, nil
+}
+
+// LatestReport returns the facts of the machine's newest inventory report, and
+// false when it has none.
+func (r *Repository) LatestReport(ctx context.Context, machineID string) ([]byte, bool, error) {
+	facts, ok, err := latestFacts(ctx, r.bdb, machineID)
+	if err != nil {
+		return nil, false, fmt.Errorf("fleet: latest report: %w", err)
+	}
+	if !ok {
+		return nil, false, nil
+	}
+	return []byte(facts), true, nil
+}
+
+// Report is one inventory report for RecordReport.
+type Report struct {
+	// Facts is the report as received; it is stored and returned byte for byte.
+	Facts []byte
+	// MACs are the machine's addresses the report carries, already normalized.
+	MACs []string
+	// Manufacturer replaces the machine's when not empty.
+	Manufacturer string
+	At           time.Time
+}
+
+// RecordReport applies a machine's inventory report in a single transaction:
+// it attaches the report's MACs, sets last_seen_at and a non-empty
+// Manufacturer, and stores the facts unless they equal the latest report's
+// byte for byte. It reports whether the facts were stored; only the newest
+// ReportsKept reports are kept.
+func (r *Repository) RecordReport(ctx context.Context, machineID string, rep Report) (bool, error) {
+	var stored bool
+	err := r.bdb.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
+		var err error
+		stored, err = recordReport(ctx, tx, machineID, rep)
+		return err
+	})
+	if err != nil {
+		return false, fmt.Errorf("fleet: record report: %w", err)
+	}
+	return stored, nil
+}
+
+// UnknownAction returns the unknown_action setting; a missing row reads as
+// UnknownActionLocal.
+func (r *Repository) UnknownAction(ctx context.Context) (UnknownAction, error) {
+	value, err := storedUnknownAction(ctx, r.bdb)
+	if err != nil {
+		return "", fmt.Errorf("fleet: unknown action: %w", err)
+	}
+	var a UnknownAction
+	if err := a.UnmarshalText([]byte(value)); err != nil {
+		return "", fmt.Errorf("fleet: unknown action: stored setting: %w", err)
+	}
+	return a, nil
+}
+
+// SetUnknownAction stores the unknown_action setting and audits the change in a
+// single transaction.
+func (r *Repository) SetUnknownAction(ctx context.Context, a UnknownAction, actor string, at time.Time) error {
+	err := r.bdb.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
+		// The raw stored value, so a corrupt one can still be replaced.
+		from, err := storedUnknownAction(ctx, tx)
+		if err != nil {
+			return err
+		}
+		row := settingRow{Key: settingUnknownKey, Value: string(a)}
+		_, err = tx.NewInsert().Model(&row).On("CONFLICT (key) DO UPDATE").Set("value = EXCLUDED.value").Exec(ctx)
+		if err != nil {
+			return fmt.Errorf("store setting: %w", err)
+		}
+		audit := auditEventRow{At: at.UTC(), Actor: actor, Action: actionSetting}
+		return insertAudit(ctx, tx, audit, settingDetail{From: from, To: string(a)})
+	})
+	if err != nil {
+		return fmt.Errorf("fleet: set unknown action: %w", err)
+	}
+	return nil
+}
+
+// observe is Observe's transaction body; conflict is true for the clone case,
+// whose writes must commit, so it is not an error here.
+func observe(ctx context.Context, tx bun.IDB, id Identity, arch Arch, at time.Time) (obs Observation, conflict bool, err error) {
+	m, ok, err := lookupMachine(ctx, tx, id)
+	if err != nil {
+		return Observation{}, false, err
+	}
+	switch {
+	case !ok:
+		m, err = createMachine(ctx, tx, BootRecord{Identity: id, Arch: arch, Trigger: TriggerFirstContact, At: at})
+		if err != nil {
+			return Observation{}, false, err
+		}
+		// A transition is applied with its event; /boot creations carry a boot
+		// event instead.
+		audit := auditEventRow{At: at.UTC(), Actor: actorSystem, Action: "transition." + string(TriggerFirstContact), MachineID: m.ID}
+		if err := insertAudit(ctx, tx, audit, transitionDetail{From: stateName(StateNone), To: stateName(m.State)}); err != nil {
+			return Observation{}, false, err
+		}
+		m, err = loadMachine(ctx, tx, m.ID)
+		return Observation{Machine: m, Created: true}, false, err
+	case m.Serial != id.Serial || m.Product != id.Product:
+		obs.Machine = m
+		if !m.Junk {
+			if err := markUUIDJunk(ctx, tx, m, id, at); err != nil {
+				return Observation{}, false, err
+			}
+			obs.Machine.Junk, obs.Alerted = true, true
+		}
+		return obs, true, nil
+	}
+	m.LastSeenAt = at.UTC()
+	if _, err := tx.NewUpdate().Model(&m).Column("last_seen_at").WherePK().Exec(ctx); err != nil {
+		return Observation{}, false, fmt.Errorf("update machine %s: %w", m.ID, err)
+	}
+	return Observation{Machine: m}, false, nil
+}
+
+func recordReport(ctx context.Context, tx bun.IDB, machineID string, rep Report) (bool, error) {
+	at := rep.At.UTC()
+	for _, mac := range rep.MACs {
+		if err := upsertMAC(ctx, tx, machineID, mac, at); err != nil {
+			return false, err
+		}
+	}
+	m := Machine{ID: machineID, LastSeenAt: at, Manufacturer: rep.Manufacturer}
+	cols := []string{"last_seen_at"}
+	if rep.Manufacturer != "" {
+		cols = append(cols, "manufacturer")
+	}
+	if _, err := tx.NewUpdate().Model(&m).Column(cols...).WherePK().Exec(ctx); err != nil {
+		return false, fmt.Errorf("update machine %s: %w", machineID, err)
+	}
+
+	facts := string(rep.Facts)
+	latest, ok, err := latestFacts(ctx, tx, machineID)
+	if err != nil || (ok && latest == facts) {
+		return false, err
+	}
+	row := inventoryReportRow{MachineID: machineID, Source: reportSourceIPXE, Facts: facts, ReceivedAt: at}
+	if _, err := tx.NewInsert().Model(&row).Exec(ctx); err != nil {
+		return false, fmt.Errorf("insert report: %w", err)
+	}
+	oldest := tx.NewSelect().Model((*inventoryReportRow)(nil)).Column("id").
+		Where("machine_id = ?", machineID).Order("id DESC").Limit(1).Offset(ReportsKept)
+	_, err = tx.NewDelete().Model((*inventoryReportRow)(nil)).
+		Where("machine_id = ?", machineID).Where("id <= (?)", oldest).Exec(ctx)
+	if err != nil {
+		return false, fmt.Errorf("trim reports: %w", err)
+	}
+	return true, nil
+}
+
+// latestFacts returns the facts of the machine's newest report.
+func latestFacts(ctx context.Context, q bun.IDB, machineID string) (string, bool, error) {
+	var facts string
+	err := q.NewSelect().Model((*inventoryReportRow)(nil)).Column("facts").
+		Where("machine_id = ?", machineID).Order("id DESC").Limit(1).Scan(ctx, &facts)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("load latest report: %w", err)
+	}
+	return facts, true, nil
+}
+
+// storedUnknownAction returns the stored unknown_action value, undecoded; a
+// missing row is the default, UnknownActionLocal.
+func storedUnknownAction(ctx context.Context, q bun.IDB) (string, error) {
+	var value string
+	err := q.NewSelect().Model((*settingRow)(nil)).Column("value").Where("key = ?", settingUnknownKey).Scan(ctx, &value)
+	if errors.Is(err, sql.ErrNoRows) {
+		return string(UnknownActionLocal), nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("read setting %s: %w", settingUnknownKey, err)
+	}
+	return value, nil
 }
 
 func lookupMachine(ctx context.Context, q bun.IDB, id Identity) (Machine, bool, error) {
