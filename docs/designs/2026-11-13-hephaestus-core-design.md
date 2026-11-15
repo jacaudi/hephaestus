@@ -1,6 +1,8 @@
 # hephaestus core: design
 
 Status: **approved** by the owner on 2026-11-14 (revision 4, after design-gate passes 1–3). Date: 2026-11-14. Owner: jacaudi.
+Updated 2026-11-15 to match M1 as built: the Milestones section, and the M1 notes and rulings folded into the sections they
+touch.
 Research and decision record: [`docs/research/booty-slim/README.md`](../research/booty-slim/README.md) (sources S1–S11
 under `docs/research/booty-slim/sources/`).
 - `D<n>` cites a decision from that record.
@@ -56,6 +58,29 @@ This document designs the **service core** only. Separate, later designs cover:
    asset, with one data directory. The container runs on TrueNAS day to day, and on any Linux host with a container
    runtime (or the bare binary) for recovery (owner, 2026-11-13 and 2026-11-14).
 
+### Milestones
+
+The goals above are built in four milestones. This section says what each contains; nothing outside M1 is built yet.
+
+- **M1: the boot plane** (this branch). Repo skeleton and standards; `hephaestus serve` and `version`; config; logs and
+  wide events; the admin listener with a check registry; the database with its two migration sets; fleet identity, the
+  full §5.2 transition table and the full `/boot` decision; `/start`, `/boot` and `/discover`; the source-subnet guard;
+  the vendored proxyDHCP and TFTP; the iPXE build with committed binaries; Let's Encrypt through DNS-01 on Cloudflare; the
+  container image. Known limitations: EFI iPXE reports `${memsize}` as 0 (stored and shown as unknown), and CPUID facts
+  may be absent on BIOS builds.
+- **M2: store.** The content store, catalog, registry mirror and prefetch (§5.6), with the `store` and `catalog`
+  packages, utility OS boots and `assets_ready`.
+- **M3: clusters.** Clusters, render, secrets, `/config` and tickets (§5.4–5.6, §6); the Talos install script; the
+  1Password token; host binding and the create-on-adopt path (§5.2); the machinery assertion and the Topf parity test in CI.
+- **M4: auth, UI and operations.** `web` and `auth` (§5.7, §5.8); `hephaestus backup` and `admin recover` (§5.9); the
+  menu-preview endpoint; the alert evaluators and surfaces that need the UI (§5.9), including the `/start`-without-`/boot`
+  alert and certificate-expiry alerting beyond the `/health` warning; and the callers of `Transition` and
+  `SetUnknownAction` (§5.2).
+
+Inputs owned by a later milestone already exist as inputs in M1: the decision function takes boot-next, readiness and
+drift (§5.2), and M1 supplies none of them. Not yet assigned to a milestone: the QEMU end-to-end harness (§7) and
+publishing the image (§3).
+
 ### Non-goals (v1)
 - **The inventory agent and its commands**: `reboot`, `poweroff`, `boot-talos`, `wipe-disks` (P2.6 rest, P2.7).
 - **Deferred to later**:
@@ -97,8 +122,12 @@ This document designs the **service core** only. Separate, later designs cover:
 - **Build**:
   - Go with `CGO_ENABLED=0`;
   - Task with a lowercase `taskfile.yml` (`task ci`);
-  - the go-tricorder lint baseline;
-  - a multi-arch distroless image with digest-pinned bases.
+  - the go-tricorder lint baseline. Until the tricorder plugin resolves (it lives in a private repo), lint runs stock
+    golangci-lint with that baseline minus the plugin (controller ruling), so `singleimpl` and the other tricorder-only
+    checks do not run and "seams arrive with their second implementor" is held by review;
+  - a multi-arch distroless image with digest-pinned bases. The Dockerfile cross-compiles amd64 and arm64;
+    `task image:build` builds and loads one platform locally (default `linux/arm64`, `PLATFORM=` overrides), and nothing
+    is published until the owner approves (§10).
 - **Module and repo**: module `go.jacaudi.dev/hephaestus` (WL:28). Repo `~/Projects/forgejo/hephaestus`, local only for
   now. Creating the Forgejo remote, the GitHub mirror and any published image is owner-approved later (see §10 licences).
 - **Network**: hephaestus owns a dedicated IP on the provisioning VLAN (§5.11).
@@ -152,18 +181,33 @@ This document designs the **service core** only. Separate, later designs cover:
 | `auth` | Passkeys (always), OIDC (optional), sessions, CSRF, bootstrap token, recovery, account linking |
 | `tlsacme` | Let's Encrypt via ACME DNS-01 on Cloudflare (owner, 2026-11-14), plus renewal |
 | `admin` | `/healthz`, `/readyz`, `/health`, `/metrics` |
-| `cmd` | `hephaestus serve`, `hephaestus admin recover`, `hephaestus backup` |
+| `datakey` | AES-256-GCM sealing of stored secrets under the data key (§5.5) |
+| `secret` | A string type that redacts itself in fmt, slog and JSON. Not the `secrets` package above: that one resolves and caches 1Password values (M3), so the two names sit side by side |
+| `telemetry` | The slog logger, wide events and the OpenTelemetry meter provider with its Prometheus exporter (§5.9) |
+| `db` | Opening SQLite or Postgres, the goose migrations, health checks; the shared appkit-shaped DB package (§10) |
+| `cmd` | `hephaestus serve` and `hephaestus version` (`--json`), with a persistent `--log-format` flag; `hephaestus admin recover` and `hephaestus backup` (M4) |
 
-Seams arrive with their second implementor (go-standards §12, tricorder `singleimpl`).
+Seams arrive with their second implementor (go-standards §12, tricorder `singleimpl`). A real test double that tests
+use counts as the second implementor. The same holds for an injected factory that exists only so a test can substitute
+the double.
 
 ### 5.2 Machine lifecycle and boot decision
 
 **Identity** (D4).
 - Machines are keyed by SMBIOS UUID.
 - A UUID is **junk** if it is missing, all-zero, all-F, or reported with two different serial/product pairs.
-- The same UUID reported from different MACs is the **same machine**: multi-NIC machines boot from each NIC in turn. All
-  MACs are recorded.
+- The same UUID reported from different MACs is the **same machine**: multi-NIC machines boot from each NIC in turn. The
+  newest 16 MACs seen per machine are recorded, and a MAC belongs to the machine that reported it most recently.
 - Junk-UUID machines are keyed by their MAC set instead.
+  - A request whose UUID is a junk pattern (missing, all-zero or all-F) is matched through the MAC it names, and only to a
+    machine that is itself keyed by a junk-pattern UUID. It **never matches a machine with a valid UUID**, whatever that
+    machine's MACs: a request with no such owner gets its own new record. So a junk-pattern request can neither mark a
+    valid-UUID machine junk nor be mistaken for it.
+  - Two junk-UUID machines are two records. When a junk-pattern request reaches a junk-UUID machine through its MAC with a
+    different serial or product, row 2 applies without a second mark or alert (the record is junk already).
+- **Limits.** Machine records are capped at 1024: first contact beyond that is refused ("fleet full": `/discover` answers 503, and `/boot`
+  still gives the machine its script, unrecorded). Per machine, the newest 500 boot events are kept (the timeline is a window, not a
+  history).
 
 **States.**
 - `discovered`
@@ -177,6 +221,15 @@ Seams arrive with their second implementor (go-standards §12, tricorder `single
 - `cordoned`: wraps a remembered prior state.
 
 **Transitions.** Each one is applied atomically with its boot or audit event.
+
+Built in M1: the whole table, as `fleet.Next` (pure) and `fleet.Repository.Transition`, plus `SetUnknownAction`
+(`internal/fleet/repository.go`). Their callers are the UI actions (§5.7) and the cut-over confirmation below, so they
+arrive in M4. Until then no machine leaves `discovered` and `unknown_action` stays at its seeded `local`.
+
+Host binding arrives with hosts, in M3. M1's approve, adopt and rebind change only the lifecycle state; nothing writes the
+`cluster_id` and `host_name` columns, and the "host unbound" guard has no binding to consult. The "(none) → adopt by typed
+UUID" row needs a host to adopt into, so its create-on-adopt path lands with hosts too, and `TransitionRequest`
+changes shape to carry the host (today `Repository.Transition` only loads an existing machine).
 
 | From | Trigger | To |
 |---|---|---|
@@ -214,13 +267,14 @@ Seams arrive with their second implementor (go-standards §12, tricorder `single
   - the transitions and events to record;
   - **`needs_ticket`** (row 10 only).
 - The caller applies the transitions, mints the ticket when asked (§6), fills it into the template, and coalesces repeated
-  holding events (one per machine per hour).
+  holding events: a hold is not stored when the machine's most recent boot event is a hold with the same reason less than
+  an hour earlier. A held machine re-chains every 30 s, so this keeps one event per reason per hour while the hold lasts.
 - Rows are checked in order and the first match wins.
 
 | # | Condition | Script |
 |---|---|---|
 | 1 | request is not TLS | `chain https://<name>/boot?…`. Only `/start` and artifact routes are plain HTTP (§5.10) |
-| 2 | a known UUID arrives with a serial/product that differs from the record | hold; mark the UUID junk; alert. This covers bound machines too, so a clone never gets an install |
+| 2 | a known UUID arrives with a serial/product that differs from the record. "Known" includes a junk-pattern UUID found through its MAC (§5.2 identity) | hold; mark the UUID junk; alert (not again for a record already junk). This covers bound machines too, so a clone never gets an install |
 | 3 | one-shot boot-next utility target set **and that utility is ready** | that utility OS; flag cleared. Not ready: the flag is kept and the remaining rows apply |
 | 4 | `cordoned` with prior `installed`, `install-unconfirmed`, `installing` or `local-only` | `exit` |
 | 5 | `cordoned` (other prior states), `rejected` or `orphaned` | holding script that never advances |
@@ -228,7 +282,13 @@ Seams arrive with their second implementor (go-standards §12, tricorder `single
 | 7 | unknown or `discovered` | report, then: `unknown_action=hold` → hold (sleep 30 s, `chain --replace`); `unknown_action=local` → `exit` |
 | 8 | `assigned`, not `assets_ready` | hold |
 | 9 | `assigned`, `drift` | hold |
+| 10 | `assigned`, junk UUID | hold ("junk SMBIOS UUID: installs are refused"): a junk-UUID machine never gets an install, even if it was assigned |
 | 10 | `assigned` | Talos install script; `needs_ticket` |
+
+**M1 behaviour of the table.** The decision is built and tested in full, but several inputs belong to later milestones:
+boot-next, utility readiness, `assets_ready` and `drift` are always absent in M1, and tickets and the install script are M3.
+So in M1 the caller turns a row-10 `needs_ticket` into a hold ("ticket minting not available (M3)") and a row-3 utility
+into a hold ("utility boot not available (M2)"), and every `assigned` machine holds at row 8.
 
 **Talos install script.**
 - The cached `kernel` and `initramfs`, fetched over plain HTTP from the artifact routes; their hashes are pinned in the store.
@@ -239,7 +299,8 @@ Seams arrive with their second implementor (go-standards §12, tricorder `single
 - Any request facts the script echoes are emitted as iPXE variables (`${uuid}`), never as interpolated request text.
 
 **Other rules.**
-- A menu-preview endpoint shows any machine's decision with no side effects.
+- A menu-preview endpoint shows any machine's decision with no side effects (M4, with the UI; the decision function is
+  already pure, but only `/boot` calls it in M1).
 - **Install completion is confirmed by the admin** ("mark installed"), not guessed. Talos never sets the UEFI `BootOrder`;
   no caller of `SetBootOrder` exists in 1.12.11, 1.14.6 or 1.15 beta (gate 2). The MS-R1 lands in the UEFI Shell after
   install (S2). An automatic check through the Talos API is later.
@@ -254,8 +315,9 @@ Seams arrive with their second implementor (go-standards §12, tricorder `single
 
 The report step posts iPXE-reported facts to `/discover` with `params` and `POST`: UUID, MACs and NIC chips per interface,
 serial, manufacturer, product, CPU, memory, platform, arch.
-- Stored as `source=ipxe`.
-- Rate-limited per source IP and capped in total.
+- Stored as `source=ipxe`; at most 16 NICs are read from a report, and the newest 10 reports are kept per machine.
+- Rate-limited per source IP (8 new machines or changed reports per 10 minutes; an unchanged report costs nothing) and
+  capped in total (1024 machines, §5.2).
 - Untrusted, display only: rendered with templ escaping under a strict CSP, never placed in an `hx-*` attribute (D11).
 
 ### 5.4 Clusters, rendering, approval
@@ -337,9 +399,10 @@ a binary upgrade.
 - **How it clears**: the admin re-approves that host's render. The diff shows old vs new hash with the redacted render,
   which stores the new hash.
 
-**Serving `/config`** (D13, unattended). Every one of these must hold:
+**Serving `/config`** (D13, unattended; M3, with this section's clusters, render and tickets). Every one of these must hold:
 - the request is TLS;
-- it comes from an on-subnet source (§6);
+- it comes from an on-subnet source (§6). An off-subnet source gets this section's 404, not the 403 the M1 boot routes
+  answer with;
 - it carries a live ticket for this UUID **whose bound host, revision and secret version are still current** (§6);
 - the host is `assigned`;
 - **the render, done for this request, hashes to the stored `config_hash`**. A mismatch sets `drift` and refuses.
@@ -481,32 +544,45 @@ Per WL:504-543:
 
 - **Config.** One viper instance with `BindStruct`, prefix `HEPHAESTUS_`, validated at startup. Only bootstrap settings live
   in the environment or files:
-  - listener addresses;
+  - listener addresses: the admin address, and the provisioning address and interface (the interface must exist and hold
+    the address; startup refuses otherwise, and an admin port of 0). The boot HTTP and HTTPS ports are fixed at 80 and
+    443: the embedded chain script `http://${proxydhcp/next-server}/start` carries no port (§5.10);
   - DB URL and data dir;
-  - data key, 1Password token and Cloudflare token;
+  - data key, 1Password token (read from M3; M1 does not read it) and Cloudflare token;
   - FQDN;
-  - provisioning subnet.
+  - provisioning subnet;
+  - the ACME directory URL (default Let's Encrypt production; the lab points it at staging), the shutdown grace, and the
+    log level and format.
 
   Everything else lives in the database.
 - **HTTP.** Huma serves JSON routes when an API exists (WL). The v1 UI is server-rendered HTML on the standard library mux.
-- **Admin listener.** On the management address only.
+- **Admin listener.** On the management address only. The full set below is the target; M1 builds the part marked (M1) and
+  later milestones add the rest alongside the feature each item reports on (store: M2; git, secrets, configs: M3).
   - `/healthz`.
-  - `/readyz`: migrations applied, store readable, certificate loaded; fails while draining.
+  - `/readyz`: migrations applied, store readable, certificate loaded; fails while draining. (M1: database ping, no
+    pending migrations and certificate loaded; the store check arrives with the store.)
   - `/health` (health+json): version, DB ping, migrations, disk and store bytes, git fetch age, secret-cache age and
-    `incomplete` flag, certificate expiry, 1Password reachability as `warn`.
+    `incomplete` flag, certificate expiry, 1Password reachability as `warn`. (M1: version, uptime, lifecycle state, DB
+    ping, migrations, data-dir free space with a warning below 10%, certificate expiry; no store, git or secret items yet.)
   - `/metrics`: request RED, build info, runtime, boots by decision, configs served and refused, prefetch status, store
-    bytes, verify failures, certificate days left, 1Password reads.
+    bytes, verify failures, certificate days left, 1Password reads. (M1: request RED, build info, runtime, boots by
+    decision, alerts, discovery reports, certificate days left and renewal failures.)
 - **Timeouts.** Per-route deadlines with `http.ResponseController`. Artifact, blob and SSE routes use idle timeouts
   instead of fixed write deadlines. Shutdown drains with a configurable grace (default 60 s) and stops proxyDHCP first.
-- **Logs.** slog JSON to stdout, snake_case, `error` key; one wide event per request and per boot decision; `trace_id` when
-  present. Query strings are redacted.
-- **Alerts** (audit, metric and UI):
+- **Logs.** slog JSON to stdout by default, snake_case, `error` key; text for local use, chosen with
+  `HEPHAESTUS_LOG_FORMAT` or `--log-format`. One wide event per request; a `/boot` request makes exactly one decision, so
+  its decision fields ride on that request's event rather than a second one. `trace_id` when present: M1 has no tracer
+  provider and boot clients send no trace context, so M1 never sets one. Query strings are redacted. Shutdown logs
+  `draining` and `stopped`, and a fatal error is logged at Error once the logger exists.
+- **Alerts** (audit, metric and UI). M1 raises only the first; the rest arrive with their features and the UI (M4):
   - one UUID seen with a second serial/product pair;
-  - a machine that reaches `/start` but not `/boot` within 2 minutes (typically a bad clock or TLS failure);
+  - a machine that reaches `/start` but not `/boot` within 2 minutes (typically a bad clock or TLS failure). M1's `/start`
+    records no event, so there is nothing to evaluate yet;
   - prefetch failures;
   - a secret refresh marked `incomplete`;
-  - certificate expiry within 14 days.
-- **Backup.** `hephaestus backup <dir>` writes:
+  - certificate expiry within 14 days. M1 shows it only as a `/health` warning and the days-left gauge, with no audit
+    event or alert counter.
+- **Backup** (M4, with `hephaestus admin recover`; M1 has neither). `hephaestus backup <dir>` writes:
   - a consistent database snapshot (SQLite `VACUUM INTO`; for Postgres, document `pg_dump`);
   - the **git object store**.
 
@@ -549,8 +625,10 @@ Per WL:504-543:
     - `#undef OCSP_CHECK`.
     - **For BIOS too**: `DOWNLOAD_PROTO_HTTPS`, `PARAM_CMD` and `NTP_CMD` enabled.
     - `MEMMAP_SETTINGS` enabled for `${memsize}`. CPUID facts are reported where available (amd64 only).
-  - **CI checks**: shipped binaries' `TRUST` fingerprints equal the ISRG set. A separately built **test variant** trusts
-    a test CA for QEMU tests and is never shipped.
+  - **CI checks**: shipped binaries' `TRUST` fingerprints equal the ISRG set. `task ci` byte-checks the two `.efi` files
+    against it and verifies `SHA256SUMS`. `undionly.kpxe` is LZMA-compressed, so its `TRUST` set is verified at build time
+    (`task ipxe:build`, from the uncompressed ELF) and recorded in `BUILDINFO`, which `task ci` checks. A separately built
+    **test variant** trusts a test CA for QEMU tests and is never shipped.
   - **Fallback**: if lab test 1 shows a TLS 1.3 interop failure with Go, pin v2.0.0. Then TLS 1.2 is allowed on the boot
     listener, as a §10 deviation that exists only in that case.
 - **Static embedded chain script** (gate 1 B2, booty/bootimus precedent). It contains no domain:
@@ -598,6 +676,12 @@ Per WL:504-543:
 - **Enforcement** (gate 2).
   - Boot-facing routes (`/start`, `/boot`, `/discover`, `/config`, artifacts, `/v2/`) refuse any TCP source address
     outside the configured provisioning subnet. A TCP source cannot be spoofed from off-link.
+  - **Refusal status.** The M1 boot routes (`/start`, `/boot`, `/discover`, artifacts) answer an off-subnet source with
+    403. `/config` and `/v2/` (M3 and M2) must answer 404 to an off-subnet source, as §5.4 and §5.6 require of every
+    refusal on those routes, so the guard they sit behind must not answer 403 for them.
+  - **TFTP** (UDP) serves only peers inside the subnet, and refuses a request that does not name its peer. The check is
+    on the claimed source address, which an attacker on the same L2 can forge; that is inside the accepted threat model
+    above, and the filter stops everything off-link.
   - The UI and auth routes are reachable from the admin's network.
   - A deployment firewall rule restating the subnet restriction is recommended.
 - **Tickets.**
@@ -652,12 +736,13 @@ Per WL:504-543:
 5. **CI.** `task ci` passes on macOS and Linux:
    - lint;
    - tests against both databases;
-   - the machinery assertion;
-   - the iPXE TRUST-fingerprint check;
-   - the **golden Topf-render parity test**: hermetic fixtures (no `env`/time/random functions) whose `ref+op://`
+   - the machinery assertion (M3, with the render path: M1 has no `machinery` dependency to assert on);
+   - the iPXE TRUST-fingerprint check (§5.10);
+   - the **golden Topf-render parity test** (M3): hermetic fixtures (no `env`/time/random functions) whose `ref+op://`
      references resolve to fixture values. That means a stub `vals` on `PATH` for `topf render` at `70cdbc8`, and a fixture
      cache for hephaestus. The two outputs must be byte-identical.
-6. **End to end.** `task e2e` passes on Linux only (it needs tap/bridge and root): a QEMU test with amd64 UEFI and BIOS,
+6. **End to end.** `task e2e` passes on Linux only (it needs tap/bridge and root). In M1 it is a placeholder that exits 1;
+   the QEMU harness arrives in a later milestone. The harness is: a QEMU test with amd64 UEFI and BIOS,
    the test-CA iPXE variant, and a bridge plus a test DHCP server, as bootimus does. It covers iPXE → `/start` → `/boot`
    → discovery → approval → install script → kernel and initramfs fetch. Talos's own HTTPS config fetch cannot trust the
    test CA, so it is covered by lab test 3, not e2e. Where `task e2e` runs (a Linux CI runner once a remote exists, or a
