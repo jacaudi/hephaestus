@@ -1717,3 +1717,111 @@ Expected: stderr contains `HEPHAESTUS_FQDN is required`; `exit=1`.
 Run: `DOCKER_HOST=unix://$HOME/.colima/default/docker.sock rtk proxy task ci` — Expected: exit 0; hadolint lints both Dockerfiles.
 Run: `rtk proxy git add Dockerfile .dockerignore README.md taskfile.yml` then `rtk proxy git commit -m "feat: distroless nonroot image with file capabilities, and the README" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"`
 Expected: one new commit; `rtk proxy sh -c "git cat-file commit HEAD | grep -c '^gpgsig'"` prints `1`.
+
+### Task 18: TLS from external certificate files or a reverse proxy (replaces tlsacme)
+Kind: rewrite
+
+Owner directive (2026-11-15): drop the in-process Let's Encrypt integration. TLS comes from either (a) certificate and key files that an external process writes and renews, at paths given by env vars, or (b) a reverse proxy (Caddy, Traefik, Envoy) that terminates TLS in front of hephaestus. Both modes ship. Owner directive: `HEPHAESTUS_DATA_KEY` leaves M1 (its only consumer was tlsacme); the `internal/datakey` package stays for M3.
+
+**Files:**
+- Delete: `internal/tlsacme/` (whole tree, including `tlsacmetest/`)
+- Create: `internal/tlscert/doc.go`, `loader.go`, `loader_test.go`, `internal/tlscert/tlscerttest/doc.go`, `selfsigned.go`; `internal/boot/proxy.go`, `proxy_test.go`
+- Modify: `internal/boot/guard.go`, `internal/boot/discover.go`, `internal/boot/handlers.go`, the boot tests that cover them; `cmd/hephaestus/config.go`, `config_test.go`, `serve.go`, `serve_test.go`; `internal/db/migrations/sqlite/00001_init.sql`, `internal/db/migrations/postgres/00001_init.sql`; `go.mod`, `go.sum`; `README.md`; `docs/designs/2026-11-13-hephaestus-core-design.md`; `docs/research/booty-slim/README.md`
+
+**Interfaces:**
+
+`internal/tlscert` (package doc: serves a certificate and key that something outside hephaestus writes and renews):
+- `type Option func(*Loader)`; `WithClock(now func() time.Time) Option`; `WithMeter(m metric.Meter) Option` (default noop meter); `WithErrorHandler(fn func(error)) Option` (default discards); `WithInterval(d time.Duration) Option` (default `time.Minute`).
+- `func NewLoader(certFile, keyFile, fqdn string, opts ...Option) (*Loader, error)`: reads both files and builds the pair with `tls.X509KeyPair`. Returns an error, and nothing is served, when either file is unreadable, the pair does not match, the leaf does not cover `fqdn` (`leaf.VerifyHostname(fqdn)`; message contains `does not cover <fqdn>`), or the leaf has expired (`now` after `NotAfter`; message contains `expired`). Records each file's `(ModTime, Size)` from `os.Stat`, which follows symlinks, so Kubernetes secret symlink swaps count as changes.
+- `func (l *Loader) GetCertificate(*tls.ClientHelloInfo) (*tls.Certificate, error)`: the current pair, under a read lock.
+- `func (l *Loader) Run(ctx context.Context) error`: every interval, stats both files. When either `(ModTime, Size)` differs from the last load, it reloads with the same checks as `NewLoader`. On success it swaps the pair and the recorded stats. On failure it keeps serving the current pair, records the new stats (so a bad file is not retried every tick until it changes again), increments `hephaestus.tls.reload.failures`, and calls the error handler. Returns nil when ctx is done.
+- `func (l *Loader) Checks() []admin.Check`: `tls:certificate` (critical): pass while the current leaf has not expired, fail after `NotAfter`. `tls:expiry` (not critical): warn when fewer than 14 days are left, otherwise pass; its observed value is the days left. Use the same `admin.Check` shape tlsacme's `Checks` used.
+- Gauge `hephaestus.tls.certificate.days_left` (same name as before); counter `hephaestus.tls.reload.failures`.
+- The library never logs; errors go through the handler (planning ruling).
+
+`internal/tlscert/tlscerttest`: `func WriteSelfSigned(t testing.TB, dir, fqdn string, notBefore, notAfter time.Time) (certFile, keyFile string)`. Writes an ECDSA P-256 self-signed leaf for `fqdn` plus its key as PEM files under `dir`, with a unique serial each call.
+
+`internal/boot` (proxy mode):
+- `func TrustProxies(trusted []netip.Prefix, next http.Handler) http.Handler`. The peer (`r.RemoteAddr`) must be inside a trusted prefix; otherwise it answers 403 with the existing problem+json shape. The client address comes from `X-Forwarded-For` only (no `Forwarded`, no `X-Real-IP`): join every header line with `,`, split on `,`, trim spaces, and walk from the rightmost entry leftwards, skipping entries inside a trusted prefix. The first entry not inside a trusted prefix is the client. Every walked entry must parse with `netip.ParseAddr`, IPv4-mapped forms unmapped. A missing header, an unparsable walked entry, or no untrusted entry answers 403 problem+json. It stores the client address in the request context under an unexported key.
+- Replace `sourceAddr(remoteAddr string)` with `func clientAddr(r *http.Request) (netip.Addr, error)`: returns the context address when `TrustProxies` set one, otherwise parses `r.RemoteAddr` as before. `RequireSubnet` and the `/discover` limiter key both use it.
+- `func (h *Handlers) Proxied(trusted []netip.Prefix) http.Handler` returns `TrustProxies(trusted, h.TLS())`. The proxy-facing listener serves the same routes as the TLS listener.
+
+`cmd/hephaestus` config. Remove `HEPHAESTUS_DATA_KEY`, `HEPHAESTUS_DATA_KEY_FILE`, `HEPHAESTUS_CLOUDFLARE_TOKEN`, `HEPHAESTUS_CLOUDFLARE_TOKEN_FILE`, `HEPHAESTUS_ACME_DIRECTORY_URL` and their fields and validation. Add:
+- `HEPHAESTUS_TLS_MODE`: `file` (default) or `proxy`; anything else → `HEPHAESTUS_TLS_MODE must be "file" or "proxy"`.
+- file mode: `HEPHAESTUS_TLS_CERT_FILE` and `HEPHAESTUS_TLS_KEY_FILE` are required (`HEPHAESTUS_TLS_CERT_FILE is required when HEPHAESTUS_TLS_MODE is file`, same form for the key). Setting `HEPHAESTUS_PROXY_ADDRESS` or `HEPHAESTUS_PROXY_TRUSTED` is an error (`HEPHAESTUS_PROXY_ADDRESS is only valid when HEPHAESTUS_TLS_MODE is proxy`, same form for trusted).
+- proxy mode: `HEPHAESTUS_PROXY_ADDRESS` is required, an IP:port with a nonzero port (it does not have to be in the provisioning subnet). `HEPHAESTUS_PROXY_TRUSTED` is required: a comma-separated list of at least one CIDR, each parsed with `netip.ParsePrefix` and masked; this is the first slice field and uses the §10 `StringToSliceHookFunc`. Setting either TLS file variable is an error (`HEPHAESTUS_TLS_CERT_FILE is only valid when HEPHAESTUS_TLS_MODE is file`).
+- `serveConfig` gains `TLSMode string`, `TLSCertFile`, `TLSKeyFile string`, `ProxyAddr netip.AddrPort`, `TrustedProxies []netip.Prefix`, and drops `DataKey`, `CloudflareToken`, `ACMEDirectoryURL`. Every problem is still reported at once (errors.Join). Update `serve`'s `Long` and `Example`.
+
+`cmd/hephaestus` serve:
+- `serveDeps` drops `newIssuer` and gains `proxyLn net.Listener`. In file mode `httpsLn` is set and `proxyLn` is nil; in proxy mode the reverse. RunE listens on `<provisioning address>:443` in file mode and on `cfg.ProxyAddr` in proxy mode. Remove `legoIssuerFactory` and the `legolog` redirect.
+- `runServe`, file mode: build `tlscert.NewLoader(cfg.TLSCertFile, cfg.TLSKeyFile, cfg.FQDN, tlscert.WithMeter(metrics.Meter()), tlscert.WithErrorHandler(<Warn "certificate reload failed" with the error key>))` at the point where the tlsacme Manager was built. An error returns before anything serves. Register `loader.Checks()` in place of `mgr.Checks()`. `loader.Run` takes `mgr.Run`'s place in the lifecycle. The HTTPS server is unchanged apart from `GetCertificate: loader.GetCertificate` (TLS 1.3 minimum stays).
+- `runServe`, proxy mode: no loader, no TLS checks. A `boot-proxy` server with the boot servers' timeouts (`WriteTimeout 60s`) and handler `telemetry.WideEvents(metrics.Instrument(h.Proxied(cfg.TrustedProxies), "boot-proxy"), …)` (use `Instrument`'s current signature) serves `proxyLn` with `Serve`. It shuts down in the same stage as the HTTP and HTTPS servers.
+- The startup Info log gains `tls_mode`. Everything else in Task 16's lifecycle and the fix wave's changes (drain logs, fatal logging, interface validation) stays.
+
+Migrations: in both `00001_init.sql` files, delete the `acme_accounts` and `tls_certificates` tables and their down-migration `DROP`s, editing in place (nothing is deployed). Keep the fourth CHECK the fix wave added. Remove whatever repository code and tests read those tables (all inside `internal/tlsacme`).
+
+Dependencies: `go mod tidy` drops `github.com/go-acme/lego/v4` and its tree. Ruling B-1 still applies to `golang.org/x/crypto`. Name every removed direct dependency in the report.
+
+README:
+- Replace the Let's Encrypt, Cloudflare and data-key material with a **TLS** section covering both modes:
+  - file mode: the paths, renewal by an external tool (certbot, lego, cert-manager) checked once a minute, and the mount for the image (`-v <dir>:/certs:ro`);
+  - proxy mode: the proxy terminates TLS 1.3 with a certificate that chains to the ISRG roots (the iPXE binaries trust only those); it forwards to `HEPHAESTUS_PROXY_ADDRESS`; it sets `X-Forwarded-For` (Caddy, Traefik and Envoy do by default); its own address must be in `HEPHAESTUS_PROXY_TRUSTED`; plain HTTP `:80` (`/start`, `/tftp`) stays on hephaestus, because the embedded chain targets the next-server address.
+- Include one minimal Caddyfile example.
+- Update the env table and the run example.
+- README limit raised to 140 lines.
+
+Design (`docs/designs/2026-11-13-hephaestus-core-design.md`): replace every in-process ACME, Let's Encrypt, Cloudflare DNS-01 and `tlsacme` statement with the two modes as specified here. That covers the §5.1 package table (`tlscert`), §5.9 config, alerts and admin checks, §5.11, §6 trust notes, §10, the Milestones section (the data key returns in M3 with its consumers), and any goal or criterion that names ACME. Do not leave a statement that hephaestus obtains certificates.
+
+Research record (`docs/research/booty-slim/README.md`): append decision `D25 — TLS from externally supplied certificate files or a TLS-terminating reverse proxy; in-process ACME (lego, Cloudflare DNS-01) dropped; HEPHAESTUS_DATA_KEY deferred to M3 (owner, 2026-11-15)`, in the format of the existing D entries.
+
+- [ ] **Step 1: Write the failing tests.**
+  - `internal/tlscert/loader_test.go`:
+    - `TestNewLoader_ServesPair`
+    - `TestNewLoader_KeyMismatch`
+    - `TestNewLoader_WrongName`, asserting `does not cover`
+    - `TestNewLoader_Expired`
+    - `TestRun_ReloadsOnChange`: `WithInterval(10*time.Millisecond)`; rewrite the files with a new serial; `GetCertificate` returns the new serial within 2s.
+    - `TestRun_BadReloadKeepsCurrent`: overwrite the key with garbage; the old serial is still served, the error handler is called once, and it is not called again on the next ticks.
+    - `TestChecks_ExpiryWarnsUnder14Days`, using `WithClock`.
+    - `TestChecks_FailsAfterExpiry`
+    - goleak on both Run tests.
+  - `internal/boot/proxy_test.go`: a table over `TrustProxies` with trusted `127.0.0.0/8`, each row naming a peer, the X-Forwarded-For lines, and the expected client or 403:
+    - untrusted peer `192.0.2.1` → 403;
+    - `10.0.0.5` → `10.0.0.5`;
+    - `1.2.3.4, 10.0.0.5` → `10.0.0.5`;
+    - `10.0.0.5, 127.0.0.2` → `10.0.0.5`;
+    - two header lines `1.2.3.4` and `10.0.0.5` → `10.0.0.5`;
+    - missing header → 403;
+    - `nope` → 403;
+    - `127.0.0.2` only → 403;
+    - `::ffff:10.0.0.5` → `10.0.0.5`.
+  - Also in `proxy_test.go`:
+    - `FuzzTrustProxies`, seeded from every table row.
+    - `TestProxied_GuardUsesClient`: a trusted peer with a client outside the provisioning subnet → 403.
+    - `TestProxied_DiscoverLimiterKeysOnClient`: two clients behind one proxy get separate `/discover` budgets.
+  - `cmd/hephaestus/config_test.go`: one case per new validation message, plus the default mode is `file`.
+  - `cmd/hephaestus/serve_test.go`:
+    - `testServeConfig` uses file mode with `tlscerttest.WriteSelfSigned` for `hephaestus.example.test`.
+    - Keep `ServesAndDrains`, `TLS12Refused`, `InvalidConfig`, `AdminWideEvents`, `ComponentFailureStopsEverything` and the inherited-flag test.
+    - Delete `WrongDataKeyFails`, `IssuerFactoryErrorStops` and `ShutdownAbandonsObtain`.
+    - Add `TestRunServe_CertificateForOtherNameFails`: a cert for `other.example.test` makes runServe return an error containing `does not cover hephaestus.example.test`, never ready, asserted with the existing `probeReadyz` / `requireUnanswered`.
+    - Add `TestRunServe_ProxyMode`: proxy mode, trusted `127.0.0.0/8`. `GET http://<proxyLn>/boot?<the ServesAndDrains query>` with `X-Forwarded-For: 127.0.0.9` gives 200 and body prefix `#!ipxe\nparams\n`; the same request without the header gives 403; `/readyz` reaches 200 with no TLS check registered.
+    - goleak on every runServe test.
+
+- [ ] **Step 2: Run to verify failure**
+
+Run: `rtk proxy go test ./internal/tlscert/... ./internal/boot/ ./cmd/hephaestus/ -run 'Loader|Run_|Checks_|TrustProxies|Proxied|Config|RunServe' -count=1`. Expected: FAIL (undefined symbols are the RED state; add no stubs).
+
+- [ ] **Step 3: Implement**, delete `internal/tlsacme`, edit the migrations, run `rtk proxy go mod tidy`, and update the README, the design and the research record.
+
+- [ ] **Step 4: Verify**
+
+Run: `rtk proxy go test ./... -race -count=1`. Expected: PASS.
+Run: `rtk proxy sh -c "grep -rn -i 'tlsacme\|go-acme\|cloudflare\|DATA_KEY\|ACME_DIRECTORY' --include='*.go' --include='*.sql' --include='*.md' --include='go.mod' . | grep -v -e '^./docs/plans/' -e '^./.superpowers/' -e '^./docs/research/booty-slim/sources/'"`. Expected: no line other than the D25 entry and design lines that explicitly say ACME is not done in-process.
+Run: `DOCKER_HOST=unix://$HOME/.colima/default/docker.sock rtk proxy task image:build`. Expected: exit 0; `cap_net_bind_service=ep` in the log.
+Run: `DOCKER_HOST=unix://$HOME/.colima/default/docker.sock docker run --rm hephaestus:dev serve; echo "exit=$?"`. Expected: stderr contains `HEPHAESTUS_FQDN is required` and `HEPHAESTUS_TLS_CERT_FILE is required when HEPHAESTUS_TLS_MODE is file`; `exit=1`.
+
+- [ ] **Step 5: Gate and commit**
+
+Run: `DOCKER_HOST=unix://$HOME/.colima/default/docker.sock rtk proxy task ci`. Expected: exit 0.
+Commit with explicit paths (never `git add -A`; `git rm -r internal/tlsacme`), unsigned per the signing override: `git -c commit.gpgsign=false commit -m "feat: TLS from external certificate files or a reverse proxy; drop in-process ACME" -m "Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>"`. Expected: one or more commits; gpgsig prints 0.
