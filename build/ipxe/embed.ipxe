@@ -1,0 +1,27 @@
+#!ipxe
+prompt --key 0x02 --timeout 2000 Press Ctrl-B for the iPXE command line... && shell ||
+ifstat
+set attempts:int32 10
+set x:int32 0
+:retry_loop
+set idx:int32 0
+:loop
+isset ${net${idx}/mac} || goto exhausted
+ifclose
+iflinkwait --timeout 5000 net${idx} || goto next_iface
+dhcp net${idx} || goto next_iface
+isset ${ntp} && ntp ${ntp} ||
+chain http://${proxydhcp/next-server}/start?uuid=${uuid}&mac=${net${idx}/mac:hexhyp}&arch=${buildarch} || goto next_iface
+exit
+:next_iface
+inc idx && goto loop
+:exhausted
+echo hephaestus: no boot server answered on any interface
+iseq ${x} ${attempts} && goto fail ||
+echo hephaestus: retrying in 5 seconds
+sleep 5
+inc x
+goto retry_loop
+:fail
+echo hephaestus: giving up after ${attempts} attempts, returning to the firmware
+exit

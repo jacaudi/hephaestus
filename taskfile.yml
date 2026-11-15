@@ -36,3 +36,19 @@ tasks:
       - |
         echo "e2e: the QEMU harness arrives in a later milestone" >&2
         exit 1
+  ipxe:image:
+    desc: Build the pinned iPXE builder image (linux/arm64)
+    cmds:
+      - docker build --platform linux/arm64 -t hephaestus-ipxe-builder:local build/ipxe
+  ipxe:build:
+    desc: Rebuild internal/boot/ipxe/bin from iPXE 9261ebe (reproducible; needs DOCKER_HOST)
+    deps: [ipxe:image]
+    cmds:
+      - docker run --rm --platform linux/arm64 -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" -v "{{.ROOT_DIR}}:/src" hephaestus-ipxe-builder:local sh /src/build/ipxe/build.sh shipped
+  ipxe:build:testca:
+    desc: Build the e2e-only test-CA variant into build/ipxe/out/testca (never embedded)
+    deps: [ipxe:image]
+    requires:
+      vars: [TEST_CA]
+    cmds:
+      - docker run --rm --platform linux/arm64 -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" -v "{{.ROOT_DIR}}:/src" hephaestus-ipxe-builder:local sh /src/build/ipxe/build.sh testca "{{.TEST_CA}}"
