@@ -157,6 +157,7 @@ func testClient(tlsConfig *tls.Config) *http.Client {
 type reply struct {
 	status     int
 	tlsVersion uint16 // zero on a plain connection
+	resumed    bool   // the TLS handshake resumed an earlier session
 	body       string
 }
 
@@ -189,6 +190,7 @@ func getWith(t *testing.T, client *http.Client, url string, header http.Header) 
 	r := reply{status: resp.StatusCode, body: string(body)}
 	if resp.TLS != nil {
 		r.tlsVersion = resp.TLS.Version
+		r.resumed = resp.TLS.DidResume
 	}
 	return r
 }
@@ -335,6 +337,42 @@ func TestRunServe_ServesAndDrains(t *testing.T) {
 	for _, check := range []string{"tls:certificate", "tls:expiry"} {
 		if !strings.Contains(health.body, check) {
 			t.Errorf("GET /health lacks the %s check:\n%s", check, health.body)
+		}
+	}
+
+	stop()
+	if err := waitDone(t, done, 10*time.Second); err != nil {
+		t.Errorf("runServe after cancel = %v, want nil", err)
+	}
+}
+
+// TestRunServe_NoSessionTickets pins that the boot HTTPS listener issues no TLS
+// session tickets. iPXE 9261ebe hashes a NewSessionTicket that arrives before
+// its own Finished into the handshake transcript, so the handshake fails against
+// a server that sends one; a client that holds a session cache can resume only
+// if the server issued a ticket.
+func TestRunServe_NoSessionTickets(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	cfg := testServeConfig(t)
+	deps := testDeps(t)
+	stop, done := startServe(t, cfg, discardLogger(), deps)
+	waitStatus(t, deps.adminURL()+"/readyz", done)
+
+	// One client, so both connections share the session cache. Its transport
+	// keeps no connection alive, so the second request dials afresh.
+	tlsClient := testClient(&tls.Config{
+		InsecureSkipVerify: true,
+		MinVersion:         tls.VersionTLS13,
+		ClientSessionCache: tls.NewLRUClientSessionCache(4),
+	})
+	for i := range 2 {
+		boot := get(t, tlsClient, deps.httpsURL()+"/boot?"+bootQuery)
+		if boot.status != http.StatusOK {
+			t.Errorf("connection %d: GET /boot status = %d, want 200", i+1, boot.status)
+		}
+		if boot.resumed {
+			t.Errorf("connection %d: the handshake resumed a session, so the server issued a ticket", i+1)
 		}
 	}
 

@@ -270,7 +270,15 @@ func runServe(ctx context.Context, cfg serveConfig, logger *slog.Logger, deps se
 	} else {
 		httpsHandler := telemetry.WideEvents(metrics.Instrument(handlers.TLS(), "boot-https", deps.httpsLn.Addr().String()), logger, slog.LevelInfo)
 		p.httpsSrv = newServer(deps.httpsLn, httpsHandler, time.Minute, logger)
-		p.httpsSrv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS13, GetCertificate: loader.GetCertificate}
+		// Session tickets are off: Go sends a NewSessionTicket before it reads the
+		// client Finished, and iPXE 9261ebe hashes that early ticket into its
+		// handshake transcript, so its Finished is wrong and the handshake fails.
+		// iPXE gains nothing from resumption.
+		p.httpsSrv.TLSConfig = &tls.Config{
+			MinVersion:             tls.VersionTLS13,
+			GetCertificate:         loader.GetCertificate,
+			SessionTicketsDisabled: true,
+		}
 	}
 	return p.run(ctx)
 }
