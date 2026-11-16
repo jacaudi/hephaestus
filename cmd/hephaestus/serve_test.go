@@ -512,6 +512,30 @@ func TestRunServe_UntrustedChainFails(t *testing.T) {
 	requireUnanswered(t, probe)
 }
 
+// TestRunServe_FileModeWithoutRootsFails pins that file mode fails closed: with no
+// iPXE roots to check the chain against, startup is refused rather than the check
+// skipped, and nothing serves.
+func TestRunServe_FileModeWithoutRootsFails(t *testing.T) {
+	for name, roots := range map[string][]*x509.Certificate{"nil": nil, "empty": {}} {
+		t.Run(name, func(t *testing.T) {
+			defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+			cfg, root := testServeConfig(t)
+			deps := testDeps(t, root)
+			deps.roots = roots
+			probe := probeReadyz(t, deps)
+			_, done := startServe(t, cfg, discardLogger(), deps)
+
+			err := waitDone(t, done, 10*time.Second)
+
+			if want := "file mode needs the embedded iPXE roots"; err == nil || !strings.Contains(err.Error(), want) {
+				t.Errorf("runServe = %v, want an error containing %q", err, want)
+			}
+			requireUnanswered(t, probe)
+		})
+	}
+}
+
 // TestRunServe_ProxyMode pins proxy mode end to end: the proxy listener serves
 // the TLS routes over plain HTTP to a trusted proxy that names a client, refuses
 // a request that names none, and the service is ready with no TLS check.

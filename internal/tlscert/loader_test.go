@@ -636,16 +636,25 @@ func TestRun_ReloadRejectsUntrustedChain(t *testing.T) {
 	stop := startRun(t, l)
 	defer stop()
 
-	tlscerttest.WriteChain(t, filepath.Dir(certFile), fqdn, t0().Add(-time.Hour), t0().Add(90*day), true, true)
+	// The replacement is written and stamped in a sibling directory, then each
+	// file is renamed into place (a rename keeps the modification time).
+	next := t.TempDir()
+	nextCert, nextKey, _ := tlscerttest.WriteChain(t, next, fqdn, t0().Add(-time.Hour), t0().Add(90*day), true, true)
 	later := time.Now().Add(time.Hour)
-	for _, f := range []string{certFile, keyFile} {
+	for _, f := range []string{nextCert, nextKey} {
 		if err := os.Chtimes(f, later, later); err != nil {
 			t.Fatalf("chtimes: %v", err)
 		}
 	}
+	for _, p := range [][2]string{{nextCert, certFile}, {nextKey, keyFile}} {
+		if err := os.Rename(p[0], p[1]); err != nil {
+			t.Fatalf("rename %s: %v", p[0], err)
+		}
+	}
 
-	// The cert and key land one after the other, so a tick between them may
-	// report a mismatch first; the untrusted chain must still be reported, once.
+	// The two renames land one after the other, so a tick between them may see
+	// the new certificate with the old key: a mismatch. That and the untrusted
+	// chain, reported once, are the only errors there can be.
 	untrusted := func() (n int) {
 		for _, err := range errs.all() {
 			if strings.Contains(err.Error(), untrustedChain) {
@@ -658,6 +667,11 @@ func TestRun_ReloadRejectsUntrustedChain(t *testing.T) {
 	time.Sleep(15 * tick) // several more ticks: the same bad files must not be retried
 	if n := untrusted(); n != 1 {
 		t.Errorf("handler calls naming the untrusted chain = %d, want 1", n)
+	}
+	for _, err := range errs.all() {
+		if !strings.Contains(err.Error(), untrustedChain) && !strings.Contains(err.Error(), "does not match") {
+			t.Errorf("unexpected reload error: %v", err)
+		}
 	}
 	if got := serial(t, l); got.Cmp(old) != 0 {
 		t.Errorf("served serial = %v after an untrusted reload, want the old %v", got, old)

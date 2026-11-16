@@ -627,13 +627,13 @@ Per WL:504-543:
       from `build/ipxe/roots.txt`); a leaf-only `cert.pem`, or a certificate from another CA, fails it, and the error
       says to serve the full chain. Once a minute it stats both files, following symlinks so a Kubernetes secret swap
       counts, and reloads the pair when either file's modification time or size changed, under the same checks, the
-      root check included. A
-      replacement that fails them leaves the current pair serving, is counted (`hephaestus.tls.reload.failures`), is
-      reported once through the error handler (the service logs it at Warn), and is not retried until the files change
-      again. A file that is missing has no modification time to remember, so it is reported on every interval until it
-      returns. The TLS 1.3 listener serves whatever pair is current. The admin checks are `tls:certificate` (critical:
-      fails while the served leaf is not yet valid and once it has expired) and `tls:expiry` (warns under 14 days); the
-      gauge `hephaestus.tls.certificate.days_left` reports the days left.
+      root check included. A replacement that fails them leaves the current pair serving, is counted
+      (`hephaestus.tls.reload.failures`), is reported once through the error handler (the service logs it at Warn),
+      and is not retried until the files change again. A file that is missing has no modification time to remember, so
+      it is reported on every interval until it returns. The TLS 1.3 listener serves whatever pair is current. The
+      admin checks are `tls:certificate` (critical: fails while the served leaf is not yet valid and once it has
+      expired) and `tls:expiry` (warns under 14 days); the gauge `hephaestus.tls.certificate.days_left` reports the
+      days left.
     - **`proxy`**. A reverse proxy (Caddy, Traefik, Envoy) terminates TLS 1.3 and forwards plain HTTP to
       `HEPHAESTUS_PROXY_ADDRESS`, where hephaestus serves the same routes as the HTTPS listener. There is no certificate
       in the process, no TLS check and no TLS port. The proxy's own addresses are `HEPHAESTUS_PROXY_TRUSTED`
@@ -672,9 +672,11 @@ Per WL:504-543:
     - `#undef OCSP_CHECK`.
     - **For BIOS too**: `DOWNLOAD_PROTO_HTTPS`, `PARAM_CMD` and `NTP_CMD` enabled.
     - `MEMMAP_SETTINGS` enabled for `${memsize}`. CPUID facts are reported where available (amd64 only).
-  - **CI checks**: shipped binaries' `TRUST` fingerprints equal the ISRG set. `task ci` byte-checks the two `.efi` files
-    against it and verifies `SHA256SUMS`. `undionly.kpxe` is LZMA-compressed, so its `TRUST` set is verified at build time
-    (`task ipxe:build`, from the uncompressed ELF) and recorded in `BUILDINFO`, which `task ci` checks. A separately built
+  - **CI checks**: shipped binaries' `TRUST` fingerprints equal the ISRG set, and `bin/roots.pem` holds exactly those
+    roots in the same order (`roots.pem` == `roots.txt` == the `BUILDINFO` trust lines, each a CA). `task ci`
+    byte-checks the two `.efi` files against the ISRG set and verifies `SHA256SUMS`. `undionly.kpxe` is LZMA-compressed,
+    so its `TRUST` set is verified at build time (`task ipxe:build`, from the uncompressed ELF) and recorded in
+    `BUILDINFO`, which `task ci` checks. A separately built
     **test variant** trusts a test CA for QEMU tests and is never shipped.
   - **Fallback**: if lab test 1 shows a TLS 1.3 interop failure with Go, pin v2.0.0. Then TLS 1.2 is allowed on the boot
     listener, as a §10 deviation that exists only in that case.

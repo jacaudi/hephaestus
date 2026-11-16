@@ -190,6 +190,11 @@ func closeAll(lns ...net.Listener) error {
 func runServe(ctx context.Context, cfg serveConfig, logger *slog.Logger, deps serveDeps) (err error) {
 	defer func() { err = errors.Join(err, closeAll(deps.httpLn, deps.httpsLn, deps.proxyLn, deps.adminLn)) }()
 
+	// Fail closed: without roots the certificate chain check would be skipped.
+	if cfg.TLSMode == tlsModeFile && len(deps.roots) == 0 {
+		return errors.New("file mode needs the embedded iPXE roots to check the certificate chain against")
+	}
+
 	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
 		return fmt.Errorf("create data dir: %w", err)
 	}
