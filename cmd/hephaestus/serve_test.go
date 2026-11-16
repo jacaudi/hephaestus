@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"io"
@@ -34,12 +35,13 @@ const (
 )
 
 // testServeConfig is a serveConfig for a loopback run in a fresh data dir, in
-// file mode with a self-signed certificate for testFQDN.
-func testServeConfig(t *testing.T) serveConfig {
+// file mode with a full chain for testFQDN. It also returns the chain's root,
+// which testDeps passes to runServe as the root the iPXE binaries trust.
+func testServeConfig(t *testing.T) (serveConfig, *x509.Certificate) {
 	t.Helper()
 
 	dir := t.TempDir()
-	certFile, keyFile := writeTestCert(t, testFQDN)
+	certFile, keyFile, root := writeTestChain(t, testFQDN)
 	return serveConfig{
 		FQDN:          testFQDN,
 		Interface:     "lo0",
@@ -53,7 +55,7 @@ func testServeConfig(t *testing.T) serveConfig {
 		ShutdownGrace: 5 * time.Second,
 		LogFormat:     "json",
 		LogLevel:      slog.LevelInfo,
-	}
+	}, root
 }
 
 // testProxyConfig is testServeConfig in proxy mode. The one trusted proxy is the
@@ -62,17 +64,18 @@ func testServeConfig(t *testing.T) serveConfig {
 func testProxyConfig(t *testing.T) serveConfig {
 	t.Helper()
 
-	cfg := testServeConfig(t)
+	cfg, _ := testServeConfig(t)
 	cfg.TLSMode, cfg.TLSCertFile, cfg.TLSKeyFile = tlsModeProxy, "", ""
 	cfg.TrustedProxies = []netip.Prefix{netip.MustParsePrefix("127.0.0.1/32")}
 	return cfg
 }
 
-// writeTestCert writes a self-signed certificate for name, valid now for 90
-// days, and returns its certificate and key files.
-func writeTestCert(t *testing.T, name string) (certFile, keyFile string) {
+// writeTestChain writes a leaf for name under a fresh root and intermediate,
+// valid now for 90 days, with the intermediate in the certificate file as a
+// fullchain.pem has it. It returns the files and the root.
+func writeTestChain(t *testing.T, name string) (certFile, keyFile string, root *x509.Certificate) {
 	t.Helper()
-	return tlscerttest.WriteSelfSigned(t, t.TempDir(), name, time.Now().Add(-time.Hour), time.Now().Add(90*24*time.Hour))
+	return tlscerttest.WriteChain(t, t.TempDir(), name, time.Now().Add(-time.Hour), time.Now().Add(90*24*time.Hour), true, true)
 }
 
 // listenLoopback opens n loopback listeners; runServe takes ownership of the ones it is given.
@@ -96,12 +99,13 @@ func testFiles() map[string][]byte {
 	return map[string][]byte{"amd64/snp.efi": []byte("amd64-efi"), "arm64/snp.efi": []byte("arm64-efi")}
 }
 
-// testDeps is the file-mode wiring: boot HTTP, boot HTTPS and admin listeners.
-func testDeps(t *testing.T) serveDeps {
+// testDeps is the file-mode wiring: boot HTTP, boot HTTPS and admin listeners,
+// and root as the one root the iPXE binaries trust.
+func testDeps(t *testing.T, root *x509.Certificate) serveDeps {
 	t.Helper()
 
 	lns := listenLoopback(t, 3)
-	return serveDeps{httpLn: lns[0], httpsLn: lns[1], adminLn: lns[2], files: testFiles()}
+	return serveDeps{httpLn: lns[0], httpsLn: lns[1], adminLn: lns[2], files: testFiles(), roots: []*x509.Certificate{root}}
 }
 
 // testProxyDeps is the proxy-mode wiring: boot HTTP, proxy and admin listeners.
@@ -302,8 +306,8 @@ func requireUnanswered(t *testing.T, probe <-chan probeResult) {
 func TestRunServe_ServesAndDrains(t *testing.T) {
 	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 
-	cfg := testServeConfig(t)
-	deps := testDeps(t)
+	cfg, root := testServeConfig(t)
+	deps := testDeps(t, root)
 	stop, done := startServe(t, cfg, discardLogger(), deps)
 	waitStatus(t, deps.adminURL()+"/readyz", done)
 
@@ -371,8 +375,8 @@ func (c *ticketCounter) Put(key string, cs *tls.ClientSessionState) {
 func TestRunServe_NoSessionTickets(t *testing.T) {
 	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 
-	cfg := testServeConfig(t)
-	deps := testDeps(t)
+	cfg, root := testServeConfig(t)
+	deps := testDeps(t, root)
 	stop, done := startServe(t, cfg, discardLogger(), deps)
 	waitStatus(t, deps.adminURL()+"/readyz", done)
 
@@ -408,8 +412,8 @@ func TestRunServe_NoSessionTickets(t *testing.T) {
 func TestRunServe_MetricsIgnoreHostHeader(t *testing.T) {
 	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 
-	cfg := testServeConfig(t)
-	deps := testDeps(t)
+	cfg, root := testServeConfig(t)
+	deps := testDeps(t, root)
 	stop, done := startServe(t, cfg, discardLogger(), deps)
 	waitStatus(t, deps.adminURL()+"/readyz", done)
 
@@ -445,8 +449,8 @@ func TestRunServe_MetricsIgnoreHostHeader(t *testing.T) {
 func TestRunServe_TLS12Refused(t *testing.T) {
 	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 
-	cfg := testServeConfig(t)
-	deps := testDeps(t)
+	cfg, root := testServeConfig(t)
+	deps := testDeps(t, root)
 	stop, done := startServe(t, cfg, discardLogger(), deps)
 	waitStatus(t, deps.adminURL()+"/readyz", done)
 
@@ -474,15 +478,35 @@ func TestRunServe_TLS12Refused(t *testing.T) {
 func TestRunServe_CertificateForOtherNameFails(t *testing.T) {
 	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 
-	cfg := testServeConfig(t)
-	cfg.TLSCertFile, cfg.TLSKeyFile = writeTestCert(t, "other.example.test")
-	deps := testDeps(t)
+	cfg, root := testServeConfig(t)
+	cfg.TLSCertFile, cfg.TLSKeyFile, _ = writeTestChain(t, "other.example.test")
+	deps := testDeps(t, root)
 	probe := probeReadyz(t, deps)
 	_, done := startServe(t, cfg, discardLogger(), deps)
 
 	err := waitDone(t, done, 10*time.Second)
 
 	if want := "does not cover " + testFQDN; err == nil || !strings.Contains(err.Error(), want) {
+		t.Errorf("runServe = %v, want an error containing %q", err, want)
+	}
+	requireUnanswered(t, probe)
+}
+
+// TestRunServe_UntrustedChainFails pins that a certificate whose chain does not
+// reach a root the iPXE binaries trust stops startup before anything serves: the
+// admin listener never answers the probe that waits in its backlog.
+func TestRunServe_UntrustedChainFails(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	cfg, root := testServeConfig(t)
+	cfg.TLSCertFile, cfg.TLSKeyFile, _ = writeTestChain(t, testFQDN) // another root issued it
+	deps := testDeps(t, root)
+	probe := probeReadyz(t, deps)
+	_, done := startServe(t, cfg, discardLogger(), deps)
+
+	err := waitDone(t, done, 10*time.Second)
+
+	if want := "does not reach a root the embedded iPXE trusts"; err == nil || !strings.Contains(err.Error(), want) {
 		t.Errorf("runServe = %v, want an error containing %q", err, want)
 	}
 	requireUnanswered(t, probe)
@@ -579,9 +603,9 @@ func holdOpen(t *testing.T, addr string) {
 func TestRunServe_DrainSharesOneGrace(t *testing.T) {
 	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 
-	cfg := testServeConfig(t)
+	cfg, root := testServeConfig(t)
 	cfg.ShutdownGrace = 2 * time.Second
-	deps := testDeps(t)
+	deps := testDeps(t, root)
 	stop, done := startServe(t, cfg, discardLogger(), deps)
 	waitStatus(t, deps.adminURL()+"/readyz", done)
 	holdOpen(t, deps.httpLn.Addr().String())
@@ -603,8 +627,8 @@ func TestRunServe_AdminWideEvents(t *testing.T) {
 	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 
 	var logs bytes.Buffer
-	cfg := testServeConfig(t)
-	deps := testDeps(t)
+	cfg, root := testServeConfig(t)
+	deps := testDeps(t, root)
 	stop, done := startServe(t, cfg, slog.New(slog.NewJSONHandler(&logs, nil)), deps)
 	waitStatus(t, deps.adminURL()+"/healthz", done)
 
@@ -632,8 +656,8 @@ func TestRunServe_LogsDrainAndStop(t *testing.T) {
 	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 
 	var logs bytes.Buffer
-	cfg := testServeConfig(t)
-	deps := testDeps(t)
+	cfg, root := testServeConfig(t)
+	deps := testDeps(t, root)
 	stop, done := startServe(t, cfg, slog.New(slog.NewJSONHandler(&logs, nil)), deps)
 	waitStatus(t, deps.adminURL()+"/readyz", done)
 
@@ -703,8 +727,8 @@ func TestReportError_PrintsUnloggedErrors(t *testing.T) {
 func TestRunServe_ComponentFailureStopsEverything(t *testing.T) {
 	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 
-	cfg := testServeConfig(t)
-	deps := testDeps(t)
+	cfg, root := testServeConfig(t)
+	deps := testDeps(t, root)
 	if err := deps.httpLn.Close(); err != nil { // Serve on a closed listener fails at once
 		t.Fatalf("close listener: %v", err)
 	}

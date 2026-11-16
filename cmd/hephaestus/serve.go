@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -102,6 +103,10 @@ func listenAndServe(ctx context.Context, cfg serveConfig, logger *slog.Logger) e
 	if err != nil {
 		return fmt.Errorf("load iPXE binaries: %w", err)
 	}
+	roots, err := ipxe.TrustedRoots()
+	if err != nil {
+		return fmt.Errorf("load iPXE trusted roots: %w", err)
+	}
 	// The second boot listener is HTTPS on the provisioning address in file
 	// mode, and the proxy's upstream in proxy mode.
 	bootTLSAddr := netip.AddrPortFrom(cfg.Address, bootHTTPSPort)
@@ -116,7 +121,7 @@ func listenAndServe(ctx context.Context, cfg serveConfig, logger *slog.Logger) e
 	if err != nil {
 		return err
 	}
-	deps := serveDeps{httpLn: lns[0], adminLn: lns[2], udp: true, files: files}
+	deps := serveDeps{httpLn: lns[0], adminLn: lns[2], udp: true, files: files, roots: roots}
 	if cfg.TLSMode == tlsModeProxy {
 		deps.proxyLn = lns[1]
 	} else {
@@ -144,6 +149,9 @@ type serveDeps struct {
 	udp bool
 	// files are the iPXE binaries, by the names TFTP and /tftp serve them under.
 	files map[string][]byte
+	// roots are the certificates the iPXE binaries trust; a file-mode certificate
+	// must chain to one of them.
+	roots []*x509.Certificate
 }
 
 // listen opens a TCP listener on each address, in order. On a failure it
@@ -213,6 +221,7 @@ func runServe(ctx context.Context, cfg serveConfig, logger *slog.Logger, deps se
 	var tlsChecks []admin.Check
 	if cfg.TLSMode == tlsModeFile {
 		loader, err = tlscert.NewLoader(cfg.TLSCertFile, cfg.TLSKeyFile, cfg.FQDN,
+			tlscert.WithRoots(deps.roots),
 			tlscert.WithMeter(metrics.Meter()),
 			tlscert.WithErrorHandler(func(err error) {
 				logger.WarnContext(ctx, "certificate reload failed", "error", err)

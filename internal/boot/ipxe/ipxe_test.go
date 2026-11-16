@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/pem"
 	"maps"
 	"os"
 	"regexp"
@@ -201,5 +202,55 @@ func TestFiles(t *testing.T) {
 	}
 	if bytes.Equal(got["snp.efi"], got["snp-arm64.efi"]) {
 		t.Error("the amd64 and arm64 binaries are identical")
+	}
+}
+
+// TestTrustedRoots pins that bin/roots.pem holds exactly the roots the binaries
+// were built with: the ISRG oracle, in trust order (so also roots.txt and the
+// BUILDINFO trust lines), each a CA.
+func TestTrustedRoots(t *testing.T) {
+	roots, err := TrustedRoots()
+	if err != nil {
+		t.Fatalf("TrustedRoots() error = %v", err)
+	}
+
+	var got []string
+	for i, c := range roots {
+		got = append(got, sha256Hex(c.Raw))
+		if !c.IsCA {
+			t.Errorf("root %d (%s) is not a CA", i, c.Subject)
+		}
+	}
+	if !slices.Equal(got, isrg()) {
+		t.Errorf("TrustedRoots() fingerprints = %v, want %v", got, isrg())
+	}
+}
+
+func TestParseRoots(t *testing.T) {
+	good := string(readFile(t, "bin/roots.pem"))
+	block := func(typ string) string {
+		return string(pem.EncodeToMemory(&pem.Block{Type: typ, Bytes: []byte("x")}))
+	}
+
+	tests := []struct {
+		name    string
+		in      string
+		wantErr string
+	}{
+		{"empty", "", "no certificates"},
+		{"text only", "not pem\n", "no certificates"},
+		{"private key block", block("PRIVATE KEY"), `block type "PRIVATE KEY"`},
+		{"certificate then key", good + block("PRIVATE KEY"), `block type "PRIVATE KEY"`},
+		{"trailing garbage", good + "garbage\n", "trailing data"},
+		{"unparsable certificate", block("CERTIFICATE"), "parse root 1"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			roots, err := parseRoots([]byte(tt.in))
+
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("parseRoots() = %d roots, error %v, want an error containing %q", len(roots), err, tt.wantErr)
+			}
+		})
 	}
 }

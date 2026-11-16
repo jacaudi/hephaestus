@@ -620,9 +620,14 @@ Per WL:504-543:
     account and no DNS credential. `HEPHAESTUS_TLS_MODE` picks one of two sources, and both ship:
     - **`file`** (default). `HEPHAESTUS_TLS_CERT_FILE` and `HEPHAESTUS_TLS_KEY_FILE` name a chain and key that an external
       process writes and renews (certbot, lego, cert-manager). The `tlscert` package reads both at startup and refuses to
-      start when a file is unreadable, the key does not match, the leaf does not cover `HEPHAESTUS_FQDN`, or the leaf is
-      not yet valid or has expired. Once a minute it stats both files, following symlinks so a Kubernetes secret swap
-      counts, and reloads the pair when either file's modification time or size changed, under the same checks. A
+      start when a file is unreadable, the key does not match, the leaf does not cover `HEPHAESTUS_FQDN`, the leaf is
+      not yet valid or has expired, or the chain in the certificate file does not reach a root the embedded iPXE
+      binaries trust (D27). That last check verifies the leaf, with the file's other certificates as intermediates,
+      against `internal/boot/ipxe/bin/roots.pem`, the bundle of roots the binaries were built with (`build.sh` writes it
+      from `build/ipxe/roots.txt`); a leaf-only `cert.pem`, or a certificate from another CA, fails it, and the error
+      says to serve the full chain. Once a minute it stats both files, following symlinks so a Kubernetes secret swap
+      counts, and reloads the pair when either file's modification time or size changed, under the same checks, the
+      root check included. A
       replacement that fails them leaves the current pair serving, is counted (`hephaestus.tls.reload.failures`), is
       reported once through the error handler (the service logs it at Warn), and is not retried until the files change
       again. A file that is missing has no modification time to remember, so it is reported on every interval until it

@@ -3,6 +3,8 @@
 # Run as root with the repository mounted at /src:
 #   build.sh shipped                      -> /src/internal/boot/ipxe/bin (embedded in the Go binary)
 #   build.sh testca <repo-relative PEM>   -> /src/build/ipxe/out/testca  (e2e only, never embedded)
+# Both also write roots.pem beside the binaries: the PEM bundle of the certificates they were built to
+# trust, which hephaestus reads to refuse a certificate whose chain iPXE would reject.
 set -eu
 
 mode=${1:?usage: build.sh shipped | build.sh testca <repo-relative CA PEM>}
@@ -19,6 +21,8 @@ git merge-base --is-ancestor "$IPXE_TLS13_ANCESTOR" HEAD
 case "$mode" in
 shipped)
 	mkdir -p /tmp/roots
+	pem=/tmp/roots.pem
+	: >"$pem"
 	CERTS=
 	EXPECT=
 	while read -r name url file_sha fingerprint; do
@@ -26,6 +30,7 @@ shipped)
 		[ "$(sha256 "/tmp/roots/$name")" = "$file_sha" ] || { echo "root $name: file sha256 mismatch" >&2; exit 1; }
 		[ "$(der_fingerprint "/tmp/roots/$name")" = "$fingerprint" ] || { echo "root $name: fingerprint mismatch" >&2; exit 1; }
 		CERTS="${CERTS:+$CERTS,}/tmp/roots/$name"
+		cat "/tmp/roots/$name" >>"$pem"
 		EXPECT="$EXPECT$fingerprint"
 	done </src/build/ipxe/roots.txt
 	size=0000000000000080
@@ -33,6 +38,7 @@ shipped)
 	;;
 testca)
 	CERTS=/src/${2:?testca needs a repo-relative CA PEM}
+	pem=$CERTS
 	EXPECT=$(der_fingerprint "$CERTS")
 	size=0000000000000020
 	out=/src/build/ipxe/out/testca
@@ -65,6 +71,7 @@ for tmp in bin-x86_64-pcbios/undionly.kpxe.tmp bin-x86_64-efi/snp.efi.tmp bin-ar
 done
 
 mkdir -p "$out"
+cp "$pem" "$out/roots.pem"
 cp src/bin-x86_64-pcbios/undionly.kpxe "$out/undionly.kpxe"
 cp src/bin-x86_64-efi/snp.efi "$out/snp-amd64.efi"
 cp src/bin-arm64-efi/snp.efi "$out/snp-arm64.efi"

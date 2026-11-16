@@ -45,6 +45,11 @@ func WithErrorHandler(fn func(error)) Option { return func(l *Loader) { l.onErro
 // default is one minute.
 func WithInterval(d time.Duration) Option { return func(l *Loader) { l.interval = d } }
 
+// WithRoots makes every pair's chain, as the certificate file holds it, reach
+// one of roots: a pair whose chain does not is refused like any other failed
+// check. By default no chain is checked.
+func WithRoots(roots []*x509.Certificate) Option { return func(l *Loader) { l.roots = roots } }
+
 // stamp is what Run compares to notice that a file changed: its modification
 // time and size.
 type stamp struct{ modNano, size int64 }
@@ -58,6 +63,7 @@ type Loader struct {
 	meter    metric.Meter
 	onError  func(error)
 	interval time.Duration
+	roots    []*x509.Certificate // nil: the chain is not checked
 
 	reloadFailures metric.Int64Counter
 
@@ -72,8 +78,9 @@ type Loader struct {
 // NewLoader reads certFile and keyFile and returns a Loader that serves the
 // pair, or an error and nothing to serve when a file cannot be read, the key
 // does not match the certificate, the leaf does not cover fqdn, the leaf is not
-// yet valid or has expired, or the interval is not positive. It starts
-// nothing: call Run to follow changes to the files.
+// yet valid or has expired, the chain does not reach a root given by WithRoots,
+// or the interval is not positive. It starts nothing: call Run to follow
+// changes to the files.
 func NewLoader(certFile, keyFile, fqdn string, opts ...Option) (*Loader, error) {
 	l := &Loader{
 		certFile: certFile,
@@ -183,7 +190,8 @@ func (l *Loader) stamps() ([2]stamp, error) {
 
 // read loads the pair from the files and applies the checks every pair must
 // pass before it is served: it must be a matching pair, its leaf must cover the
-// name, and the leaf must not have expired.
+// name, the leaf must not have expired, and, when roots are set, the chain must
+// reach one of them.
 func (l *Loader) read() (*tls.Certificate, error) {
 	certPEM, err := os.ReadFile(l.certFile)
 	if err != nil {
@@ -211,8 +219,37 @@ func (l *Loader) read() (*tls.Certificate, error) {
 	if now.After(leaf.NotAfter) {
 		return nil, fmt.Errorf("tlscert: certificate %s expired at %s", l.certFile, leaf.NotAfter.UTC().Format(time.RFC3339))
 	}
+	if l.roots != nil {
+		if err := l.verifyChain(leaf, pair.Certificate[1:], now); err != nil {
+			return nil, fmt.Errorf("tlscert: %s: certificate chain does not reach a root the embedded iPXE trusts (serve the full chain, e.g. fullchain.pem): %w", l.certFile, err)
+		}
+	}
 	pair.Leaf = leaf
 	return &pair, nil
+}
+
+// verifyChain checks that leaf chains to one of l.roots through the
+// intermediates in rest, the DER certificates after the leaf in the file.
+func (l *Loader) verifyChain(leaf *x509.Certificate, rest [][]byte, now time.Time) error {
+	roots, intermediates := x509.NewCertPool(), x509.NewCertPool()
+	for _, r := range l.roots {
+		roots.AddCert(r)
+	}
+	for i, der := range rest {
+		c, err := x509.ParseCertificate(der)
+		if err != nil {
+			return fmt.Errorf("parse certificate %d after the leaf: %w", i+1, err)
+		}
+		intermediates.AddCert(c)
+	}
+	_, err := leaf.Verify(x509.VerifyOptions{
+		DNSName:       l.fqdn,
+		Roots:         roots,
+		Intermediates: intermediates,
+		CurrentTime:   now,
+		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	})
+	return err
 }
 
 // GetCertificate returns the pair being served; it is the tls.Config callback.

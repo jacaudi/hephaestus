@@ -562,3 +562,104 @@ func TestMetrics_DaysLeftAndReloadFailures(t *testing.T) {
 		t.Errorf("metrics lack hephaestus_tls_reload_failures_total after a bad reload:\n%s", body)
 	}
 }
+
+// chain writes a chain for fqdn valid from t0-1h for 90 days, in a new
+// directory, and returns its files and the root a client must trust.
+func chain(t *testing.T, withIntermediate, includeIntermediate bool) (certFile, keyFile string, root *x509.Certificate) {
+	t.Helper()
+	return tlscerttest.WriteChain(t, t.TempDir(), fqdn, t0().Add(-time.Hour), t0().Add(90*day), withIntermediate, includeIntermediate)
+}
+
+func TestNewLoader_ChainReachesRoot(t *testing.T) {
+	certFile, keyFile, root := chain(t, false, false)
+
+	l := newLoader(t, certFile, keyFile, tlscert.WithRoots([]*x509.Certificate{root}))
+
+	if got, want := serial(t, l), fileSerial(t, certFile); got.Cmp(want) != 0 {
+		t.Errorf("served serial = %v, want %v", got, want)
+	}
+}
+
+func TestNewLoader_ChainWithIntermediate(t *testing.T) {
+	certFile, keyFile, root := chain(t, true, true)
+
+	l := newLoader(t, certFile, keyFile, tlscert.WithRoots([]*x509.Certificate{root}))
+
+	if got, want := serial(t, l), fileSerial(t, certFile); got.Cmp(want) != 0 {
+		t.Errorf("served serial = %v, want %v", got, want)
+	}
+}
+
+const untrustedChain = "does not reach a root the embedded iPXE trusts"
+
+func TestNewLoader_MissingIntermediate(t *testing.T) {
+	certFile, keyFile, root := chain(t, true, false)
+
+	l, err := tlscert.NewLoader(certFile, keyFile, fqdn, tlscert.WithClock(t0), tlscert.WithRoots([]*x509.Certificate{root}))
+
+	if err == nil {
+		t.Fatal("NewLoader succeeded with a leaf-only file whose issuer is an intermediate, want an error")
+	}
+	if l != nil {
+		t.Errorf("NewLoader returned a loader along with %v", err)
+	}
+	if !strings.Contains(err.Error(), untrustedChain) {
+		t.Errorf("error = %q, want it to contain %q", err, untrustedChain)
+	}
+}
+
+func TestNewLoader_OtherCA(t *testing.T) {
+	certFile, keyFile := files(t, fqdn, 90*day) // self-signed: no CA issued it
+	_, _, root := chain(t, false, false)
+
+	l, err := tlscert.NewLoader(certFile, keyFile, fqdn, tlscert.WithClock(t0), tlscert.WithRoots([]*x509.Certificate{root}))
+
+	if err == nil {
+		t.Fatal("NewLoader succeeded with a certificate from another CA, want an error")
+	}
+	if l != nil {
+		t.Errorf("NewLoader returned a loader along with %v", err)
+	}
+	if !strings.Contains(err.Error(), untrustedChain) {
+		t.Errorf("error = %q, want it to contain %q", err, untrustedChain)
+	}
+}
+
+// TestRun_ReloadRejectsUntrustedChain pins that a reload applies the root check:
+// a replacement from a CA the roots do not hold is reported and never served.
+func TestRun_ReloadRejectsUntrustedChain(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	certFile, keyFile, root := chain(t, true, true)
+	var errs errLog
+	l := newLoader(t, certFile, keyFile, tlscert.WithRoots([]*x509.Certificate{root}), tlscert.WithInterval(tick), tlscert.WithErrorHandler(errs.handle))
+	old := serial(t, l)
+	stop := startRun(t, l)
+	defer stop()
+
+	tlscerttest.WriteChain(t, filepath.Dir(certFile), fqdn, t0().Add(-time.Hour), t0().Add(90*day), true, true)
+	later := time.Now().Add(time.Hour)
+	for _, f := range []string{certFile, keyFile} {
+		if err := os.Chtimes(f, later, later); err != nil {
+			t.Fatalf("chtimes: %v", err)
+		}
+	}
+
+	// The cert and key land one after the other, so a tick between them may
+	// report a mismatch first; the untrusted chain must still be reported, once.
+	untrusted := func() (n int) {
+		for _, err := range errs.all() {
+			if strings.Contains(err.Error(), untrustedChain) {
+				n++
+			}
+		}
+		return n
+	}
+	eventually(t, "an error naming the untrusted chain", func() bool { return untrusted() > 0 })
+	time.Sleep(15 * tick) // several more ticks: the same bad files must not be retried
+	if n := untrusted(); n != 1 {
+		t.Errorf("handler calls naming the untrusted chain = %d, want 1", n)
+	}
+	if got := serial(t, l); got.Cmp(old) != 0 {
+		t.Errorf("served serial = %v after an untrusted reload, want the old %v", got, old)
+	}
+}
