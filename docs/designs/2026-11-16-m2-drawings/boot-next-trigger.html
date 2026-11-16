@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hephaestus M2: how a utility boot is triggered</title>
+<style>
+  :root { --ink:#1b1f24; --muted:#59636e; --line:#d0d7de; --bg:#ffffff; --panel:#f6f8fa; --rec:#1a7f37; --warn:#9a6700; --bad:#cf222e; --hl:#fff8c5; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:24px 16px 48px; font:16px/1.5 -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; color:var(--ink); background:var(--bg); }
+  main { max-width:1180px; margin:0 auto; }
+  h1 { font-size:24px; line-height:1.25; margin:0 0 8px; }
+  h2 { font-size:20px; margin:0 0 4px; }
+  h3 { font-size:16px; margin:16px 0 6px; }
+  p { margin:0 0 12px; }
+  .lede { color:var(--muted); margin-bottom:20px; }
+  .grid { display:grid; grid-template-columns:1fr; gap:20px; }
+  @media (min-width: 900px) { .grid { grid-template-columns:1fr 1fr; } }
+  .opt { border:1px solid var(--line); border-radius:8px; padding:16px; background:var(--bg); min-width:0; }
+  .opt.rec { border:2px solid var(--rec); }
+  .tag { display:inline-block; font-size:13px; font-weight:600; padding:2px 8px; border-radius:12px; margin-bottom:8px; }
+  .tag.rec { background:#dafbe1; color:var(--rec); }
+  .tag.alt { background:#fff1e5; color:var(--warn); }
+  .flow { list-style:none; margin:0; padding:0; }
+  .flow li { border:1px solid var(--line); background:var(--panel); border-radius:6px; padding:8px 10px; margin:0 0 6px; overflow-wrap:anywhere; }
+  .flow li.arrow { border:none; background:none; padding:0 0 0 14px; margin:-2px 0 4px; color:var(--muted); font-size:14px; }
+  .flow li.hl { background:var(--hl); border-color:#d4a72c; }
+  code { font:13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; background:#eff1f3; padding:1px 4px; border-radius:4px; overflow-wrap:anywhere; }
+  .tbl { width:100%; overflow-x:auto; }
+  table { border-collapse:collapse; width:100%; font-size:14px; }
+  th, td { border:1px solid var(--line); padding:6px 8px; text-align:left; vertical-align:top; white-space:nowrap; }
+  th { background:var(--panel); }
+  td.new { background:var(--hl); }
+  .pros, .cons { margin:4px 0 0; padding-left:20px; }
+  .pros li::marker { color:var(--rec); }
+  .cons li::marker { color:var(--bad); }
+  .note { font-size:14px; color:var(--muted); margin-top:16px; }
+  .shared { border:1px solid var(--line); border-radius:8px; padding:16px; margin-bottom:20px; background:var(--panel); }
+</style>
+</head>
+<body>
+<main>
+  <h1>M2: how you trigger a utility-OS boot before the UI exists</h1>
+  <p class="lede">Example: boot SystemRescue once on the machine with MAC <code>52:54:00:e2:e0:03</code>. Highlighted = new in M2. The UI (M4) later calls the same code path.</p>
+
+  <section class="shared">
+    <h2>Shared by both options: data and the boot path</h2>
+    <h3>New column and table (highlighted)</h3>
+    <div class="tbl"><table>
+      <tr><th>machines (excerpt)</th><th>smbios_uuid</th><th>state</th><th>arch</th><th>boot_next</th></tr>
+      <tr><td>m-01</td><td>e2e00000-…-525400e2e003</td><td>discovered</td><td>amd64</td><td class="new">systemrescue</td></tr>
+    </table></div>
+    <div class="tbl" style="margin-top:8px"><table>
+      <tr><th>utility_cache</th><th>state</th><th>sha256 (pinned)</th><th>fetched_at</th></tr>
+      <tr><td class="new">systemrescue</td><td class="new">wanted → fetching → ready</td><td class="new">pinned in the catalog</td><td class="new">2026-11-16T07:02Z</td></tr>
+    </table></div>
+    <h3>Next boot of that machine</h3>
+    <ol class="flow">
+      <li>iPXE → <code>/boot</code> (TLS)</li>
+      <li class="arrow">↓ decision row 3: boot-next set and ready?</li>
+      <li class="hl">ready → SystemRescue script, second stage over plain HTTP from the store; <code>boot_next</code> cleared</li>
+      <li class="hl">not ready → flag kept, rows 4–10 apply as today, fetch queued</li>
+    </ol>
+    <p class="note">Only the <code>serve</code> process writes the content store. The store index is not safe for two writers.</p>
+  </section>
+
+  <div class="grid">
+    <section class="opt rec">
+      <span class="tag rec">A · recommended</span>
+      <h2>CLI inside the container writes the database</h2>
+      <ol class="flow">
+        <li>You, on the TrueNAS host: <code>docker exec hephaestus /hephaestus boot-next 52:54:00:e2:e0:03 systemrescue</code></li>
+        <li class="arrow">↓ same binary, same config, same repository code</li>
+        <li class="hl">DB: <code>boot_next = systemrescue</code>; <code>utility_cache.systemrescue = wanted</code></li>
+        <li class="arrow">↓ serve's fetcher polls wanted rows every 10 s</li>
+        <li class="hl">serve fetches, checks the pinned sha256, extracts, sets <code>ready</code></li>
+      </ol>
+      <ul class="pros">
+        <li>No new network surface: access to the host <em>is</em> the authentication</li>
+        <li>Works with SQLite (WAL, busy timeout) and Postgres</li>
+        <li>Also: <code>boot-next clear</code>, <code>utility fetch &lt;entry&gt;</code>, <code>utility list</code></li>
+      </ul>
+      <ul class="cons">
+        <li>Needs a shell on the host (fine for one owner)</li>
+        <li>Fetch starts within 10 s, not instantly</li>
+      </ul>
+    </section>
+
+    <section class="opt">
+      <span class="tag alt">B</span>
+      <h2>Admin-listener HTTP endpoint, CLI is a thin client</h2>
+      <ol class="flow">
+        <li>You, anywhere on the management LAN: <code>hephaestus boot-next … --admin 10.0.10.5:9090</code></li>
+        <li class="arrow">↓ <code>POST /admin/boot-next</code></li>
+        <li class="hl">serve writes the DB and starts the fetch immediately</li>
+      </ol>
+      <ul class="pros">
+        <li>Instant fetch; works from a laptop without host access</li>
+      </ul>
+      <ul class="cons">
+        <li>The admin listener has no authentication until M4 (§5.8). Anyone on the management LAN could boot-next <strong>ShredOS</strong> (a disk wipe) onto any machine.</li>
+        <li>So it needs a stopgap token now that M4 then replaces</li>
+        <li>Turns a read-only listener (health, metrics) into a control plane</li>
+      </ul>
+    </section>
+  </div>
+
+  <p class="note">Dropped: a config file listing boot-next targets. A one-shot flag that a static file re-arms on every restart is the wrong shape.</p>
+</main>
+</body>
+</html>

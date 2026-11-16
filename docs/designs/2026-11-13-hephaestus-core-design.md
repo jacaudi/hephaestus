@@ -4,7 +4,8 @@ Status: **approved** by the owner on 2026-11-14 (revision 4, after design-gate p
 Updated 2026-11-15 to match M1 as built: the Milestones section, and the M1 notes and rulings folded into the sections they
 touch. Also 2026-11-15 (owner): the in-process Let's Encrypt client is dropped. TLS comes from certificate files that an
 external tool writes and renews, or from a TLS-terminating reverse proxy (§5.10); the data key returns with its consumers
-in M3 (D25).
+in M3 (D25). Also 2026-11-16: M2 is now utility boots, and the Talos prefetch, `assets_ready` and the `/v2/` mirror moved to
+M3 (see the M2 design, `2026-11-16-hephaestus-m2-utility-boot-design.md`).
 Research and decision record: [`docs/research/booty-slim/README.md`](../research/booty-slim/README.md) (sources S1–S11
 under `docs/research/booty-slim/sources/`).
 - `D<n>` cites a decision from that record.
@@ -70,18 +71,22 @@ The goals above are built in four milestones. This section says what each contai
   the vendored proxyDHCP and TFTP; the iPXE build with committed binaries; TLS from certificate files that an external
   tool renews, or from a TLS-terminating reverse proxy (§5.10), and no data key yet; the container image. Known limitations: EFI iPXE reports `${memsize}` as 0 (stored and shown as unknown), and CPUID facts
   may be absent on BIOS builds.
-- **M2: store.** The content store, catalog, registry mirror and prefetch (§5.6), with the `store` and `catalog`
-  packages, utility OS boots and `assets_ready`.
-- **M3: clusters.** Clusters, render, secrets, `/config` and tickets (§5.4–5.6, §6); the Talos install script; the data
+- **M2: utility boots.** The content store, the pinned utility catalog (D7's verifiable 7) and utility-OS boots, driven
+  by an admin CLI (§5.6), with the `store`, `catalog` and `utility` packages. Design:
+  `docs/designs/2026-11-16-hephaestus-m2-utility-boot-design.md`.
+- **M3: clusters.** Clusters, render, secrets, `/config` and tickets (§5.4–5.6, §6); Talos prefetch, `assets_ready` and
+  Talos reconciliation, the `/v2/` mirror and the runtime GC quiet window (§5.6); the Talos install script; the data
   key (its `datakey` package exists, and nothing reads the key before M3) and the 1Password token; host binding and the create-on-adopt path (§5.2); the machinery assertion and the Topf parity test in CI.
 - **M4: auth, UI and operations.** `web` and `auth` (§5.7, §5.8); `hephaestus backup` and `admin recover` (§5.9); the
   menu-preview endpoint; the alert evaluators and surfaces that need the UI (§5.9), including the `/start`-without-`/boot`
   alert and certificate-expiry alerting beyond the `/health` warning; and the callers of `Transition` and
   `SetUnknownAction` (§5.2).
+- **After M2: Alpine aarch64** (D18, the owner's option A, after its spike; §5.6). `zfs-lts` is out of v1.
 
 Inputs owned by a later milestone already exist as inputs in M1: the decision function takes boot-next, readiness and
-drift (§5.2), and M1 supplies none of them. Not yet assigned to a milestone: the QEMU end-to-end harness (§7) and
-publishing the image (§3).
+drift (§5.2), and M1 supplies none of them. M2 supplies boot-next and utility readiness; `assets_ready` and `drift` stay
+absent until M3. The QEMU end-to-end harness exists (`task e2e`, §7). Not yet assigned to a milestone: publishing the
+image (§3).
 
 ### Non-goals (v1)
 - **The inventory agent and its commands**: `reboot`, `poweroff`, `boot-talos`, `wipe-disks` (P2.6 rest, P2.7).
@@ -173,10 +178,11 @@ publishing the image (§3).
 
 | Area | Responsibility |
 |---|---|
-| `boot` | proxyDHCP and TFTP (vendored), embedded iPXE binaries (§5.10), the `/start` and `/boot` scripts, the decision (§5.2), source-subnet guard (§6) |
-| `store` | The oras-go OCI-layout store: pins, GC coordinator, prefetch jobs, artifact serving, the `/v2/` mirror (§5.6) |
-| `catalog` | Compiled-in utility entries with pinned versions and hashes; Talos version discovery; schematic registration |
-| `fleet` | Machines, identity, lifecycle, approvals, boot events, timeline, audit |
+| `boot` | proxyDHCP and TFTP (vendored), embedded iPXE binaries (§5.10), the `/start` and `/boot` scripts, the decision (§5.2) including row 3 for utility boots, the `/u/` artifact route, source-subnet guard (§6) |
+| `store` | The oras-go OCI-layout store (M2): push, tag, untag, resolve, blob reads with a layer size check, and GC. Only `serve` uses it. Pins, the GC coordinator, Talos prefetch jobs and the `/v2/` mirror arrive in M3 (§5.6) |
+| `catalog` | Compiled-in utility entries (M2): hand-written URLs, recipes and support, plus generated sizes, hashes, paths and pin ids written by `task catalog:pin`. It renders recipe scripts and does no I/O. Talos version discovery and schematic registration arrive in M3 |
+| `utility` | The utility fetcher and its state machine, the pure-Go extractors (zip, tar+gzip, ISO9660), startup reconciliation and GC (M2, §5.6). Runs in `serve` only |
+| `fleet` | Machines, identity, lifecycle, approvals, boot events, timeline, audit; boot-next (set, clear, list) and the `utility_cache` repository (M2) |
 | `clusters` | Topf definitions from git (go-git) or native (DB); tree-hash revisions; export (§5.4) |
 | `render` | Vendored Topf renderer with guardrails |
 | `secrets` | `ref+op://` resolution (1Password SDK), the encrypted value cache with pending versions, and the 1Password writer for native bundles (§5.5) |
@@ -188,7 +194,7 @@ publishing the image (§3).
 | `secret` | A string type that redacts itself in fmt, slog and JSON. Not the `secrets` package above: that one resolves and caches 1Password values (M3), so the two names sit side by side |
 | `telemetry` | The slog logger, wide events and the OpenTelemetry meter provider with its Prometheus exporter (§5.9) |
 | `db` | Opening SQLite or Postgres, the goose migrations, health checks; the shared appkit-shaped DB package (§10) |
-| `cmd` | `hephaestus serve` and `hephaestus version` (`--json`), with a persistent `--log-format` flag; `hephaestus admin recover` and `hephaestus backup` (M4) |
+| `cmd` | `hephaestus serve` and `hephaestus version` (`--json`), with a persistent `--log-format` flag; the admin CLI (M2): `boot-next set`, `boot-next clear`, `boot-next list`, `utility fetch` and `utility list`, all with `--json`, run inside the container (§5.6, §6); `hephaestus admin recover` and `hephaestus backup` (M4) |
 
 Seams arrive with their second implementor (go-standards §12, tricorder `singleimpl`). A real test double that tests
 use counts as the second implementor. The same holds for an injected factory that exists only so a test can substitute
@@ -262,9 +268,11 @@ changes shape to carry the host (today `Repository.Transition` only loads an exi
   - machine state and host binding;
   - the stored serial/product for the UUID;
   - the per-machine flags `assets_ready` and `drift` (§5.4, §5.6);
-  - utility readiness;
+  - the boot-next target and the time it was set;
+  - utility readiness, and whether the entry supports the machine's `(arch, platform)`;
   - `unknown_action`;
-  - request facts, including `${serial}` and `${product}`.
+  - request facts, including `${serial}`, `${product}` and `platform` (`efi` or `pcbios`). `/start`'s server-side chain
+    query carries `platform=${platform}` into the `/boot` query, so the iPXE binaries are not rebuilt.
 - Output:
   - a script template;
   - the transitions and events to record;
@@ -278,7 +286,7 @@ changes shape to carry the host (today `Repository.Transition` only loads an exi
 |---|---|---|
 | 1 | request is not TLS | `chain https://<name>/boot?…`. Only `/start` and artifact routes are plain HTTP (§5.10) |
 | 2 | a known UUID arrives with a serial/product that differs from the record. "Known" includes a junk-pattern UUID found through its MAC (§5.2 identity) | hold; mark the UUID junk; alert (not again for a record already junk). This covers bound machines too, so a clone never gets an install |
-| 3 | one-shot boot-next utility target set **and that utility is ready** | that utility OS; flag cleared. Not ready: the flag is kept and the remaining rows apply |
+| 3 | one-shot boot-next utility target set, and not expired, **and that utility is ready and supported on the machine's arch and platform** | that utility OS; flag cleared (`served`). Otherwise the outcomes under "Row 3" below apply |
 | 4 | `cordoned` with prior `installed`, `install-unconfirmed`, `installing` or `local-only` | `exit` |
 | 5 | `cordoned` (other prior states), `rejected` or `orphaned` | holding script that never advances |
 | 6 | `local-only`, `installing`, `install-unconfirmed`, `installed` | `exit`. The transition `installing → install-unconfirmed` is recorded |
@@ -288,10 +296,27 @@ changes shape to carry the host (today `Repository.Transition` only loads an exi
 | 10 | `assigned`, junk UUID | hold ("junk SMBIOS UUID: installs are refused"): a junk-UUID machine never gets an install, even if it was assigned |
 | 10 | `assigned` | Talos install script; `needs_ticket` |
 
-**M1 behaviour of the table.** The decision is built and tested in full, but several inputs belong to later milestones:
-boot-next, utility readiness, `assets_ready` and `drift` are always absent in M1, and tickets and the install script are M3.
-So in M1 the caller turns a row-10 `needs_ticket` into a hold ("ticket minting not available (M3)") and a row-3 utility
-into a hold ("utility boot not available (M2)"), and every `assigned` machine holds at row 8.
+**Row 3** (M2). The outcomes are checked in order. Rows 1 and 2 still come first, and row 2 leaves the flag untouched.
+1. The flag is older than 24 h (a future set time counts as now): clear with `expired`; the remaining rows apply.
+2. The entry is no longer in the catalog (for example after a binary upgrade): clear with `unknown_entry`; the remaining
+   rows apply.
+3. The platform is known and the entry does not support it: clear with `unsupported`; the remaining rows apply.
+4. Ready and supported: the recipe script, with the flag cleared as `served` (the script was issued, so delivery is at
+   most once).
+5. Not ready, including an unknown or absent platform (only `efi` and `pcbios` are recognised): keep the flag, queue the
+   fetch (§5.6), and the remaining rows apply.
+
+Every clear is a compare-and-clear (`WHERE boot_next = ? AND boot_next_set_at = ?`), in the same transaction that records
+the boot and before any script is written. If the compare fails because the CLI changed the flag meanwhile, the request
+is decided once more from the fresh row; if it fails a second time, the request falls through to rows 4-10 without
+clearing and logs a warning. No background sweep clears flags: expiry is enforced when the decision is made.
+
+**Behaviour of the table by milestone.** The decision is built and tested in full in M1, but several inputs belong to
+later milestones. In M1, boot-next, utility readiness, `assets_ready` and `drift` are always absent, and tickets and the
+install script are M3. So in M1 the caller turns a row-10 `needs_ticket` into a hold ("ticket minting not available
+(M3)") and a row-3 utility into a hold ("utility boot not available (M2)"), and every `assigned` machine holds at row 8.
+M2 supplies boot-next and utility readiness, so row 3 is live and the M1 row-3 fallback is gone. `assets_ready` and
+`drift` stay absent until M3, so every `assigned` machine still holds at row 8.
 
 **Talos install script.**
 - The cached `kernel` and `initramfs`, fetched over plain HTTP from the artifact routes; their hashes are pinned in the store.
@@ -451,9 +476,11 @@ per host per hour.
 ### 5.6 Content store and catalog (no streaming)
 
 One oras-go v3 OCI-layout store under `<data>/store` (D17). Blobs become visible only once complete: oras-go writes to an
-`ingest/` temp file and renames it when done (gate 2). hephaestus therefore **never serves a blob that is still downloading**.
+`ingest/` temp file and renames it when done (gate 2). hephaestus therefore **never serves a blob that is still downloading**. Only the `serve` process writes to the store.
+M2 builds the store, the utility catalog and the artifact route for utility boots. Talos prefetch, `assets_ready`, Talos
+reconciliation, the `/v2/` mirror and the runtime GC quiet window are M3.
 
-**Prefetch, per bound machine** (triggers in §5.4). Everything a machine needs is fetched into the store before its
+**Prefetch, per bound machine (M3)** (triggers in §5.4). Everything a machine needs is fetched into the store before its
 `assets_ready` turns true:
 - the Talos boot assets for its `(schematic, version, arch)`: `kernel-<arch>`, `initramfs-<arch>.xz` and
   `cmdline-metal-<arch>`. SHA-256 is recorded on first fetch (S4 §3).
@@ -468,13 +495,25 @@ Prefetch jobs:
   never be spliced into one first-fetch hash, into hephaestus's own spool file, which is pushed into the store when complete;
 - show progress in the UI.
 
-**Startup reconciliation.** Every `assets_ready` flag and utility-ready flag is recomputed against the store. A missing
-blob, for example after a restore, clears the flag and re-queues the prefetch.
+**Startup reconciliation.** Every `assets_ready` flag (M3) and utility-ready state (M2) is recomputed against the store. A
+missing blob, for example after a restore, clears the flag and re-queues the fetch. For utility content (M2), after the
+listeners are bound and before they serve:
+- an undecodable `index.json` moves `<data>/store` aside to `store.corrupt-<UTC>` and starts an empty store, keeping only
+  the newest such directory; any other open error stops `serve`;
+- rows in `fetching` become `wanted`;
+- a row for an entry no longer in the catalog is deleted, and a row at a stale pin is reset to `wanted` at the current one;
+- a `ready` row whose tag or any layer is missing or wrong-sized becomes `wanted`, so a restored or repaired host
+  refetches its offline cache unattended;
+- a tag at the current pin whose layers all pass the size check makes its row `ready` (this repairs a crash between
+  tagging and the state update);
+- spool files outside the expected-name set are removed.
 
-**Utility readiness.** Each catalog entry has a ready flag. Entries are fetched on first selection as a boot-next target,
-or from an admin "fetch now" in the UI. Row 3 uses the flag.
+**Utility readiness (M2).** Each `(entry, arch)` has a `utility_cache` row in the state `wanted`, `fetching`, `ready`,
+`failed` or `broken`. Entries are fetched on first selection as a boot-next target, or on request with `hephaestus
+utility fetch`. That CLI command is "fetch now" until the UI's button arrives in M4; both call the same `fleet`
+functions. Row 3 uses `ready` at the catalog's current pin, with every layer passing a size check.
 
-**Registry mirror.**
+**Registry mirror (M3).**
 - `/v2/` is read-only, for an **allow-list**: `factory.talos.dev/*` and `ghcr.io/siderolabs/*`.
 - **Routing contract** (the owner's `RegistryMirrorConfig` patch must match): one mirror entry per upstream host, with
   endpoint `https://<name>/v2/<upstream-host>` and `overridePath: true`, so a request path's first segment names the
@@ -486,34 +525,76 @@ or from an admin "fetch now" in the UI. Row 3 uses the flag.
   upstream for that pull. Offline installs still work because everything an assigned host needs was prefetched.
 - Anything outside the allow-list returns 404.
 
-**Utility OSes** (D7, D18). Versions are **pinned in the compiled-in catalog**. Each entry carries:
-- the artifact URL;
-- the expected sha256, computed by `task catalog:pin`, which verifies the upstream GPG signature where one exists;
-- the boot recipe;
-- for ISO/zip containers, the files to extract.
+**Utility OSes (M2)** (D7, D18). Versions are **pinned in the compiled-in catalog**. The catalog holds D7's verifiable 7:
+memtest86+, SystemRescue, Clonezilla, GParted, ShredOS, grml and the UEFI Shell (arm64: memtest86+, grml and the UEFI
+Shell). An entry is keyed by `(entry, arch)` and carries:
+- one or more upstream objects, each with an `https` URL, a pinned size and sha256, and a container type (`raw`, `zip` or
+  `iso`);
+- the files to extract, each with a path, size and sha256;
+- a signature reference: a detached signature plus a signer fingerprint, or an explicit **TOFU mark** where upstream
+  publishes nothing verifiable (memtest86+, ShredOS and the UEFI Shell);
+- its support per `(arch, platform)`, and the boot recipe;
+- a **pin id**: the first 12 hex characters of the sha256 over the entry's canonical pin record (every object URL, size
+  and hash, and every file path, size and hash). Tags, spool names and `/u/` content are addressed by it, so a second
+  stage never mixes pins.
 
-At runtime the container's hash is checked, then only the named files are extracted in pure Go: `archive/zip`, plus a
-pinned, cgo-free ISO9660 reader the plan names.
-- The UEFI Shell is verified by its pinned hash alone.
-- Alpine aarch64 also pins its apk subset: the dependency closure is resolved at pin time against the signed `APKINDEX`,
-  and `zfs-lts` matches the netboot kernel.
-- SystemRescue boots with `archiso_pxe_http` (S5 §6).
-- Utility second-stage fetches (squashfs, modloop, apk) use **plain HTTP** artifact routes. Their integrity comes from the
-  pinned hashes, and the provisioning VLAN is the trusted zone (§6).
+`task catalog:pin` fixes every value. It runs inside a pinned container, verifies each object (the GPG signature bound to
+the fingerprint committed in the repo, which must come from a source separate from the download host) before parsing
+it, and refuses an object whose URL, or any redirect target, cannot negotiate TLS 1.3. A key that cannot be
+authenticated stops that entry; it never falls back to TOFU. ShredOS boots interactive and no recipe contains
+`autonuke` (CI checks), so no utility boot wipes a disk without someone at the console.
 
-**Serving artifacts.** Plain HTTP and HTTPS reads of complete blobs by stable path, through `http.ServeContent`, with
-`Range` support. HTTP-boot clients use `/tftp/<arch>/snp.efi`, the path the vendored proxy hands out (gate 2).
+**Fetching (M2).** The fetcher runs in `serve` only, polls every 10 s, and runs one fetch at a time, armed boot-nexts
+first. Each `utility_cache` transition is a conditional update, and every (state, event) pair not listed is a no-op:
+- `wanted` → `fetching` when the fetcher claims it → `ready` once the push and tag are done and every layer's size is
+  checked.
+- An **integrity error** (wrong size or hash, a GPG or path violation, a redirect to a non-`https` URL) moves the row to
+  `broken`, deletes the spool, and compare-and-clears every `boot_next` naming the entry (`broken`).
+- Any other error (network, any unexpected HTTP status, local I/O, disk full) moves the row to `failed`, with backoff from
+  1 min doubling to 1 h. The 10th failure moves it to `broken`.
+- An admin action (`boot-next set` or `utility fetch`) moves `failed` or `broken` back to `wanted` and resets the
+  attempts. Row 3 never resets backoff or re-arms `broken`, so a held machine re-chaining every 30 s cannot cause a
+  refetch loop.
+- A `ready` row whose layer is found missing or wrong-sized goes back to `wanted` (logged at Error).
+
+Downloads go to `<data>/spool/<pin>-<n>`. They resume with `Range` plus `If-Range` and only a strong ETag kept in a
+sidecar file; a weak or absent ETag, or a `200` in reply to a range request, restarts from zero. Bytes beyond the pinned
+size are refused, and the pinned hash is the authority whichever mirror answers. The HTTP client has no total timeout, a
+60 s idle deadline, a **TLS 1.3 minimum** (go-standards §15.1; no deviation), at most 5 `https`-only redirects, and user
+agent `hephaestus/<version>`. A redirect to a mirror that offers only TLS 1.2 fails that attempt as an ordinary
+retryable error. Before extraction the object's size and sha256 must match; extraction then takes only the named files
+(no absolute paths, no `..`, no links followed), each capped at its pinned size and checked against its sha256, in pure
+Go: `archive/zip`, tar+gzip, and a pinned, cgo-free ISO9660 reader (the plan names it). Each file is pushed as a blob,
+with one manifest per `(entry, arch, pin)` of artifact type `application/vnd.hephaestus.utility.v1`, tagged
+`utility/<entry>-<arch>:<pin>`.
+- SystemRescue boots through its `archiso_pxe_http` hook: `archisobasedir=sysresccd ip=dhcp archiso_http_srv=<http base ending in />` (M2 design §5.2).
+- Utility second-stage fetches (squashfs, modloop, apk) use **plain HTTP** artifact routes, addressed by IP rather than
+  name (live-boot's `fetch=` accepts an IP only, and in proxy mode the name's `:80` is the proxy). Their integrity comes
+  from the pinned hashes, and the provisioning VLAN is the trusted zone (§6).
+- **Alpine aarch64** (D18) is a follow-up after M2, behind a spike. The owner's trust decision for it, option A, stands:
+  a snapshot taken at first fetch, verified against Alpine's apk signing keys pinned in the binary. `zfs-lts` is out of
+  v1: the netboot kernel can never match the repository's.
+
+**Serving artifacts.** Complete blobs are read by stable path through `http.ServeContent`, with `Range` support.
+- **Utility artifacts (M2)** are served **only over plain HTTP**, at `GET /u/{entry}/{arch}/{version}/{path...}`, under
+  the subnet guard. `{version}` must equal the catalog version. The route resolves `utility/<entry>-<arch>:<current pin>`,
+  checks the file's blob size and serves it with the blob digest as ETag. It uses the idle-deadline writer, not the
+  one-minute `WriteTimeout`, and anything unknown returns 404.
+- Talos boot assets (M3) are read over plain HTTP and HTTPS.
+- HTTP-boot clients use `/tftp/<arch>/snp.efi`, the path the vendored proxy hands out (gate 2); it stays on both muxes.
 
 **Pins and GC.**
-- **Pinned**:
-  - every tuple and installer index used by a machine in `assigned`, `installing`, `install-unconfirmed` or `installed`,
-    or `cordoned` with one of those as its prior state;
-  - fetched utility entries.
-
-  The earlier "newest 3 minors" pin is dropped: it had no v1 consumer (gate 3).
-- **GC**: untag unpinned, then `Store.GC()`. GC takes the store's write lock, which blocks **serving** as well as fetching
-  (gate 3). So it runs only in a quiet window: no prefetch, mirror fetch or artifact response active for 5 minutes, and no
-  machine in `assigned` or `installing`. Otherwise it is rescheduled.
+- **Pinned** (M2): fetched utility entries at the catalog's current pin.
+- **Pinned** (M3): every tuple and installer index used by a machine in `assigned`, `installing`, `install-unconfirmed` or
+  `installed`, or `cordoned` with one of those as its prior state. The earlier "newest 3 minors" pin is dropped: it had
+  no v1 consumer (gate 3).
+- **GC, in M2**: once at startup, after reconciliation, untag every `utility/*` tag that is not at a current pin, then run
+  `Store.GC()`. oras-go spares unreachable blobs younger than an hour, and nothing is being served yet. The untag is
+  scoped to `utility/`, so M3's pins stay additive. No GC runs at runtime in M2, so its garbage only appears across
+  restarts.
+- **GC, runtime (M3)**: untag unpinned, then `Store.GC()`. GC takes the store's write lock, which blocks **serving** as
+  well as fetching (gate 3). So it runs only in a quiet window: no prefetch, mirror fetch or artifact response active for
+  5 minutes, and no machine in `assigned` or `installing`. Otherwise it is rescheduled.
 
 ### 5.7 UI
 
@@ -565,16 +646,18 @@ Per WL:504-543:
 - **Admin listener.** On the management address only. The full set below is the target; M1 builds the part marked (M1) and
   later milestones add the rest alongside the feature each item reports on (store: M2; git, secrets, configs: M3).
   - `/healthz`.
-  - `/readyz`: migrations applied, store readable, certificate valid; fails while draining. (M1: database ping, no
+  - `/readyz`: migrations applied, store readable (M2), certificate valid; fails while draining. (M1: database ping, no
     pending migrations and, in file mode, `tls:certificate`, which fails once the served leaf has expired; proxy mode
-    has no certificate check, since the proxy holds the certificate; the store check arrives with the store.)
-  - `/health` (health+json): version, DB ping, migrations, disk and store bytes, git fetch age, secret-cache age and
+    has no certificate check, since the proxy holds the certificate; the store check arrives with the store, in M2.)
+  - `/health` (health+json): version, DB ping, migrations, disk and store bytes (M2: `store:readable`, critical, and
+    `store:bytes`), git fetch age, secret-cache age and
     `incomplete` flag, certificate expiry, 1Password reachability as `warn`. (M1: version, uptime, lifecycle state, DB
     ping, migrations, data-dir free space with a warning below 10%, and in file mode `tls:expiry`, which warns under 14
     days; no store, git or secret items yet.)
   - `/metrics`: request RED, build info, runtime, boots by decision, configs served and refused, prefetch status, store
     bytes, verify failures, certificate days left, 1Password reads. (M1: request RED, build info, runtime, boots by
-    decision, alerts, discovery reports, and in file mode certificate days left and certificate reload failures.)
+    decision, alerts, discovery reports, and in file mode certificate days left and certificate reload failures. M2 adds
+    `hephaestus.utility.fetch.bytes`, `hephaestus.utility.fetch.failures{class}` and `hephaestus.utility.boots{entry}`.)
 - **Timeouts.** Per-route deadlines with `http.ResponseController`. Artifact, blob and SSE routes use idle timeouts
   instead of fixed write deadlines. Shutdown stops proxyDHCP first, then drains the boot servers and later the admin
   server against one shared deadline, a configurable grace (default 60 s) counted from when draining starts, so a stop
@@ -685,8 +768,8 @@ Per WL:504-543:
   2. `isset ${ntp} && ntp ${ntp} ||`. The iPXE setting is `ntp` (`net/udp/ntp.c:282`, verified); unknown names expand
      silently to empty (gate 3).
   3. `chain http://${proxydhcp/next-server}/start?uuid=${uuid}&mac=${net${idx}/mac:hexhyp}&arch=${buildarch}&…`.
-  4. `/start` answers a **static** script, `chain https://<name>/boot?` with the same iPXE variables (no request text
-     echoed).
+  4. `/start` answers a **static** script, `chain https://<name>/boot?` with the same iPXE variables, plus
+     `platform=${platform}` (no request text echoed).
   5. Per-interface retry and Ctrl-B escape, as booter does (S2 §2.3).
   6. When retries are exhausted: **`exit`, never `reboot`.**
   7. When a chained script returns (e.g. after row 4 or 6 `exit`), the embedded script itself `exit`s, as booty's
@@ -739,7 +822,7 @@ Per WL:504-543:
 
     The peer's own address is never used as the client on the proxy listener, and `Forwarded` and `X-Real-IP` are not read.
   - **Refusal status.** The M1 boot routes (`/start`, `/boot`, `/discover`, artifacts) answer an off-subnet source with
-    403. `/config` and `/v2/` (M3 and M2) must answer 404 to an off-subnet source, as §5.4 and §5.6 require of every
+    403. `/config` and `/v2/` (both M3) must answer 404 to an off-subnet source, as §5.4 and §5.6 require of every
     refusal on those routes, so the guard they sit behind must not answer 403 for them.
   - **TFTP** (UDP) serves only peers inside the subnet, and refuses a request that does not name its peer. The check is
     on the claimed source address, which an attacker on the same L2 can forge; that is inside the accepted threat model
@@ -756,6 +839,11 @@ Per WL:504-543:
 
   There is **no source-IP binding**: Talos may fetch the config from a different NIC than iPXE used (gate 2), and on a
   trusted L2 IPs can be spoofed anyway.
+- **Control channel** (M2). The admin CLI (`boot-next`, `utility`) is a control channel authorized by shell access to the
+  host: it runs inside the container and writes the database directly. No control endpoint is reachable over the network,
+  and the admin listener stays read-only.
+- **Utility serving** (M2) is plain HTTP on the trusted VLAN. Every byte served was checked against a hash pinned in the
+  binary, so integrity comes from the pins, not from the transport (§5.6).
 - **Alerts**: §5.9.
 - **Exposure.**
   - Talos prints the full config URL on its console (`platform/metal/metal.go:69`), and the URL sits in `/proc/cmdline`.
@@ -809,9 +897,17 @@ Per WL:504-543:
    boots QEMU VMs on a bridged test network with a test DHCP and DNS server: amd64 UEFI, amd64 BIOS and arm64 UEFI
    through hephaestus in `file` mode, then amd64 UEFI again with hephaestus behind Caddy in `proxy` mode. The iPXE is the
    test-CA variant. It covers iPXE → `/start` → `/boot` → `/discover` and the hold for M1, with the checks in
-   `test/e2e/README.md`. Approval, the install script and the kernel and initramfs fetch arrive with M2 and M3. Talos's own
+   `test/e2e/README.md`. Approval, the install script and the kernel and initramfs fetch arrive with M3. Talos's own
    HTTPS config fetch cannot trust the test CA, so it is covered by lab test 3, not e2e. It is not part of `task ci`: where
    it runs in CI (a Linux CI runner once a remote exists, or a Linux host) is a run-contract item.
+   - **Utility cases (M2).** They run against a local fake upstream, with the e2e image built from a catalog overlaid
+     by test entries that point at it (no build tag, and no change to the production Dockerfile):
+     - an EFI-chain entry, shaped like the UEFI Shell and delivered in a zip, on amd64 UEFI and arm64 UEFI;
+     - a kernel + initrd + squashfs entry on amd64 UEFI, amd64 BIOS and arm64 UEFI, delivered as an ISO for one arch and a
+       zip for another. Its initrd fetches the second stage by IP from `/u/…` using the expanded `BOOTIF` and prints a
+       marker on the serial console; on BIOS the evidence is the second-stage request in the server log;
+     - a UEFI-only entry set as boot-next on the BIOS VM, which is cleared with `unsupported`, after which the VM proceeds
+       to row 7.
 
 ## 8. Left to the builder
 
@@ -826,7 +922,7 @@ Per WL:504-543:
 2. Multiple clusters are supported.
 3. v1 control is: WoL, utility boot-next, reinstall, abort, mark installed, cordon, unassign, unbind/rebind.
 4. Install completion is confirmed by the admin (`install-unconfirmed`), not guessed.
-5. Utility versions are pinned in the binary; upstream bumps ship as releases.
+5. Utility versions are pinned in the binary, each entry with a pin id; upstream bumps ship as releases.
 6. The UI uses shadcn-templ default variables until design-tokens' shadcn output exists.
 7. Cut-over and adoption follow §5.2, including `local-only`.
 8. Schematics are resolved at approval; the mirror patch lives in the cluster definition and follows §5.6's routing contract.
@@ -879,8 +975,10 @@ Per WL:504-543:
 4. Installer pulls through the mirror with the §5.6 routing contract: the requests containerd sends with `overridePath`;
    signature verification; the 404-miss fallback; maintenance-mode timing of `RegistryMirrorConfig` (S9 §4.3).
 5. Golden Topf parity on the migrated home-ops repo, including duplicate `machine.files` (S11).
-6. Utility-OS second stages (SystemRescue `archiso_pxe_http`, live-boot `fetch=`, Alpine `modloop`/`alpine_repo`) over
-   plain HTTP from hephaestus.
+6. Utility-OS second stages (SystemRescue `archiso_http_srv=`, live-boot `fetch=`, and Alpine `modloop`/`alpine_repo` once
+   the Alpine follow-up lands) over plain HTTP from hephaestus. M2 extends this to one real boot per catalog entry on
+   matching hardware, recorded in `docs/lab/`: memtest86+ on BIOS (until then unsupported there), and each OS honouring
+   `BOOTIF`, the NIC the machine booted from. `task e2e` proves only that iPXE expands it.
 7. The container's minimum capabilities on TrueNAS with host networking. `task e2e` covers the capability part: the image
    binds 67, 69, 80, 443 and 4011 as UID 65532 under `--cap-drop ALL --cap-add NET_BIND_SERVICE --sysctl
    net.ipv4.ip_unprivileged_port_start=1024` (the sysctl matters: Docker sets it to 0 in container namespaces, which lets any
