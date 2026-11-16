@@ -1,5 +1,6 @@
 {
   "admin": {"disabled": true},
+  "logging": {"logs": {"default": {"level": "DEBUG"}}},
   "apps": {
     "http": {"servers": {"boot": {
       "listen": [":443"],

@@ -31,9 +31,7 @@ tasks:
     cmds:
       - task: go:build
   e2e:
-    desc: QEMU end-to-end boot test in colima's Linux Docker (about 3 min cold; design §7.6); not part of ci
-    requires:
-      vars: [DOCKER_HOST]
+    desc: QEMU end-to-end boot test in a Linux Docker daemon such as colima (about 2.5 min with the layer cache warm; design §7.6); not part of ci
     cmds:
       - sh test/e2e/run.sh
   ipxe:image:

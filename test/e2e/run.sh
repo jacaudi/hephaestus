@@ -1,21 +1,34 @@
 #!/bin/sh
-# QEMU end-to-end test (design §7 criterion 6). Run it as `task e2e`; it needs DOCKER_HOST and nothing else
-# on the host (see test/e2e/README.md). Boots amd64 UEFI, amd64 BIOS and arm64 UEFI VMs through hephaestus
-# in file mode, then amd64 UEFI again with hephaestus behind Caddy. Prints a PASS or FAIL line per check,
-# writes every log to build/e2e/<UTC timestamp>/, and removes everything it created on any exit.
+# QEMU end-to-end test (design §7 criterion 6). Run it as `task e2e`; it needs a reachable Docker daemon
+# (colima: set DOCKER_HOST) and nothing else on the host (see test/e2e/README.md). Boots amd64 UEFI, amd64 BIOS
+# and arm64 UEFI VMs through hephaestus in file mode, then amd64 UEFI again with hephaestus behind Caddy.
+# Prints a PASS or FAIL line per check and writes every log to build/e2e/<UTC timestamp>/. On any exit it
+# removes the heph-e2e-* containers, network and volume, and the temporary source copy, certificates and
+# test-CA build outputs that this run created. The names, network and subnet are fixed: one run at a time.
 set -eu
 
 root=$(cd "$(dirname "$0")/../.." && pwd -P)
 cd "$root"
-: "${DOCKER_HOST:?set DOCKER_HOST, for colima: unix://\$HOME/.colima/default/docker.sock}"
-export DOCKER_HOST
+if ! docker info >/dev/null 2>&1; then
+	echo "e2e: cannot reach a Docker daemon. With colima: export DOCKER_HOST=unix://\$HOME/.colima/default/docker.sock" >&2
+	exit 1
+fi
 
 # --- pins and topology (the spike's, design §7) ---
 # Caddy is pinned by the digest of its multi-arch index (caddy:2 on 2026-11-15); the toolbox pins its own base.
 CADDY_IMAGE=docker.io/library/caddy:2@sha256:4e2425f6009577e7c651010f16679c28f7d12df3e7b1914f941a7a3370746b3c
 TOOLS=hephaestus-e2e-qemu:local
 IMAGE=hephaestus:e2e
-PLATFORM=linux/arm64 # same as `task ipxe:build:testca` and image:build; colima's native arch
+# The Docker daemon's own architecture, so images run natively. Only colima on arm64 has been tested; `task
+# ipxe:build:testca` still builds iPXE in a linux/arm64 builder (taskfile.yml).
+case $(docker info --format '{{.Architecture}}') in
+aarch64 | arm64) PLATFORM=linux/arm64 ;;
+x86_64) PLATFORM=linux/amd64 ;;
+*)
+	echo "e2e: unsupported Docker architecture: $(docker info --format '{{.Architecture}}')" >&2
+	exit 1
+	;;
+esac
 NET=heph-e2e
 VOL=heph-e2e-data
 GATEWAY=10.99.0.1
@@ -33,6 +46,8 @@ certs=build/e2e/run/certs
 testca_pem=build/ipxe/out/e2e-ca.pem
 testca_dir=build/ipxe/out/testca
 src=
+own_pem=no # whether this run created the test-CA files under build/ipxe/out, which it then removes
+own_testca=no
 heph_mode='file'
 passes=0
 fails=0
@@ -64,10 +79,14 @@ jn() {
 }
 sqlite_q() { docker run --rm --user 65532:65532 -v "$VOL":/d "$TOOLS" sqlite3 -batch -cmd '.timeout 5000' /d/hephaestus.db "$1"; }
 sidecar() { docker run --rm --network container:heph-e2e-hephaestus "$TOOLS" "$@"; }
+# hold_count prints the hold counter, or nothing and fails when the metrics cannot be read (so a failed scrape is never a 0).
 hold_count() {
-	sidecar curl -fsS http://127.0.0.1:9090/metrics |
+	m=$(sidecar curl -fsS http://127.0.0.1:9090/metrics) || return 1
+	printf '%s\n' "$m" |
 		awk '/^hephaestus_boot_decisions_total\{/ && /action="hold"/ && /decision_row="7"/ {s += $NF} END {print s + 0}'
 }
+# rose <before> <after>: both counters were read and the second is at least one higher.
+rose() { [ -n "$1" ] && [ -n "$2" ] && [ "$(($2 - $1))" -ge 1 ]; }
 mark() { docker logs "$1" 2>&1 | wc -l | tr -d ' '; }
 since() { docker logs "$1" 2>&1 | tail -n +$(($2 + 1)); }
 
@@ -90,8 +109,8 @@ cleanup() {
 	docker volume rm "$VOL" >/dev/null 2>&1
 	[ -n "$src" ] && rm -rf "${src:?}"
 	rm -rf "${certs:?}"
-	rm -f "${testca_pem:?}"
-	rm -rf "${testca_dir:?}"
+	[ "$own_pem" = yes ] && rm -f "${testca_pem:?}"
+	[ "$own_testca" = yes ] && rm -rf "${testca_dir:?}"
 	if [ "$status" -eq 0 ] && [ "$fails" -gt 0 ]; then status=1; fi
 	printf 'e2e: %s passed, %s failed in %ss; logs in %s\n' "$passes" "$fails" "$(($(date +%s) - run_start))" "$out"
 	exit "$status"
@@ -151,10 +170,13 @@ seed_hold() {
 }
 
 # --- run-level checks ---
-# tls_checks <label> <ip>: TLS 1.2 is refused, and TLS 1.3 completes against the test CA with no session ticket
-# (iPXE 9261ebe hashes a NewSessionTicket sent before its Finished into the transcript and fails the handshake).
+# tls_checks <label> <ip> <container>: TLS 1.2 is refused, and TLS 1.3 completes against the test CA with no session
+# ticket (iPXE 9261ebe hashes a NewSessionTicket sent before its Finished into the transcript and fails the handshake).
+# <container> is the TLS terminator whose log must record the refused TLS 1.2 probe as exactly one handshake error. That
+# positive control is what lets the boots' "zero TLS handshake error lines" check fail: a logger that cannot print the
+# line would make it pass for any server.
 tls_checks() {
-	label=$1 ip=$2
+	label=$1 ip=$2 terminator=$3
 	probe="printf 'GET /e2e-probe HTTP/1.1\r\nHost: $FQDN\r\nConnection: close\r\n\r\n' | openssl s_client -ign_eof -connect $ip:443 -servername $FQDN -CAfile /certs/ca.pem"
 	tls12=$(docker run --rm --network "$NET" -v "$root/$certs:/certs:ro" "$TOOLS" sh -c "$probe -tls1_2 2>&1" || true)
 	printf '%s\n' "$tls12" >"$out/tls12-$label.txt"
@@ -166,6 +188,9 @@ tls_checks() {
 	# reads a post-handshake ticket, and this check would pass whether or not one was sent. The 404 proves it read.
 	check "$label: the probe read the server's response after the handshake (HTTP 404)" grep -q '^HTTP/1.1 404' "$out/tls13-$label.txt"
 	check "$label: no NewSessionTicket sent after the handshake" sh -c '! grep -qi "New Session Ticket" "$1"' _ "$out/tls13-$label.txt"
+	docker logs "$terminator" >"$out/$terminator-probe.log" 2>&1 || true
+	n=$(grep -c 'TLS handshake error' "$out/$terminator-probe.log" || true)
+	check "$label: positive control: $terminator logged exactly one TLS handshake error, for the TLS 1.2 probe (found ${n:-0})" test "${n:-0}" -eq 1
 }
 
 # listens <tcp|udp> <port> <ss -lnut output>: the output has a listener on the port (column 5 is the local address).
@@ -203,7 +228,7 @@ boot() {
 	step "boot $name ($fw, $arch, $mode)"
 	hm=$(mark heph-e2e-hephaestus)
 	[ "$mode" = proxy ] && cm=$(mark heph-e2e-caddy)
-	hold0=$(hold_count)
+	hold0=$(hold_count) || hold0=
 	: >"$serial"
 	docker exec heph-e2e-qemu /e2e/run-vm.sh "$name" "$fw" "$mac" "$uuid" "$((BOOT_TIMEOUT + 10))" >"$out/$name.vm.log" 2>&1 &
 	vm=$!
@@ -288,8 +313,8 @@ boot() {
 	row=$(sqlite_q "SELECT m.state||'|'||m.junk||'|'||m.arch||'|'||m.smbios_uuid FROM machines m JOIN machine_macs mm ON mm.machine_id = m.id WHERE lower(mm.mac) = lower('$mac')")
 	printf '%s\n' "$row" >"$out/$name.row.txt"
 	check "$name: sqlite has exactly one row for $mac: discovered|0|$arch|$uuid" test "$row" = "discovered|0|$arch|$uuid"
-	hold1=$(hold_count)
-	check "$name: hephaestus_boot_decisions_total{action=\"hold\",decision_row=\"7\"} rose ($hold0 -> $hold1)" ge "$((hold1 - hold0))" 1
+	hold1=$(hold_count) || hold1=
+	check "$name: hephaestus_boot_decisions_total{action=\"hold\",decision_row=\"7\"} rose (${hold0:-unread} -> ${hold1:-unread})" rose "$hold0" "$hold1"
 }
 
 # --- main ---
@@ -304,6 +329,8 @@ step "test CA and leaf certificate"
 docker run --rm --user "$(id -u):$(id -g)" -v "$root/$certs:/certs" -v "$root/test/e2e:/e2e:ro" "$TOOLS" sh /e2e/gen-certs.sh >"$out/gen-certs.log" 2>&1
 
 step "iPXE built to trust only the test CA"
+[ -e "$testca_pem" ] || own_pem=yes
+[ -e "$testca_dir" ] || own_testca=yes
 cp "$certs/ca.pem" "$testca_pem"
 "$TASK" ipxe:build:testca TEST_CA="$testca_pem" >"$out/ipxe-build.log" 2>&1 || { tail -n 30 "$out/ipxe-build.log"; exit 1; }
 for f in undionly.kpxe snp-amd64.efi snp-arm64.efi roots.pem; do
@@ -312,12 +339,17 @@ done
 
 step "hephaestus:e2e from a temporary copy of the tracked tree, with the test-CA binaries overlaid"
 # The repository tree and the production Dockerfile never hold test-CA binaries: the overlay lives only in this copy.
+# sh has no pipefail, so the archive goes through a file and each tar's status is checked (set -e): a tracked file that
+# is missing from the working tree fails the run instead of building an image without it.
 src=$(mktemp -d "${TMPDIR:-/tmp}/heph-e2e-src.XXXXXX")
-git ls-files -z | tar --null -T - -cf - | tar -xf - -C "$src"
-cp "$testca_dir"/* "$src/internal/boot/ipxe/bin/"
+mkdir "$src/tree"
+git ls-files -z >"$src/files"
+tar --null -T "$src/files" -cf "$src/tree.tar"
+tar -xf "$src/tree.tar" -C "$src/tree"
+cp "$testca_dir"/* "$src/tree/internal/boot/ipxe/bin/"
 docker buildx build --platform "$PLATFORM" --load -q \
 	--build-arg VERSION=e2e --build-arg COMMIT="$(git rev-parse --short HEAD)" --build-arg DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-	-t "$IMAGE" "$src" >"$out/image-build.log" 2>&1 || { tail -n 30 "$out/image-build.log"; exit 1; }
+	-t "$IMAGE" "$src/tree" >"$out/image-build.log" 2>&1 || { tail -n 30 "$out/image-build.log"; exit 1; }
 rm -rf "${src:?}"
 src=
 
@@ -331,7 +363,7 @@ start_hephaestus file
 check "seed: unknown_action = hold" seed_hold
 
 step "run-level checks (file mode)"
-tls_checks file "$HEPH_IP"
+tls_checks file "$HEPH_IP" heph-e2e-hephaestus
 capability_checks
 
 boot ovmf ovmf 52:54:00:e2:e0:03 amd64 snp.efi snp.efi file
@@ -347,7 +379,7 @@ start_hephaestus proxy
 docker run -d --name heph-e2e-caddy --network "$NET" --ip "$CADDY_IP" -v "$root/test/e2e:/caddy:ro" -v "$root/$certs:/certs:ro" \
 	"$CADDY_IMAGE" caddy run --config /caddy/caddy.json >/dev/null
 wait_for "Caddy listening" 30 sh -c 'docker logs heph-e2e-caddy 2>&1 | grep -q "serving initial configuration"'
-tls_checks proxy "$CADDY_IP"
+tls_checks proxy "$CADDY_IP" heph-e2e-caddy
 code=$(box curl -s -o /dev/null -w '%{http_code}' "http://$HEPH_IP:8443/boot" || true)
 check "proxy: a direct request from a non-proxy peer gets 403 (got ${code:-none})" test "$code" = 403
 boot ovmf-proxy ovmf 52:54:00:e2:e0:06 amd64 snp.efi snp.efi proxy

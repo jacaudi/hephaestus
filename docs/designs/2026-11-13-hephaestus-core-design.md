@@ -882,8 +882,9 @@ Per WL:504-543:
 6. Utility-OS second stages (SystemRescue `archiso_pxe_http`, live-boot `fetch=`, Alpine `modloop`/`alpine_repo`) over
    plain HTTP from hephaestus.
 7. The container's minimum capabilities on TrueNAS with host networking. `task e2e` covers the capability part: the image
-   binds 67, 69, 80, 443 and 4011 as UID 65532 under `--cap-drop ALL --cap-add NET_BIND_SERVICE`, and does not exec
-   under `--cap-drop ALL` alone. It does not cover `no-new-privileges`, because Docker grants the capability directly,
+   binds 67, 69, 80, 443 and 4011 as UID 65532 under `--cap-drop ALL --cap-add NET_BIND_SERVICE --sysctl
+   net.ipv4.ip_unprivileged_port_start=1024` (the sysctl matters: Docker sets it to 0 in container namespaces, which lets any
+   user bind low ports and would hide the capability), and does not exec under `--cap-drop ALL` alone. It does not cover `no-new-privileges`, because Docker grants the capability directly,
    so it does not isolate the file capability. Still lab work: whether BuildKit keeps file capabilities, TrueNAS
    `no-new-privileges` and its defaults; the dedicated VLAN interface and its primary address; restricting the GUI;
    symmetric routing for admin UI traffic.
