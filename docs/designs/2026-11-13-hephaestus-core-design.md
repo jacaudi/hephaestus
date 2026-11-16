@@ -638,8 +638,8 @@ Per WL:504-543:
       goes through the source-subnet guard and the `/discover` rate limiter (§6). The proxy must replace or append to a
       client-supplied `X-Forwarded-For`, never pass it through. Caddy and Traefik do by default; Envoy needs
       `use_remote_address: true` with `xff_num_trusted_hops: 0`, because its default (`false`) leaves the header
-      untouched. The proxy must also have TLS session tickets off (see the next bullet); Caddy's `apps.tls.session_tickets`
-      has `disabled: true` in its JSON config, and the Caddyfile has no equivalent.
+      untouched. The proxy must also have TLS session tickets off (see the next bullet); in Caddy, set
+      `apps.tls.session_tickets.disabled: true` in its JSON config, which the Caddyfile has no equivalent for.
     - **TLS session tickets are off** on the boot HTTPS listener (`SessionTicketsDisabled: true`), and must be off at a
       proxy. Go sends its NewSessionTicket before it reads the client Finished, which RFC 8446 §4.6.1 allows, but iPXE
       `9261ebe` hashes any handshake message that arrives before its own Finished into the transcript, ticket included.
@@ -861,8 +861,9 @@ Per WL:504-543:
 1. iPXE `9261ebe` (amd64 UEFI and BIOS, arm64 on the MS-R1) completes TLS 1.3 with the Go server, and with the reverse
    proxy in `proxy` mode, and validates an ISRG-rooted chain (Let's Encrypt's default) with internet egress blocked. On
    failure, fall back to v2.0.0 and TLS 1.2. Finding, 2026-11-16: the QEMU e2e spike showed that `9261ebe` cannot finish a
-   TLS 1.3 handshake with a server that sends a session ticket early (§5.10, D26), so tickets are now off on the listener
-   and at the proxy. QEMU firmware (amd64 UEFI and BIOS, arm64 UEFI) now covers the handshake in file mode, and Caddy covers proxy mode. Still lab work:
+   TLS 1.3 handshake with a server that sends a session ticket early (§5.10, D26), so tickets are off on the hephaestus
+   listener, and the proxy is documented as requiring them off. The spike verified the handshake on QEMU firmware (the
+   repeatable harness is `task e2e`). Still lab work:
    physical NIC firmware, and the ISRG chain with internet egress blocked.
 2. `${proxydhcp/next-server}` on the MS-R1 shim path; `undionly.kpxe` size with HTTPS enabled.
 3. Talos `talos.config` over HTTPS with ticket consumption; what Talos does after its 3 h retry window (unverified, S4 §5);

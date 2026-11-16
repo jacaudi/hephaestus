@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -346,11 +347,27 @@ func TestRunServe_ServesAndDrains(t *testing.T) {
 	}
 }
 
+// ticketCounter is a client session cache that counts the sessions stored in it.
+// A TLS 1.3 client stores one for every NewSessionTicket it receives; a nil
+// state is how the cache is told to drop an entry, so it is not counted.
+type ticketCounter struct {
+	tls.ClientSessionCache
+
+	stored atomic.Int32
+}
+
+func (c *ticketCounter) Put(key string, cs *tls.ClientSessionState) {
+	if cs != nil {
+		c.stored.Add(1)
+	}
+	c.ClientSessionCache.Put(key, cs)
+}
+
 // TestRunServe_NoSessionTickets pins that the boot HTTPS listener issues no TLS
 // session tickets. iPXE 9261ebe hashes a NewSessionTicket that arrives before
 // its own Finished into the handshake transcript, so the handshake fails against
-// a server that sends one; a client that holds a session cache can resume only
-// if the server issued a ticket.
+// a server that sends one. The client counts the tickets it receives, and a
+// second connection that resumes would show one was issued.
 func TestRunServe_NoSessionTickets(t *testing.T) {
 	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 
@@ -361,10 +378,11 @@ func TestRunServe_NoSessionTickets(t *testing.T) {
 
 	// One client, so both connections share the session cache. Its transport
 	// keeps no connection alive, so the second request dials afresh.
+	cache := &ticketCounter{ClientSessionCache: tls.NewLRUClientSessionCache(4)}
 	tlsClient := testClient(&tls.Config{
 		InsecureSkipVerify: true,
 		MinVersion:         tls.VersionTLS13,
-		ClientSessionCache: tls.NewLRUClientSessionCache(4),
+		ClientSessionCache: cache,
 	})
 	for i := range 2 {
 		boot := get(t, tlsClient, deps.httpsURL()+"/boot?"+bootQuery)
@@ -373,6 +391,9 @@ func TestRunServe_NoSessionTickets(t *testing.T) {
 		}
 		if boot.resumed {
 			t.Errorf("connection %d: the handshake resumed a session, so the server issued a ticket", i+1)
+		}
+		if n := cache.stored.Load(); n != 0 {
+			t.Errorf("after connection %d: the client received %d session tickets, want 0", i+1, n)
 		}
 	}
 
