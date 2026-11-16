@@ -83,3 +83,45 @@ Commit: `test: task e2e boots amd64 UEFI, BIOS and arm64 UEFI through hephaestus
 ## Review Focus
 - Task 1: the test proves that no session ticket is issued, not merely that a handshake succeeds.
 - Task 2: no assertion can pass vacuously (an empty log must FAIL). Cleanup runs on failure and on Ctrl-C. No test-CA binary reaches the repo tree or the production image. Every pin is real.
+
+### Task 3: File-mode certificates must chain to a root the embedded iPXE trusts
+Kind: rewrite
+
+Owner request (2026-11-16): catch at startup and on reload a deployed certificate that iPXE would reject. The common mistakes are a leaf-only `cert.pem` instead of `fullchain.pem`, or a certificate from a CA the binaries do not trust. Today hephaestus reports ready and every boot fails at the TLS handshake. **Runs before Task 2**, because the e2e overlay must carry the test CA's root file.
+
+**Files:**
+- Create: `internal/boot/ipxe/bin/roots.pem`.
+- Modify: `build/ipxe/build.sh`, `internal/boot/ipxe/ipxe.go`, `internal/boot/ipxe/ipxe_test.go`, `internal/tlscert/loader.go`, `internal/tlscert/loader_test.go`, `internal/tlscert/tlscerttest/selfsigned.go`, `cmd/hephaestus/serve.go`, `cmd/hephaestus/serve_test.go`, `README.md`, `docs/designs/2026-11-13-hephaestus-core-design.md`, `docs/research/booty-slim/README.md`.
+
+Decisions:
+- **`roots.pem`** is a PEM bundle of exactly the certificates the binaries were built with (`CERT=`/`TRUST=`), in `roots.txt` order.
+  - `build.sh shipped` writes `internal/boot/ipxe/bin/roots.pem` by concatenating the downloaded, sha256-verified root files.
+  - `build.sh testca` writes `build/ipxe/out/testca/roots.pem` as a copy of the test CA PEM.
+  - For the binaries already committed, produce `bin/roots.pem` now without rebuilding them: in the pinned builder image, fetch each `roots.txt` URL, verify its file sha256 and DER fingerprint as build.sh does, and concatenate the files in order. `SHA256SUMS` and the binaries do not change.
+- **`internal/boot/ipxe`:** add `//go:embed bin/roots.pem` and `func TrustedRoots() ([]*x509.Certificate, error)`, which parses every PEM block. It returns an error on zero certificates or a non-CERTIFICATE block.
+- **ipxe tests:** the DER sha256 of each `TrustedRoots()` cert equals the existing `isrg()` oracle, in order (so `roots.pem` == `roots.txt` == BUILDINFO trust lines), and every cert has `IsCA`.
+- **`internal/tlscert`:** add `func WithRoots(roots []*x509.Certificate) Option`.
+  - When roots are set, `read()` runs after the existing name, validity and expiry checks. It calls `leaf.Verify(x509.VerifyOptions{DNSName: fqdn, Roots: <pool of roots>, Intermediates: <pool of pair.Certificate[1:] parsed>, CurrentTime: now(), KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}})`.
+  - On failure: `certificate chain does not reach a root the embedded iPXE trusts (serve the full chain, e.g. fullchain.pem): <err>`.
+  - At startup that error stops `NewLoader`. On reload the current pair keeps serving, the failure counter increments and the handler is called, exactly like any failed reload.
+  - Without `WithRoots` the check is skipped.
+- **`tlscerttest`:** add `func WriteChain(t testing.TB, dir, fqdn string, notBefore, notAfter time.Time, withIntermediate, includeIntermediate bool) (certFile, keyFile string, root *x509.Certificate)`. It creates a fresh root CA (and an intermediate when asked), and a leaf for `fqdn`. The cert file holds the leaf, followed by the intermediate when `includeIntermediate` is true.
+- **tlscert tests:**
+  - `TestNewLoader_ChainReachesRoot`: leaf straight from the root;
+  - `TestNewLoader_ChainWithIntermediate`: intermediate included;
+  - `TestNewLoader_MissingIntermediate`: error contains `does not reach a root the embedded iPXE trusts`;
+  - `TestNewLoader_OtherCA`: the self-signed leaf from `WriteSelfSigned`, checked against a different root;
+  - `TestRun_ReloadRejectsUntrustedChain`: the old serial keeps serving and the handler is called once.
+- **serve:**
+  - `serveDeps` gains `roots []*x509.Certificate`. RunE fills it from `ipxe.TrustedRoots()` (an error stops startup), and file mode passes `tlscert.WithRoots(deps.roots)`.
+  - Tests build `testServeConfig` with `tlscerttest.WriteChain` and pass its root in `deps.roots`.
+  - `TestRunServe_UntrustedChainFails`: a chain from another root makes runServe return an error containing `does not reach a root the embedded iPXE trusts`, never ready (`probeReadyz`/`requireUnanswered`).
+  - Proxy mode is unchanged: the certificate lives in the proxy, and the README already states its chain requirement.
+- **README file mode:** the file must hold the full chain (`fullchain.pem`) and reach one of the roots the embedded iPXE trusts (the four ISRG roots). hephaestus refuses an untrusted chain at startup and keeps the old certificate on a bad reload.
+- **Design:** §5.10 file-mode bullet.
+- **Research:** add `D27 — file-mode certificates are verified at load against the roots embedded in the iPXE binaries (bin/roots.pem), so a chain iPXE would reject stops startup (owner, 2026-11-16)`.
+
+Run: `rtk proxy go test ./internal/boot/ipxe/ ./internal/tlscert/... ./cmd/hephaestus/ -race -count=1`. Expected: FAIL first (undefined symbols are the RED state), then PASS.
+Run: `DOCKER_HOST=… rtk proxy task ci`. Expected: exit 0.
+Run: `DOCKER_HOST=… rtk proxy task image:build`. Expected: exit 0. Then `docker run --rm hephaestus:dev serve` still exits 1 with the config errors, and the image's embedded roots load (the startup path reaches config validation without an ipxe error).
+Commit: `feat: refuse a file-mode certificate whose chain iPXE would not trust`.
