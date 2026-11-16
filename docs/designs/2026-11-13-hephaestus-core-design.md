@@ -805,12 +805,13 @@ Per WL:504-543:
    - the **golden Topf-render parity test** (M3): hermetic fixtures (no `env`/time/random functions) whose `ref+op://`
      references resolve to fixture values. That means a stub `vals` on `PATH` for `topf render` at `70cdbc8`, and a fixture
      cache for hephaestus. The two outputs must be byte-identical.
-6. **End to end.** `task e2e` passes on Linux only (it needs tap/bridge and root). In M1 it is a placeholder that exits 1;
-   the QEMU harness arrives in a later milestone. The harness is: a QEMU test with amd64 UEFI and BIOS,
-   the test-CA iPXE variant, and a bridge plus a test DHCP server, as bootimus does. It covers iPXE → `/start` → `/boot`
-   → discovery → approval → install script → kernel and initramfs fetch. Talos's own HTTPS config fetch cannot trust the
-   test CA, so it is covered by lab test 3, not e2e. Where `task e2e` runs (a Linux CI runner once a remote exists, or a
-   Linux host) is a run-contract item.
+6. **End to end.** `task e2e` exists and runs in colima's Linux VM (Docker only; nothing else is installed on the host). It
+   boots QEMU VMs on a bridged test network with a test DHCP and DNS server: amd64 UEFI, amd64 BIOS and arm64 UEFI
+   through hephaestus in `file` mode, then amd64 UEFI again with hephaestus behind Caddy in `proxy` mode. The iPXE is the
+   test-CA variant. It covers iPXE → `/start` → `/boot` → `/discover` and the hold for M1, with the checks in
+   `test/e2e/README.md`. Approval, the install script and the kernel and initramfs fetch arrive with M2 and M3. Talos's own
+   HTTPS config fetch cannot trust the test CA, so it is covered by lab test 3, not e2e. It is not part of `task ci`: where
+   it runs in CI (a Linux CI runner once a remote exists, or a Linux host) is a run-contract item.
 
 ## 8. Left to the builder
 
@@ -869,8 +870,8 @@ Per WL:504-543:
    proxy in `proxy` mode, and validates an ISRG-rooted chain (Let's Encrypt's default) with internet egress blocked. On
    failure, fall back to v2.0.0 and TLS 1.2. Finding, 2026-11-16: the QEMU e2e spike showed that `9261ebe` cannot finish a
    TLS 1.3 handshake with a server that sends a session ticket early (§5.10, D26), so tickets are off on the hephaestus
-   listener, and the proxy is documented as requiring them off. The spike verified the handshake on QEMU firmware (the
-   repeatable harness is `task e2e`). Still lab work:
+   listener, and the proxy is documented as requiring them off. `task e2e` verifies the handshake on QEMU firmware
+   (amd64 UEFI and BIOS, arm64 UEFI; proxy mode through Caddy on amd64 UEFI). Still lab work:
    physical NIC firmware, and the ISRG chain with internet egress blocked.
 2. `${proxydhcp/next-server}` on the MS-R1 shim path; `undionly.kpxe` size with HTTPS enabled.
 3. Talos `talos.config` over HTTPS with ticket consumption; what Talos does after its 3 h retry window (unverified, S4 §5);
@@ -880,7 +881,10 @@ Per WL:504-543:
 5. Golden Topf parity on the migrated home-ops repo, including duplicate `machine.files` (S11).
 6. Utility-OS second stages (SystemRescue `archiso_pxe_http`, live-boot `fetch=`, Alpine `modloop`/`alpine_repo`) over
    plain HTTP from hephaestus.
-7. The container's minimum capabilities on TrueNAS with host networking (whether BuildKit keeps file capabilities;
-   TrueNAS `no-new-privileges`); the dedicated VLAN interface and its primary address; restricting the GUI; symmetric
-   routing for admin UI traffic.
+7. The container's minimum capabilities on TrueNAS with host networking. `task e2e` covers the capability part: the image
+   binds 67, 69, 80, 443 and 4011 as UID 65532 under `--cap-drop ALL --cap-add NET_BIND_SERVICE`, and does not exec
+   under `--cap-drop ALL` alone. It does not cover `no-new-privileges`, because Docker grants the capability directly,
+   so it does not isolate the file capability. Still lab work: whether BuildKit keeps file capabilities, TrueNAS
+   `no-new-privileges` and its defaults; the dedicated VLAN interface and its primary address; restricting the GUI;
+   symmetric routing for admin UI traffic.
 8. Backup restore on a second Linux host (success criterion 3).

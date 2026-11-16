@@ -31,11 +31,11 @@ tasks:
     cmds:
       - task: go:build
   e2e:
-    desc: QEMU end-to-end test (Linux only, design §7.6); not part of ci
+    desc: QEMU end-to-end boot test in colima's Linux Docker (about 3 min cold; design §7.6); not part of ci
+    requires:
+      vars: [DOCKER_HOST]
     cmds:
-      - |
-        echo "e2e: the QEMU harness arrives in a later milestone" >&2
-        exit 1
+      - sh test/e2e/run.sh
   ipxe:image:
     desc: Build the pinned iPXE builder image (linux/arm64)
     cmds:

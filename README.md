@@ -118,6 +118,7 @@ task ci            # fmt and tidy checks, lint, vuln, hadolint, go test -race, c
                    # Postgres integration tests, coverage gate (needs DOCKER_HOST)
 task ipxe:build    # rebuild the embedded iPXE binaries (needs DOCKER_HOST)
 task image:build   # build hephaestus:dev for linux/arm64; PLATFORM=linux/amd64 overrides (needs DOCKER_HOST)
+task e2e           # boot QEMU VMs through hephaestus, in colima; about 3 minutes, not part of ci (needs DOCKER_HOST; see test/e2e/README.md)
 ```
 
 With colima, set `DOCKER_HOST=unix:///Users/<you>/.colima/default/docker.sock`. The Dockerfile builds linux/amd64 and linux/arm64 by cross-compiling on the build platform; the final image is distroless and runs as `65532:65532`.

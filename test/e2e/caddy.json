@@ -1,0 +1,17 @@
+{
+  "admin": {"disabled": true},
+  "apps": {
+    "http": {"servers": {"boot": {
+      "listen": [":443"],
+      "automatic_https": {"disable": true},
+      "logs": {},
+      "tls_connection_policies": [{"match": {"sni": ["hephaestus.e2e.test"]}, "protocol_min": "tls1.3", "protocol_max": "tls1.3"}],
+      "routes": [{"match": [{"host": ["hephaestus.e2e.test"]}],
+                  "handle": [{"handler": "reverse_proxy", "upstreams": [{"dial": "10.99.0.10:8443"}]}]}]
+    }}},
+    "tls": {
+      "certificates": {"load_files": [{"certificate": "/certs/fullchain.pem", "key": "/certs/privkey.pem"}]},
+      "session_tickets": {"disabled": true}
+    }
+  }
+}
