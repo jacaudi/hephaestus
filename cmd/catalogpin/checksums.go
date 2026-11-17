@@ -18,6 +18,9 @@ const (
 
 	sha256HexLen = 64
 	sha1HexLen   = 40
+
+	// sectionMark opens a section header line of a checksum list.
+	sectionMark = "###"
 )
 
 // hashers computes, in one pass, the digests a download is checked with: the
@@ -42,9 +45,11 @@ func (h hashers) sum(algo string) string {
 // parseChecksums returns the lower-case digest the checksum list data gives
 // for the file name. A line is "<hex>  <name>" or "<hex> *<name>"; the name
 // may carry a leading path, of which only the last element is compared. Only
-// a digest as long as algo's counts, so one list that holds md5, sha1 and
-// sha256 sections is read for the one wanted. It returns false when no line
-// names the file, when algo is unknown, and when two lines give the file
+// a digest as long as algo's counts. A list with "### <ALGO>SUMS:" section
+// headers (Clonezilla's and GParted's hold md5, sha1, sha256, sha512, blake2
+// and blake3, and blake3 is as long as sha256) is read only in the section
+// for algo; a list without headers is read whole. It returns false when no
+// line names the file, when algo is unknown, and when two lines give the file
 // different digests.
 func parseChecksums(data []byte, algo, name string) (string, bool) {
 	var want int
@@ -56,8 +61,18 @@ func parseChecksums(data []byte, algo, name string) (string, bool) {
 	default:
 		return "", false
 	}
+	text := string(data)
+	sectioned := strings.HasPrefix(text, sectionMark) || strings.Contains(text, "\n"+sectionMark)
+	inSection := !sectioned
 	found := ""
-	for line := range strings.Lines(string(data)) {
+	for line := range strings.Lines(text) {
+		if header, ok := strings.CutPrefix(line, sectionMark); ok {
+			inSection = strings.EqualFold(strings.Trim(header, " \t\r\n:"), algo+"SUMS")
+			continue
+		}
+		if !inSection {
+			continue
+		}
 		sum, entry, ok := parseChecksumLine(line)
 		if !ok || len(sum) != want || path.Base(entry) != name {
 			continue

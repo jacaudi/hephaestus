@@ -54,8 +54,6 @@ const (
 	// maxSmallFile bounds a signature or checksum list, which is read into
 	// memory before it is verified.
 	maxSmallFile = 8 << 20
-	// efiHeaderLen is how much of a file efiStub looks at.
-	efiHeaderLen = 512
 	// alertProtocolVersion is TLS alert 70, sent by a peer that cannot speak the
 	// offered version.
 	alertProtocolVersion = 70
@@ -506,12 +504,10 @@ func hashMember(c catalog.Container, ra io.ReaderAt, size int64, member string) 
 	if err != nil {
 		return catalog.FilePin{}, err
 	}
-	head := make([]byte, efiHeaderLen)
-	n, err := io.ReadFull(r, head)
-	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+	head, err := readEFIHeader(r)
+	if err != nil {
 		return catalog.FilePin{}, err
 	}
-	head = head[:n]
 	h := sha256.New()
 	total, err := io.Copy(h, io.MultiReader(bytes.NewReader(head), r))
 	if err != nil {

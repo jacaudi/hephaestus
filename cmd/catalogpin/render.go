@@ -3,8 +3,10 @@ package main
 import (
 	"cmp"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"go/format"
+	"io"
 	"maps"
 	"slices"
 	"strings"
@@ -21,7 +23,45 @@ const (
 	peSubsystem      = 68
 	pe32PlusMagic    = 0x20b
 	subsystemEFIApp  = 10
+
+	// dosHeaderLen is the DOS header's length: it ends with the PE pointer.
+	dosHeaderLen = peOffsetPointer + 4
+	// maxPEOffset bounds where the PE header may start. A pointer past it is
+	// no stub, so a crafted file cannot make readEFIHeader read far.
+	maxPEOffset = 64 << 10
 )
+
+// readEFIHeader reads from r the bytes efiStub needs: the DOS header, then the
+// bytes through the subsystem field of the PE header it points to. A PE header
+// in a real EFI binary can sit well past the DOS header (the UEFI Shell's
+// AArch64 build has it at 3672), so no fixed window serves. It reads no more
+// than maxPEOffset and the PE fields, and no more than the file holds; the
+// caller hashes the rest of r after the bytes returned.
+func readEFIHeader(r io.Reader) ([]byte, error) {
+	head, err := readUpTo(r, make([]byte, dosHeaderLen))
+	if err != nil || len(head) < dosHeaderLen {
+		return head, err
+	}
+	e := uint64(binary.LittleEndian.Uint32(head[peOffsetPointer:]))
+	if e > maxPEOffset {
+		return head, nil
+	}
+	end := e + peOptionalHeader + peSubsystem + 2
+	if end <= dosHeaderLen {
+		return head, nil
+	}
+	more, err := readUpTo(r, make([]byte, end-dosHeaderLen))
+	return append(head, more...), err
+}
+
+// readUpTo fills buf from r, or as far as r goes: a short read is not an error.
+func readUpTo(r io.Reader, buf []byte) ([]byte, error) {
+	n, err := io.ReadFull(r, buf)
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		err = nil
+	}
+	return buf[:n], err
+}
 
 // efiStub reports whether header, the first bytes of a file, opens an
 // executable that UEFI firmware can start: MZ, a PE header at the offset the

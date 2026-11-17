@@ -11,6 +11,7 @@ const (
 	sum1   = "da39a3ee5e6b4b0d3255bfef95601890afd80709"
 	sumMD5 = "d41d8cd98f00b204e9800998ecf8427e"
 	sumB2  = "786a02f742015903c6c6fd852552d272912f4740e15847618a86e217f71f5419d25e1031afee585313896444934eb04b903a685b1448b755d56f701afe9be2ce"
+	sumB3  = "2ba3e1c9d5f7048a6b3c1d9e0f4a7b8c5d6e1f203a4b5c6d7e8f90a1b2c3d4e5"
 )
 
 // clonezillaList is shaped like Clonezilla's CHECKSUMS.TXT: one section per
@@ -18,7 +19,8 @@ const (
 const clonezillaList = "### MD5SUMS:\n" + sumMD5 + "  clonezilla-live-3.3.3-37-amd64.zip\n" +
 	"### SHA1SUMS:\n" + sum1 + "  clonezilla-live-3.3.3-37-amd64.zip\n" +
 	"### SHA256SUMS:\n" + sum256 + "  clonezilla-live-3.3.3-37-amd64.zip\n" +
-	"### B2SUMS:\n" + sumB2 + "  clonezilla-live-3.3.3-37-amd64.zip\n"
+	"### B2SUMS:\n" + sumB2 + "  clonezilla-live-3.3.3-37-amd64.zip\n" +
+	"### B3SUMS:\n" + sumB3 + "  clonezilla-live-3.3.3-37-amd64.zip\n"
 
 var checksumCases = []struct {
 	name   string
@@ -30,6 +32,9 @@ var checksumCases = []struct {
 }{
 	{"sha256 section of a mixed list", clonezillaList, "sha256", "clonezilla-live-3.3.3-37-amd64.zip", sum256, true},
 	{"sha1 section of a mixed list", clonezillaList, "sha1", "clonezilla-live-3.3.3-37-amd64.zip", sum1, true},
+	{"two digests in the wanted section", "### SHA256SUMS:\n" + sum256 + "  tool.iso\n" + sumB3 + "  tool.iso\n### B3SUMS:\n", "sha256", "tool.iso", "", false},
+	{"the wanted section is absent, a 64-hex section is not", "### SHA1SUMS:\n" + sum1 + "  tool.iso\n### B3SUMS:\n" + sumB3 + "  tool.iso\n", "sha256", "tool.iso", "", false},
+	{"a line before the first section is not in any", sum256 + "  tool.iso\n### SHA1SUMS:\n" + sum1 + "  tool.iso\n", "sha256", "tool.iso", "", false},
 	{"binary-mode star", sum256 + " *tool.iso\n", "sha256", "tool.iso", sum256, true},
 	{"leading ./dir path", sum256 + "  ./dir/tool.iso\n", "sha256", "tool.iso", sum256, true},
 	{"upper-case hex returns lower case", strings.ToUpper(sum256) + "  tool.iso\n", "sha256", "tool.iso", sum256, true},

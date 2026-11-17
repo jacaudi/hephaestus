@@ -626,18 +626,18 @@ func TestPin_SHA1List(t *testing.T) {
 }
 
 func TestPin_EFIStubRecorded(t *testing.T) {
-	body := makeZip(t, member{"kernel.efi", peHeader(10)}, member{"plain", []byte("plain text")})
+	body := makeZip(t, member{"kernel.efi", peHeader(10)}, member{"plain", []byte("plain text")}, member{"far.efi", peImage(1137, 10)})
 	srv := startServer(t, serveBytes(body), false)
 	p := newPinner(t, testClient(t, srv), &fakeGPG{})
 
-	pin, lines, err := p.pinSpec(t.Context(), zipSpec("tool", srv.URL+"/tool.zip", "kernel.efi", "plain"))
+	pin, lines, err := p.pinSpec(t.Context(), zipSpec("tool", srv.URL+"/tool.zip", "kernel.efi", "plain", "far.efi"))
 	if err != nil {
 		t.Fatalf("pinSpec: %v", err)
 	}
 
 	files := pin.Objects[0].Files
-	if !files[0].EFIStub || files[1].EFIStub {
-		t.Errorf("EFIStub = %t, %t, want true, false", files[0].EFIStub, files[1].EFIStub)
+	if !files[0].EFIStub || files[1].EFIStub || !files[2].EFIStub {
+		t.Errorf("EFIStub = %t, %t, %t, want true, false, true", files[0].EFIStub, files[1].EFIStub, files[2].EFIStub)
 	}
 	report := strings.Join(lines, "\n")
 	for _, want := range []string{"finding efi_stub kernel.efi true", "finding bootif recipe=kernel honoured=false", "pin " + pin.ID} {

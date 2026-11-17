@@ -561,7 +561,7 @@ func TestPins_SignersInProvenance(t *testing.T) {
 	}
 }
 
-func TestPins_AMD64EFIKernelsHaveStub(t *testing.T) {
+func TestPins_EFIKernelsHaveStub(t *testing.T) {
 	if _, err := os.Stat("catalog_pins.go"); err != nil {
 		t.Fatal(err)
 	}
@@ -573,7 +573,7 @@ func TestPins_AMD64EFIKernelsHaveStub(t *testing.T) {
 		t.Fatalf("Default: %v", err)
 	}
 	for _, e := range c.Entries() {
-		if e.Arch != "amd64" || !e.Supports(catalog.PlatformEFI) {
+		if !e.Supports(catalog.PlatformEFI) {
 			continue
 		}
 		f, ok := e.File(e.Boot.Kernel)

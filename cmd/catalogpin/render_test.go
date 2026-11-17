@@ -3,13 +3,17 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"go/format"
 	"go/parser"
 	"go/token"
+	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+	"testing/iotest"
 
 	"go.jacaudi.dev/hephaestus/internal/catalog"
 )
@@ -150,5 +154,88 @@ func TestRender_MatchesCompiledInFile(t *testing.T) {
 	}
 	if !bytes.Equal(got, want) {
 		t.Errorf("catalog_pins.go is not what render produces from its own pins:\n--- render ---\n%s\n--- file ---\n%s", got, want)
+	}
+}
+
+// peImage returns an image of an executable whose PE header starts at e, as a
+// real EFI binary may place it: MZ, e at 0x3c, then "PE\0\0", the PE32+ magic
+// and the subsystem at e, and 512 bytes of body after.
+func peImage(e uint32, subsystem uint16) []byte {
+	b := make([]byte, int(e)+512)
+	copy(b, "MZ")
+	binary.LittleEndian.PutUint32(b[peOffsetPointer:], e)
+	copy(b[e:], "PE\x00\x00")
+	binary.LittleEndian.PutUint16(b[e+peOptionalHeader:], pe32PlusMagic)
+	binary.LittleEndian.PutUint16(b[e+peOptionalHeader+peSubsystem:], subsystem)
+	return b
+}
+
+// countReader counts the bytes read through it.
+type countReader struct {
+	r io.Reader
+	n int
+}
+
+func (c *countReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += n
+	return n, err
+}
+
+func TestReadEFIHeader(t *testing.T) {
+	const maxRead = maxPEOffset + peOptionalHeader + peSubsystem + 2
+	tests := []struct {
+		name     string
+		image    []byte
+		wantStub bool
+		maxBytes int // most bytes the read may take from the file
+	}{
+		{"PE header at 1137, as in memtest86+ x86_64", peImage(1137, 10), true, maxRead},
+		{"PE header at 3672, as in the UEFI Shell AArch64", peImage(3672, 10), true, maxRead},
+		{"PE header at the bound", peImage(maxPEOffset, 10), true, maxRead},
+		{"PE header past the bound", peImage(maxPEOffset+1, 10), false, dosHeaderLen},
+		{"PE offset overflowing", func() []byte {
+			b := peImage(1137, 10)
+			binary.LittleEndian.PutUint32(b[peOffsetPointer:], 0xffffffff)
+			return b
+		}(), false, dosHeaderLen},
+		{"PE header at 1137, a console subsystem", peImage(1137, 3), false, maxRead},
+		{"file cut inside the PE header", peImage(1137, 10)[:1137+30], false, maxRead},
+		{"file shorter than the DOS header", []byte("MZ"), false, dosHeaderLen},
+		{"empty file", nil, false, dosHeaderLen},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			src := &countReader{r: bytes.NewReader(tt.image)}
+
+			head, err := readEFIHeader(src)
+
+			if err != nil {
+				t.Fatalf("readEFIHeader: %v", err)
+			}
+			if got := efiStub(head); got != tt.wantStub {
+				t.Errorf("efiStub = %t, want %t", got, tt.wantStub)
+			}
+			if src.n > tt.maxBytes {
+				t.Errorf("read %d bytes, want at most %d", src.n, tt.maxBytes)
+			}
+			rest, err := io.ReadAll(src)
+			if err != nil {
+				t.Fatalf("ReadAll: %v", err)
+			}
+			if whole := append(slices.Clone(head), rest...); !bytes.Equal(whole, tt.image) {
+				t.Errorf("head and the rest are %d bytes that differ from the %d byte image", len(whole), len(tt.image))
+			}
+		})
+	}
+}
+
+func TestReadEFIHeader_ReadError(t *testing.T) {
+	boom := errors.New("boom")
+
+	_, err := readEFIHeader(io.MultiReader(bytes.NewReader(peImage(1137, 10)[:100]), iotest.ErrReader(boom)))
+
+	if !errors.Is(err, boom) {
+		t.Errorf("readEFIHeader error = %v, want %v", err, boom)
 	}
 }
