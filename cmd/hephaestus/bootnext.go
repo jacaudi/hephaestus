@@ -95,8 +95,8 @@ func newBootNextSetCmd(deps cliDeps) *cobra.Command {
 The machine must have booted through hephaestus once. A UUID that several machines share is
 refused; name one by MAC. The flag expires %d hours after it was set.
 
-The output shows when the flag expires and the utility's state: wanted, fetching, ready, failed
-or broken. A failed or broken utility is re-armed, and the error it had is shown.`, bootNextTTLHours),
+The output shows when the flag expires and the utility's state: wanted, fetching, ready, failed,
+broken or stale_pin. A failed or broken utility is re-armed, and the error it had is shown.`, bootNextTTLHours),
 		Example: `  hephaestus boot-next set 52:54:00:12:34:56 systemrescue
   hephaestus boot-next set 4c4c4544-0042-3510-8052-b4c04f4e4d32 memtest86plus --json`,
 		Args: exactArgs(2),

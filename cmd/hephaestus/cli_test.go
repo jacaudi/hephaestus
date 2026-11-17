@@ -949,6 +949,8 @@ func TestSafeText(t *testing.T) {
 		{"newline and carriage return", "a\r\nb", `a\r\nb`},
 		{"invalid UTF-8", "a\xffb", `a\xffb`},
 		{"bidi override", "a\u202eb", `a\u202eb`},
+		{"C1 control", "a\u009bb", `a\u009bb`},
+		{"zero-width space", "a\u200bb", `a\u200bb`},
 		{"empty", "", ""},
 	}
 	for _, tt := range tests {
@@ -1028,6 +1030,9 @@ func TestUtilityList_SignedEntryIsNotTOFU(t *testing.T) {
 	}))
 
 	rows := jsonRows(t, c.mustRun(t, "utility", "list", "--json"))
+	if len(rows) != 4 {
+		t.Fatalf("got %d rows, want tlive and tshell for two arches: %v", len(rows), rows)
+	}
 
 	for _, row := range rows {
 		if want := row["entry"] == "tlive"; row["tofu"] != want {
