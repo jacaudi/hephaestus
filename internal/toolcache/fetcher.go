@@ -48,7 +48,7 @@ const (
 	spaceReserve = 1 << 30
 
 	spoolFileMode = 0o600
-	spoolDirMode  = 0o750
+	spoolDirMode  = 0o700
 )
 
 // locationParseFailure starts the message net/http gives a redirect whose

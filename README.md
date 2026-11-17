@@ -162,7 +162,7 @@ Shell access to the container is the authorization; the CLI has no network surfa
 | Path | Holds |
 |---|---|
 | `<data>/store` | The content store, an OCI image layout. Each entry is one tag, `utility/<entry>-<arch>:<pin id>`, over one blob per extracted file. Blob files are read-only (0444) and never edited in place |
-| `<data>/spool` | Partial downloads, `<pin id>-<object index>` with an `.etag` sidecar. A fetch resumes from them after a restart |
+| `<data>/spool` | Partial downloads, `<pin id>-<object index>` with an `.etag` sidecar. A fetch resumes from them after a restart. Created 0700 at startup when missing |
 | `<data>/store.corrupt-<UTC time>` | A store `serve` set aside at startup (below). Only the newest is kept |
 
 **A fetch needs free space** on the spool volume: twice the object's size plus a 1 GiB reserve. The data directory also holds the database, so `/health` warns on `disk:data_dir` below 10% free.
@@ -180,7 +180,7 @@ Shell access to the container is the authorization; the CLI has no network surfa
 | `restored` | A `wanted` or `failed` row whose content is complete in the store becomes `ready` (a crash between tagging and the state update). A `broken` row stays broken |
 | `spool_removed` | Spool files that no current pin owns are deleted |
 
-**Garbage collection is restart-only.** After reconciliation, `serve` untags every `utility/*` tag that is not a current entry's, logs `utility garbage collected` with the `untagged` count, and deletes the blobs no tag reaches. The store spares unreferenced blobs written in the last hour. Tags outside `utility/` are never touched. Nothing collects while `serve` runs, so a catalog change frees its disk on the next restart.
+**Garbage collection is restart-only.** After reconciliation, `serve` untags every `utility/*` tag that is not a current entry's, logs `utility garbage collected` with the `untagged` count, and deletes the blobs no tag reaches. The store spares unreferenced blobs written in the last hour. Tags outside `utility/` are never touched. Nothing collects while `serve` runs, so a catalog change frees its disk on the next restart. A collection that fails logs `utility garbage collection failed` at Warn and `serve` carries on: the garbage is only disk. A reconciliation that fails stops `serve` with the error, and so does content the store cannot read (a permission or I/O error): only content the store lacks (an unknown tag, a missing or wrong-sized layer) requeues a `ready` row.
 
 **Fetch log lines.** Every state change of a cache row logs one Info line, `utility fetch`, with `entry`, `arch`, `pin`, `from`, `to`, `attempts`, `class` (`integrity` or `other` for a failure), `error`, `bytes` and `duration_ms`. An error that the fetcher could not store on a row logs `utility fetch loop error` at Warn and polling continues; a failed fetch never stops `serve`. A transient failure is retried after a backoff that starts at one minute, doubles and caps at one hour, and the tenth failure makes the row `broken`. An integrity failure (a hash that does not match, a redirect off https) makes it `broken` at once. `hephaestus utility fetch <entry>` re-arms a `failed` or `broken` row.
 

@@ -36,7 +36,7 @@ func (h *Handlers) utilityFacts(ctx context.Context, name string, arch fleet.Arc
 		return facts, e, nil
 	}
 	if err := h.content.CheckLayers(ctx, e.Tag()); err != nil {
-		if contentLost(err) {
+		if store.ContentLost(err) {
 			h.requeueMissing(ctx, e, err, now)
 		} else {
 			h.reportUnreadable(ctx, e, err)
@@ -45,12 +45,6 @@ func (h *Handlers) utilityFacts(ctx context.Context, name string, arch fleet.Arc
 	}
 	facts.Ready = true
 	return facts, e, nil
-}
-
-// contentLost reports whether err says the store lacks the content, a tag, a
-// layer or its full size, as opposed to failing to read content it may have.
-func contentLost(err error) bool {
-	return errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrLayerMissing) || errors.Is(err, store.ErrLayerSize)
 }
 
 // requeueMissing puts e's ready cache row back to wanted, because its content

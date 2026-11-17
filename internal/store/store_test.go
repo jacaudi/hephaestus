@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -734,6 +735,30 @@ func TestChecks_FreshStore(t *testing.T) {
 	}
 	if got := byName["store:readable"].Run(t.Context()); got.Status != admin.StatusFail {
 		t.Errorf("store:readable without the blobs directory = %+v, want fail", got)
+	}
+}
+
+// TestContentLost pins which store errors say the content is gone, as opposed
+// to failing to read content that may be there.
+func TestContentLost(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"unknown tag", fmt.Errorf("resolve: %w", ErrNotFound), true},
+		{"missing layer", fmt.Errorf("layer: %w", ErrLayerMissing), true},
+		{"wrong size", fmt.Errorf("layer: %w", ErrLayerSize), true},
+		{"permission denied", &fs.PathError{Op: "open", Path: "blob", Err: fs.ErrPermission}, false},
+		{"other", errors.New("disk on fire"), false},
+		{"nil", nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ContentLost(tt.err); got != tt.want {
+				t.Errorf("ContentLost(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
 	}
 }
 

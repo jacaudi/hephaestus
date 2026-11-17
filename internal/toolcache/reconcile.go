@@ -22,7 +22,7 @@ type ReconcileConfig struct {
 	Store *store.Store
 	// Catalog says which entries and pins are current.
 	Catalog *catalog.Catalog
-	// SpoolDir holds the partial downloads; it must exist.
+	// SpoolDir holds the partial downloads. Reconcile creates it when missing.
 	SpoolDir string
 	// At is the time written to every row Reconcile changes.
 	At time.Time
@@ -44,16 +44,21 @@ type ReconcileReport struct {
 	SpoolRemoved int
 }
 
-// Reconcile brings the utility_cache rows, the store and the spool into
-// agreement with the catalog, in design section 5.7's order: fetching rows
-// become wanted; a row of an entry or architecture the catalog lacks is
-// deleted; a row at another pin is repinned; a ready row whose tag or layers
-// are not in the store is requeued; a wanted or failed row whose content is
-// complete in the store becomes ready; and every spool file that is not a
-// current pin's is removed. It runs before the fetcher starts. It stops at the
-// first repository error, which a done ctx causes.
+// Reconcile creates the spool directory when it is missing, then brings the
+// utility_cache rows, the store and the spool into agreement with the catalog,
+// in design section 5.7's order: fetching rows become wanted; a row of an entry
+// or architecture the catalog lacks is deleted; a row at another pin is
+// repinned; a ready row whose tag or layers the store lacks is requeued; a
+// wanted or failed row whose content is complete in the store becomes ready;
+// and every spool file that is not a current pin's is removed. It runs before
+// the fetcher starts. It stops at the first repository error, which a done ctx
+// causes, and at the first store error that is not lost content (see
+// store.ContentLost), such as a permission failure.
 func Reconcile(ctx context.Context, cfg ReconcileConfig) (ReconcileReport, error) {
 	var rep ReconcileReport
+	if err := os.MkdirAll(cfg.SpoolDir, spoolDirMode); err != nil {
+		return rep, fmt.Errorf("toolcache: create the spool dir: %w", err)
+	}
 	n, err := cfg.Repo.ResetFetching(ctx, cfg.At)
 	if err != nil {
 		return rep, err
@@ -73,8 +78,11 @@ func Reconcile(ctx context.Context, cfg ReconcileConfig) (ReconcileReport, error
 	entries := cfg.Catalog.Entries()
 	for i := range entries {
 		e := &entries[i]
-		if cfg.Store.CheckLayers(ctx, e.Tag()) != nil {
+		switch err := cfg.Store.CheckLayers(ctx, e.Tag()); {
+		case store.ContentLost(err):
 			continue
+		case err != nil:
+			return rep, fmt.Errorf("toolcache: check %s/%s content: %w", e.Entry, e.Arch, err)
 		}
 		key := fleet.CacheKey{Entry: e.Entry, Arch: fleet.Arch(e.Arch)}
 		moved, err := cfg.Repo.RestoreReady(ctx, key, e.Pin.ID, cfg.At)
@@ -91,9 +99,9 @@ func Reconcile(ctx context.Context, cfg ReconcileConfig) (ReconcileReport, error
 }
 
 // reconcileRow settles one row against the catalog and the store. A ready row
-// whose store check fails for any reason has no content to serve, so it goes
-// back to wanted and is refetched, unattended. A done ctx fails the repository
-// call that follows, so a check that failed only because of it requeues nothing.
+// whose content the store lacks has nothing to serve, so it goes back to wanted
+// and is refetched, unattended. Content the store cannot read is not content it
+// lacks: that is returned, and the row is left alone.
 func reconcileRow(ctx context.Context, cfg ReconcileConfig, row fleet.CacheRow, rep *ReconcileReport) error {
 	key := row.Key()
 	e, ok := cfg.Catalog.Lookup(row.Entry, string(row.Arch))
@@ -112,8 +120,11 @@ func reconcileRow(ctx context.Context, cfg ReconcileConfig, row fleet.CacheRow, 
 			rep.Repinned++
 		}
 	case row.State == fleet.CacheReady:
-		if cfg.Store.CheckLayers(ctx, e.Tag()) == nil {
+		switch err := cfg.Store.CheckLayers(ctx, e.Tag()); {
+		case err == nil:
 			return nil
+		case !store.ContentLost(err):
+			return fmt.Errorf("toolcache: check %s/%s content: %w", row.Entry, row.Arch, err)
 		}
 		moved, err := cfg.Repo.Requeue(ctx, key, row.Pin, cfg.At)
 		if err != nil {

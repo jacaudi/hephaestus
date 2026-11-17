@@ -341,3 +341,60 @@ func ageBlobs(t *testing.T, root string, d time.Duration) {
 		}
 	}
 }
+
+// TestReconcile_UnreadableContentNotRequeued pins that content the store cannot
+// read is not content it lacks: a permission failure stops Reconcile and leaves
+// the row alone, rather than refetching (and, offline, breaking) it.
+func TestReconcile_UnreadableContentNotRequeued(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores file modes")
+	}
+	for _, state := range []fleet.CacheState{fleet.CacheReady, fleet.CacheWanted} {
+		t.Run(string(state), func(t *testing.T) {
+			e := newReconcileEnv(t)
+			ent, _ := e.fx.Catalog.Lookup("tlive", "amd64")
+			e.insert(tliveAMD64(), ent.Pin.ID, state, 0)
+			e.stock(tliveAMD64())
+			manifest, err := e.st.Resolve(t.Context(), ent.Tag())
+			if err != nil {
+				t.Fatalf("Resolve(%s): %v", ent.Tag(), err)
+			}
+			blob := filepath.Join(e.storeDir, ocispec.ImageBlobsDir, manifest.Digest.Algorithm().String(), manifest.Digest.Encoded())
+			if err := os.Chmod(blob, 0o000); err != nil {
+				t.Fatalf("chmod manifest blob: %v", err)
+			}
+			t.Cleanup(func() {
+				if err := os.Chmod(blob, 0o444); err != nil {
+					t.Errorf("restore manifest blob mode: %v", err)
+				}
+			})
+
+			_, err = Reconcile(t.Context(), ReconcileConfig{
+				Repo: e.repo, Store: e.st, Catalog: e.fx.Catalog, SpoolDir: e.spool, At: fetchT0(),
+			})
+
+			if err == nil {
+				t.Fatal("Reconcile = nil, want the permission error")
+			}
+			if store.ContentLost(err) {
+				t.Errorf("Reconcile error %v counts as lost content, want a read failure", err)
+			}
+			e.wantRow(tliveAMD64(), state, ent.Pin.ID, 0)
+		})
+	}
+}
+
+func TestReconcile_CreatesSpoolDir(t *testing.T) {
+	e := newReconcileEnv(t)
+	e.spool = filepath.Join(t.TempDir(), "spool")
+
+	e.reconcile()
+
+	fi, err := os.Stat(e.spool)
+	if err != nil || !fi.IsDir() {
+		t.Fatalf("stat spool dir = %v, %v; want a directory", fi, err)
+	}
+	if got := fi.Mode().Perm(); got != 0o700 {
+		t.Errorf("spool dir mode = %#o, want 0700", got)
+	}
+}

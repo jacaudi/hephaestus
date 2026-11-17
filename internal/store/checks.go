@@ -152,3 +152,11 @@ func readBlobDir(r *os.Root) ([]fs.DirEntry, error) {
 	}
 	return nil, nil
 }
+
+// ContentLost reports whether err, from CheckLayers or Layers, says the store
+// lacks the content: an unknown tag, a missing layer or one of the wrong size.
+// Any other error means the content could not be read, which says nothing
+// about whether it is there.
+func ContentLost(err error) bool {
+	return errors.Is(err, ErrNotFound) || errors.Is(err, ErrLayerMissing) || errors.Is(err, ErrLayerSize)
+}

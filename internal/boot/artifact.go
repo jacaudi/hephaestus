@@ -12,6 +12,7 @@ import (
 
 	"go.jacaudi.dev/hephaestus/internal/catalog"
 	"go.jacaudi.dev/hephaestus/internal/fleet"
+	"go.jacaudi.dev/hephaestus/internal/store"
 )
 
 // artifact serves GET /u/{entry}/{arch}/{version}/{path...}: one file of a
@@ -67,7 +68,7 @@ func (h *Handlers) artifact(w http.ResponseWriter, r *http.Request) {
 // alone.
 func (h *Handlers) artifactError(w http.ResponseWriter, r *http.Request, e catalog.Entry, err error) {
 	ctx := r.Context()
-	if !contentLost(err) {
+	if !store.ContentLost(err) {
 		h.reportUnreadable(ctx, e, err)
 		h.internalError(w, r, err)
 		return

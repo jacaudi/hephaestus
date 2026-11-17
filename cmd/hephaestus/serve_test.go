@@ -1000,14 +1000,19 @@ func TestRunServe_FetchesWantedUtility(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
+	var found bool
 	for _, check := range st.Checks() {
 		if check.Name != "store:bytes" {
 			continue
 		}
+		found = true
 		res := check.Run(t.Context())
 		if n, ok := res.ObservedValue.(int64); !ok || n <= 0 {
 			t.Errorf("store:bytes = %+v, want a positive byte count", res)
 		}
+	}
+	if !found {
+		t.Error("the store has no store:bytes check")
 	}
 }
 
@@ -1103,5 +1108,51 @@ func TestRunServe_FetchFailureDoesNotStopServe(t *testing.T) {
 	stop()
 	if err := waitDone(t, done, 10*time.Second); err != nil {
 		t.Errorf("runServe after cancel = %v, want nil", err)
+	}
+}
+
+// TestRunServe_GarbageCollectionFailureDoesNotStopServe pins that a failed
+// garbage collection is a Warn and not a stop: the garbage is only disk, and
+// serve still comes ready. A store directory nobody may write to makes the
+// store's GC fail to save the index, which it replaces atomically.
+func TestRunServe_GarbageCollectionFailureDoesNotStopServe(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores file modes")
+	}
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	var logs bytes.Buffer
+	cfg, root := testServeConfig(t)
+	storeDir := filepath.Join(cfg.DataDir, "store")
+	if _, _, err := store.Open(t.Context(), storeDir, time.Now); err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	if err := os.Chmod(storeDir, 0o500); err != nil {
+		t.Fatalf("chmod store dir: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chmod(storeDir, 0o700); err != nil {
+			t.Errorf("restore store dir mode: %v", err)
+		}
+	})
+	deps := testDeps(t, root)
+	stop, done := startServe(t, cfg, slog.New(slog.NewJSONHandler(&logs, nil)), deps)
+	waitStatus(t, deps.adminURL()+"/readyz", done)
+
+	stop()
+	if err := waitDone(t, done, 10*time.Second); err != nil {
+		t.Fatalf("runServe after cancel = %v, want nil", err)
+	}
+
+	// runServe has returned, so nothing writes to logs any more.
+	warned := logRecords(logs.Bytes(), "utility garbage collection failed")
+	if len(warned) != 1 {
+		t.Fatalf("%d \"utility garbage collection failed\" lines, want 1\n%s", len(warned), logs.String())
+	}
+	if rec := warned[0]; rec["level"] != "WARN" || rec["untagged"] != float64(0) || rec["error"] == "" || rec["error"] == nil {
+		t.Errorf("record = %v, want level WARN, untagged 0 and an error", rec)
+	}
+	if collected := logRecords(logs.Bytes(), "utility garbage collected"); len(collected) != 0 {
+		t.Errorf("%d \"utility garbage collected\" lines after a failure, want none", len(collected))
 	}
 }
