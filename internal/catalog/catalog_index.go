@@ -208,7 +208,7 @@ func (s Spec) validateBoot() error {
 	case RecipeKernel:
 	}
 	if !scriptSafe(s.Args, true) {
-		errs = append(errs, fmt.Errorf("args %q carry a control character, $ or a byte outside printable ASCII", s.Args))
+		errs = append(errs, fmt.Errorf("args %q carry a control character, $, a backslash or a byte outside printable ASCII", s.Args))
 	}
 	// iPXE splits a line on whitespace with no quoting: a token of ;, || or &&
 	// ends the command and a token starting with # starts a comment
@@ -248,7 +248,7 @@ func (o ObjectSpec) validate(seen map[string]bool) error {
 			errs = append(errs, fmt.Errorf("file path %q is not a clean relative path", f))
 		}
 		if !scriptSafe(f, false) || strings.Contains(f, "#") {
-			errs = append(errs, fmt.Errorf("file path %q is not script-safe: it carries a control character, space, $, # or a byte outside printable ASCII", f))
+			errs = append(errs, fmt.Errorf("file path %q is not script-safe: it carries a control character, space, $, #, a backslash or a byte outside printable ASCII", f))
 		}
 		if seen[f] {
 			errs = append(errs, fmt.Errorf("file %q is listed twice", f))
@@ -364,13 +364,15 @@ func isHTTPS(u string) bool {
 
 // scriptSafe reports whether s can be written into an iPXE script line
 // without ending it or expanding a setting: every byte is printable ASCII
-// and not '$', with the space allowed only when allowSpace is set (Args holds
-// several arguments; a file path is one word).
+// and not '$' or '\', with the space allowed only when allowSpace is set (Args
+// holds several arguments; a file path is one word). iPXE's script.c joins a
+// line ending in '\' with the next one, so a trailing backslash would swallow
+// the newline that ends the command.
 func scriptSafe(s string, allowSpace bool) bool {
 	for i := range len(s) {
 		switch c := s[i]; {
 		case c == ' ' && allowSpace:
-		case c <= ' ' || c >= 0x7f || c == '$':
+		case c <= ' ' || c >= 0x7f || c == '$' || c == '\\':
 			return false
 		}
 	}

