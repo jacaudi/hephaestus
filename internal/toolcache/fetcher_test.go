@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -17,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -205,7 +207,7 @@ func newHarness(t *testing.T, cat *catalog.Catalog, client *http.Client) *harnes
 		t.Fatalf("NewFetcher: %v", err)
 	}
 	// The default statfs reads the host's disk, whose free space the test must not depend on.
-	f.statfs = func(string) (uint64, uint64, error) { return 1 << 40, 1 << 40, nil }
+	f.statfs = func(string) (uint64, error) { return 1 << 40, nil }
 	h.f = f
 	return h
 }
@@ -617,6 +619,7 @@ func TestFetcher_Resume(t *testing.T) {
 		name    string
 		sidecar string
 		whole   bool // the spool holds the whole object, not its first half
+		longer  bool // the spool holds the object and ten bytes more
 		serve   func(object []byte) http.Handler
 		ranged  bool // the request asks for the rest under If-Range
 		reqs    int
@@ -633,6 +636,7 @@ func TestFetcher_Resume(t *testing.T) {
 			},
 		},
 		{name: "complete spool", whole: true, serve: serveObject},
+		{name: "spool longer than the pin", sidecar: testETag, longer: true, serve: serveObject, reqs: 1},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -646,6 +650,9 @@ func TestFetcher_Resume(t *testing.T) {
 					data := sc.object[:half]
 					if tt.whole {
 						data = sc.object
+					}
+					if tt.longer {
+						data = slices.Concat(sc.object, make([]byte, 10))
 					}
 					seedSpool(t, h, e, data, tt.sidecar)
 				}
@@ -702,6 +709,20 @@ func TestFetcher_IntegrityFailures(t *testing.T) {
 				half := len(object) / 2
 				return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 					w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", half, len(object), len(object)+1))
+					w.WriteHeader(http.StatusPartialContent)
+					send(t, w, object[half:])
+				})
+			})
+			sc.seed = seedHalf(sc.object)
+			return sc
+		}},
+		{"206 content-length", func(t *testing.T, base string) scenario {
+			t.Helper()
+			sc := liveOf(t, base, func(object []byte) http.Handler {
+				half := len(object) / 2
+				return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", half, len(object)-1, len(object)))
+					w.Header().Set("Content-Length", strconv.Itoa(len(object)-half+1))
 					w.WriteHeader(http.StatusPartialContent)
 					send(t, w, object[half:])
 				})
@@ -785,6 +806,28 @@ func TestFetcher_TransientFailures(t *testing.T) {
 			t.Helper()
 			return liveOf(t, base, func([]byte) http.Handler { return http.NotFoundHandler() })
 		}},
+		{name: "content-range end", want: "Content-Range", mk: func(t *testing.T, base string) scenario {
+			t.Helper()
+			sc := liveOf(t, base, func(object []byte) http.Handler {
+				half := len(object) / 2
+				return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", half, len(object)-2, len(object)))
+					w.Header().Set("Content-Length", strconv.Itoa(len(object)-half))
+					w.WriteHeader(http.StatusPartialContent)
+					send(t, w, object[half:])
+				})
+			})
+			sc.seed = seedHalf(sc.object)
+			return sc
+		}},
+		{name: "weak etag drops the sidecar", mk: func(t *testing.T, base string) scenario {
+			t.Helper()
+			return droppedSidecar(t, base, `ETag: W/"v2"`+"\r\n")
+		}, check: wantSidecarGone},
+		{name: "no etag drops the sidecar", mk: func(t *testing.T, base string) scenario {
+			t.Helper()
+			return droppedSidecar(t, base, "")
+		}, check: wantSidecarGone},
 		{name: "content-range start", mk: func(t *testing.T, base string) scenario {
 			t.Helper()
 			sc := liveOf(t, base, func(object []byte) http.Handler {
@@ -856,7 +899,7 @@ func TestFetcher_TransientFailures(t *testing.T) {
 		{name: "free space", want: "free space", noRequest: true, mk: func(t *testing.T, base string) scenario {
 			t.Helper()
 			sc := liveOf(t, base, serveObject)
-			sc.tune = func(f *Fetcher) { f.statfs = func(string) (uint64, uint64, error) { return 1, 100, nil } }
+			sc.tune = func(f *Fetcher) { f.statfs = func(string) (uint64, error) { return 1, nil } }
 			return sc
 		}},
 	}
@@ -1021,6 +1064,12 @@ func TestFetcher_BookkeepingFailsTwiceResetsRow(t *testing.T) {
 		t.Fatal("second runOnce succeeded, want the injected error again")
 	}
 	r.wantRow(tliveAMD64(), fleet.CacheWanted, 0)
+	if got, want := r.transitions(), []string{"wanted>fetching", "fetching>wanted"}; !slices.Equal(got, want) {
+		t.Errorf("events = %v, want %v", got, want)
+	}
+	if ev := r.lastEvent(); ev.Err == nil || !strings.Contains(ev.Err.Error(), "injected") || ev.Class != "" {
+		t.Errorf("last event = %+v, want the held cause as Err and no Class", ev)
+	}
 }
 
 func TestFetcher_ShutdownAbandons(t *testing.T) {
@@ -1073,7 +1122,7 @@ func TestFetcher_PriorityFirst(t *testing.T) {
 	r.wantRow(tliveARM64(), fleet.CacheWanted, 0)
 }
 
-// runnable is a harness whose database has been closed, so every claim fails.
+// closedHarness is a harness whose database has been closed, so every claim fails.
 func closedHarness(t *testing.T) *harness {
 	t.Helper()
 	h := newHarness(t, catalogtest.New(t, "https://example.test").Catalog, NewHTTPClient(testUserAgent, nil))
@@ -1143,6 +1192,7 @@ func TestRedactURLError(t *testing.T) {
 		{"userinfo, query and fragment", &url.Error{Op: "Get", URL: "https://u:p@h/x?" + secretQuery + "#frag", Err: io.EOF}, `Get "https://h/x": EOF`},
 		{"unparsable", &url.Error{Op: "Get", URL: "https://h/%zz?" + secretQuery, Err: io.EOF}, `Get "<unparsable>": EOF`},
 		{"wrapped", fmt.Errorf("outer: %w", &url.Error{Op: "Head", URL: "https://h/?" + secretQuery, Err: io.EOF}), `Head "https://h/": EOF`},
+		{"unparsable Location", &url.Error{Op: "Get", URL: "https://h/x", Err: fmt.Errorf("failed to parse Location header %q: %s", "https://h/%zz?"+secretQuery, io.EOF.Error())}, `Get "https://h/x": unparsable Location header`},
 		{"not a url error", io.EOF, "EOF"},
 	}
 	for _, tt := range tests {
@@ -1179,6 +1229,9 @@ func TestFetcher_RedirectURLsAreRedacted(t *testing.T) {
 		{"plain http target", func(*testing.T) (string, []*httptest.Server) {
 			return "http://127.0.0.1:1/x?" + secretQuery, nil
 		}, "https only"},
+		{"unparsable Location", func(*testing.T) (string, []*httptest.Server) {
+			return "https://h/%zz?" + secretQuery, nil
+		}, "unparsable Location"},
 	}
 	for _, tt := range tests {
 		mk := func(t *testing.T, base string) scenario {
@@ -1213,6 +1266,9 @@ func TestFetcher_RedirectURLsAreRedacted(t *testing.T) {
 			if err == nil || strings.Contains(err.Error(), "s3cret") || !strings.Contains(err.Error(), tt.cause) {
 				t.Errorf("runOnce = %v, want an error that names %q and holds no secret", err, tt.cause)
 			}
+			if _, ok := errors.AsType[*IntegrityError](err); ok {
+				t.Errorf("runOnce = %v, which classes as integrity though the repository failed", err)
+			}
 		})
 	}
 }
@@ -1231,6 +1287,7 @@ type readerFunc func([]byte) (int, error)
 func (f readerFunc) Read(p []byte) (int, error) { return f(p) }
 
 func TestIdleReader(t *testing.T) {
+	defer goleak.VerifyNone(t)
 	t.Run("progress resets the deadline", func(t *testing.T) {
 		pr, pw := io.Pipe()
 		ctx, cancel := context.WithCancelCause(t.Context())
@@ -1284,4 +1341,116 @@ func TestIdleReader(t *testing.T) {
 			t.Errorf("the request was cancelled after Stop: %v", context.Cause(ctx))
 		}
 	})
+}
+
+// droppedSidecar starts a live fetch from half a spool under a strong sidecar,
+// and answers with a 200 that carries extraHeader (an ETag line, or none) and
+// half the body, then drops the connection.
+func droppedSidecar(t *testing.T, base, extraHeader string) scenario {
+	t.Helper()
+	sc := liveOf(t, base, func(object []byte) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			head := fmt.Sprintf("HTTP/1.1 200 OK\r\n%sContent-Length: %d\r\n\r\n", extraHeader, len(object))
+			hijackSend(t, w, head+string(object[:len(object)/2]))
+		})
+	})
+	sc.seed = seedHalf(sc.object)
+	return sc
+}
+
+func wantSidecarGone(t *testing.T, h *harness, e catalog.Entry) {
+	t.Helper()
+	if got := h.spoolSize(ETagName(e.Pin.ID, 0)); got != -1 {
+		t.Errorf("sidecar size = %d, want it removed", got)
+	}
+}
+
+func TestFetcher_PinNotInCatalog(t *testing.T) {
+	r := runScenario(t, func(t *testing.T, base string) scenario {
+		t.Helper()
+		return liveOf(t, base, serveObject)
+	})
+	if moved, err := r.repo.Repin(t.Context(), tliveAMD64(), r.e.Pin.ID, "000000000000", fetchT0()); err != nil || !moved {
+		t.Fatalf("Repin = %v, %v; want true, nil", moved, err)
+	}
+
+	r.fetchOnce()
+
+	row := r.wantRow(tliveAMD64(), fleet.CacheFailed, 1)
+	if !strings.Contains(row.LastError, "not in the catalog at this pin") {
+		t.Errorf("last_error = %q, want it to say the pin is not in the catalog", row.LastError)
+	}
+	if ev := r.lastEvent(); ev.Class != "other" || ev.To != fleet.CacheFailed {
+		t.Errorf("last event = %+v, want To failed, Class other", ev)
+	}
+	if got := len(r.up.seen()); got != 0 {
+		t.Errorf("the upstream saw %d requests, want 0", got)
+	}
+}
+
+func TestExtractionError_LocalFailureIsNotIntegrity(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"rename ENOSPC", &os.LinkError{Op: "rename", Err: syscall.ENOSPC}, classOther},
+		{"path EIO", &fs.PathError{Op: "write", Path: "x", Err: syscall.EIO}, classOther},
+		{"syscall error", os.NewSyscallError("write", syscall.ENOSPC), classOther},
+		{"path error of another kind", &fs.PathError{Op: "read", Path: "x", Err: io.ErrClosedPipe}, classOther},
+		{"digest mismatch", fmt.Errorf("store x: %w", io.ErrUnexpectedEOF), classIntegrity},
+		{"malformed object", fmt.Errorf("%w: cut short", ErrMalformed), classIntegrity},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := classOf(extractionError(tt.err)); got != tt.want {
+				t.Errorf("class = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFetcher_FreeSpaceBoundary(t *testing.T) {
+	tests := []struct {
+		name      string
+		short     uint64 // how far below the need the volume is
+		wantReady bool
+	}{
+		{"one byte short fails", 1, false},
+		{"exactly enough passes", 0, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := runScenario(t, func(t *testing.T, base string) scenario {
+				t.Helper()
+				sc := fixtureOf(t, base, tshellAMD64(), serveObject)
+				need := 2*uint64(len(sc.object)) + spaceReserve
+				sc.tune = func(f *Fetcher) { f.statfs = func(string) (uint64, error) { return need - tt.short, nil } }
+				return sc
+			})
+			r.fetchOnce()
+
+			if tt.wantReady {
+				r.wantRow(tshellAMD64(), fleet.CacheReady, 0)
+				return
+			}
+			row := r.wantRow(tshellAMD64(), fleet.CacheFailed, 1)
+			if !strings.Contains(row.LastError, "free space") {
+				t.Errorf("last_error = %q, want it to mention free space", row.LastError)
+			}
+			if got := len(r.up.seen()); got != 0 {
+				t.Errorf("the upstream saw %d requests, want 0", got)
+			}
+		})
+	}
+}
+
+func TestDiskFree(t *testing.T) {
+	free, err := diskFree(t.TempDir())
+	if err != nil || free == 0 {
+		t.Errorf("diskFree = %d, %v; want some free space and no error", free, err)
+	}
+	if _, err := diskFree(filepath.Join(t.TempDir(), "missing")); err == nil {
+		t.Error("diskFree of a missing path succeeded, want an error")
+	}
 }

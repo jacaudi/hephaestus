@@ -11,14 +11,15 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
-	"golang.org/x/sys/unix"
 
 	"go.jacaudi.dev/hephaestus/internal/catalog"
 	"go.jacaudi.dev/hephaestus/internal/fleet"
@@ -40,9 +41,22 @@ const (
 	classIntegrity = "integrity"
 	classOther     = "other"
 
+	// spaceReserve is what a download leaves free on the spool volume. The data
+	// directory also holds the SQLite database, which needs room for its journal
+	// and for growth, and a full disk would stop serve, not just the fetcher.
+	spaceReserve = 1 << 30
+
 	spoolFileMode = 0o600
 	spoolDirMode  = 0o750
 )
+
+// locationParseFailure starts the message net/http gives a redirect whose
+// Location header does not parse; the message holds the raw header.
+const locationParseFailure = "failed to parse Location header"
+
+// errUnparsableLocation replaces that message, so a redirect target's query
+// never reaches an event, a handler or a stored error.
+var errUnparsableLocation = errors.New("unparsable Location header")
 
 // errIdle is why a download was cancelled: no data arrived within the idle
 // timeout.
@@ -72,7 +86,7 @@ type FetchEvent struct {
 	// Class is "" for a change that is not a failure, "integrity" for a failure
 	// no retry can fix and "other" for any other failure.
 	Class string
-	// Err is the failure's cause, with any URL query removed.
+	// Err is the failure's cause, with the userinfo, query and fragment of any URL removed.
 	Err error
 	// Bytes is how many bytes this run downloaded.
 	Bytes    int64
@@ -94,8 +108,9 @@ func WithEvents(fn func(context.Context, FetchEvent)) FetcherOption {
 }
 
 // WithErrorHandler sets the function called with every error the fetcher
-// cannot settle on a row: an unrecorded repository error, or a spool file it
-// could not remove.
+// cannot settle on a row: an unrecorded repository error, a progress record
+// that failed, or a spool file or the spool directory it could not remove or
+// close.
 func WithErrorHandler(fn func(context.Context, error)) FetcherOption {
 	return func(f *Fetcher) { f.onError = fn }
 }
@@ -115,7 +130,7 @@ type Fetcher struct {
 	// Test hooks.
 	poll   time.Duration
 	idle   time.Duration
-	statfs func(path string) (free, total uint64, err error)
+	statfs func(path string) (free uint64, err error)
 
 	// held is an outcome the database refused to take, retried on the next poll.
 	held *heldOutcome
@@ -171,17 +186,6 @@ func NewFetcher(cfg FetcherConfig, opts ...FetcherOption) (*Fetcher, error) {
 	return f, nil
 }
 
-// diskFree is the default statfs: the space free to an unprivileged process
-// and the size of the volume holding path.
-func diskFree(path string) (free, total uint64, err error) {
-	var st unix.Statfs_t
-	if err := unix.Statfs(path, &st); err != nil {
-		return 0, 0, fmt.Errorf("statfs %s: %w", path, err)
-	}
-	block := uint64(st.Bsize)
-	return st.Bavail * block, st.Blocks * block, nil
-}
-
 // Run fetches one claimed row now and then every poll interval, until ctx is
 // done, and then returns nil. It never returns an error: each runOnce error
 // other than ctx's own goes to the error handler and polling continues.
@@ -214,6 +218,8 @@ type heldOutcome struct {
 	outcome
 
 	retried bool
+	// cause is the latest error that kept the outcome from being stored.
+	cause error
 }
 
 // runOnce settles one row. It reports false when nothing was claimed, and true
@@ -265,12 +271,14 @@ func (f *Fetcher) runOnce(ctx context.Context) (bool, error) {
 	if ctx.Err() != nil {
 		return true, ctx.Err()
 	}
-	f.held = &heldOutcome{outcome: o}
+	f.held = &heldOutcome{outcome: o, cause: recordErr}
 	return true, recordErr
 }
 
 // claimedFrom is the state a claimed row was in. ClaimFetch returns it already
-// fetching, but only a failed row keeps its next_attempt_at.
+// fetching. A failure sets next_attempt_at and every way back to wanted clears
+// it except ResetFetching, so a set value means failed; a row ResetFetching gave
+// back after a failed claim is reported as failed too.
 func claimedFrom(row fleet.CacheRow) fleet.CacheState {
 	if row.NextAttemptAt.IsZero() {
 		return fleet.CacheWanted
@@ -294,7 +302,7 @@ func (f *Fetcher) record(ctx context.Context, o outcome) error {
 	}
 	row, err := f.cfg.Repo.RecordFetchFailure(ctx, o.fail)
 	if err != nil {
-		return fmt.Errorf("%w (the fetch failed: %w)", err, o.ev.Err)
+		return fmt.Errorf("%w (the fetch failed: %v)", err, o.ev.Err) //nolint:errorlint // the cause is text for the handler; a second %w would make a repository error match *IntegrityError
 	}
 	if row.Pin == o.ev.Pin && (row.State == fleet.CacheFailed || row.State == fleet.CacheBroken) {
 		o.ev.To, o.ev.Attempts = row.State, row.Attempts
@@ -308,8 +316,8 @@ func (f *Fetcher) record(ctx context.Context, o outcome) error {
 // no row stays fetching because the database refused its settlement.
 func (f *Fetcher) retryHeld(ctx context.Context) (bool, error) {
 	h := f.held
-	var cause error
-	if !h.retried {
+	firstRetry := !h.retried
+	if firstRetry {
 		err := f.record(ctx, h.outcome)
 		switch {
 		case err == nil:
@@ -318,19 +326,20 @@ func (f *Fetcher) retryHeld(ctx context.Context) (bool, error) {
 		case ctx.Err() != nil:
 			return true, ctx.Err()
 		}
-		h.retried, cause = true, err
+		h.retried, h.cause = true, err
 	}
 	if _, err := f.cfg.Repo.ResetFetching(ctx, f.now()); err != nil {
 		if ctx.Err() != nil {
 			return true, ctx.Err()
 		}
-		return true, errors.Join(cause, err)
+		return true, errors.Join(h.cause, err)
 	}
 	f.held = nil
-	if cause == nil {
-		return true, nil
+	f.events(ctx, FetchEvent{Key: h.ev.Key, Pin: h.ev.Pin, From: fleet.CacheFetching, To: fleet.CacheWanted, Err: h.cause})
+	if !firstRetry {
+		return true, nil // the error was returned when the retry failed
 	}
-	return true, fmt.Errorf("the outcome of %s/%s could not be stored twice and the row went back to wanted: %w", h.ev.Key.Entry, h.ev.Key.Arch, cause)
+	return true, fmt.Errorf("the outcome of %s/%s could not be stored twice and the row went back to wanted: %w", h.ev.Key.Entry, h.ev.Key.Arch, h.cause)
 }
 
 // fetchJob is the work on one claimed row.
@@ -513,13 +522,13 @@ func (j *fetchJob) keepETag(n int, etag string) error {
 }
 
 // checkSpace refuses a download the spool volume has no room for: twice the
-// object (the spool and its extracted copy) and a tenth of the volume.
+// object (the spool and its extracted copy) and spaceReserve.
 func (j *fetchJob) checkSpace(size int64) error {
-	free, total, err := j.f.statfs(j.f.cfg.SpoolDir)
+	free, err := j.f.statfs(j.f.cfg.SpoolDir)
 	if err != nil {
 		return fmt.Errorf("free space on the spool volume: %w", err)
 	}
-	need := 2*uint64(max(size, 0)) + total/10
+	need := 2*uint64(max(size, 0)) + spaceReserve
 	if free < need {
 		return fmt.Errorf("free space on the spool volume is %d bytes, a %d byte object needs %d", free, size, need)
 	}
@@ -528,7 +537,7 @@ func (j *fetchJob) checkSpace(size int64) error {
 
 // transfer requests object n, from byte have under etag when etag is set, and
 // writes the body into the spool.
-func (j *fetchJob) transfer(ctx context.Context, n int, have int64, etag string) error {
+func (j *fetchJob) transfer(ctx context.Context, n int, have int64, etag string) (err error) {
 	obj := j.entry.Pin.Objects[n]
 	reqCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
@@ -544,7 +553,7 @@ func (j *fetchJob) transfer(ctx context.Context, n int, have int64, etag string)
 	if err != nil {
 		return fmt.Errorf("get object %d: %w", n, redactURLError(err))
 	}
-	defer resp.Body.Close() //nolint:errcheck // read-only
+	defer func() { err = errors.Join(err, resp.Body.Close()) }()
 
 	offset, err := j.accept(resp, n, have)
 	if err != nil {
@@ -568,7 +577,7 @@ func (j *fetchJob) accept(resp *http.Response, n int, have int64) (int64, error)
 		return 0, j.keepETag(n, resp.Header.Get("ETag"))
 	case http.StatusPartialContent:
 		header := resp.Header.Get("Content-Range")
-		start, _, total, err := parseContentRange(header)
+		start, end, total, err := parseContentRange(header)
 		if err != nil || start != have {
 			return 0, errors.Join(fmt.Errorf("a 206 with Content-Range %q does not continue at byte %d", header, have), err, j.reset(n))
 		}
@@ -577,6 +586,11 @@ func (j *fetchJob) accept(resp *http.Response, n int, have int64) (int64, error)
 		}
 		if resp.ContentLength >= 0 && resp.ContentLength != size-have {
 			return 0, integrityf("the upstream sent %d bytes for the %d the range asked for", resp.ContentLength, size-have)
+		}
+		// Only the total is a fact about the object (minor-16): a range that
+		// stops short is a misbehaving server, which a retry may not meet.
+		if end != size-1 {
+			return 0, fmt.Errorf("a 206 with Content-Range %q ends at byte %d, not at the last byte %d", header, end, size-1)
 		}
 		return have, nil
 	default:
@@ -639,13 +653,13 @@ func (s *spoolWriter) Write(p []byte) (int, error) {
 }
 
 // verify checks that object n's whole spool is the pinned size and sha256.
-func (j *fetchJob) verify(ctx context.Context, n int) error {
+func (j *fetchJob) verify(ctx context.Context, n int) (err error) {
 	obj := j.entry.Pin.Objects[n]
 	f, err := j.root.Open(SpoolName(j.row.Pin, n))
 	if err != nil {
 		return fmt.Errorf("open the spool: %w", err)
 	}
-	defer f.Close() //nolint:errcheck // read-only
+	defer func() { err = errors.Join(err, f.Close()) }()
 
 	h := sha256.New()
 	size, err := io.Copy(h, ctxReader{r: f, err: ctx.Err})
@@ -664,16 +678,16 @@ func (j *fetchJob) verify(ctx context.Context, n int) error {
 // extract pushes each pinned file of object n from its spool into the store
 // and returns their layers. A file that is not what the pin says, or a member
 // the extractor refuses, is an integrity failure; a failing disk is not.
-func (j *fetchJob) extract(ctx context.Context, n int) ([]ocispec.Descriptor, error) {
+func (j *fetchJob) extract(ctx context.Context, n int) (layers []ocispec.Descriptor, err error) {
 	pin := j.entry.Pin.Objects[n]
 	container := j.entry.Objects[n].Container
 	f, err := j.root.Open(SpoolName(j.row.Pin, n))
 	if err != nil {
 		return nil, fmt.Errorf("open the spool: %w", err)
 	}
-	defer f.Close() //nolint:errcheck // read-only
+	defer func() { err = errors.Join(err, f.Close()) }()
 
-	layers := make([]ocispec.Descriptor, 0, len(pin.Files))
+	layers = make([]ocispec.Descriptor, 0, len(pin.Files))
 	for _, fp := range pin.Files {
 		desc, err := store.Layer(fp.Path, fp.Size, fp.SHA256)
 		if err != nil {
@@ -751,9 +765,15 @@ func integrityf(format string, args ...any) error {
 }
 
 // extractionError classes a failure to open a member or store its file:
-// integrity, unless a *fs.PathError says the local disk failed.
+// integrity, unless the local disk failed. A *fs.PathError says so, and so does
+// any OS errno in the chain: oras-go returns the raw os.Rename error, a
+// *os.LinkError, whose ENOSPC or EIO is a full or failing disk (design 5.4), not
+// bad bytes. *fs.PathError, *os.LinkError and *os.SyscallError all unwrap to one.
 func extractionError(err error) error {
 	if _, ok := errors.AsType[*fs.PathError](err); ok { //nolint:errcheck // the match target is not a dropped error; modernize requires AsType over errors.As
+		return err
+	}
+	if _, ok := errors.AsType[syscall.Errno](err); ok { //nolint:errcheck // the match target is not a dropped error; modernize requires AsType over errors.As
 		return err
 	}
 	return &IntegrityError{Err: err}
@@ -771,7 +791,9 @@ func classOf(err error) string {
 // stripped of userinfo, query and fragment, since a mirror's redirect target
 // often carries a signed token. An unparsable URL becomes "<unparsable>". The
 // cause is kept, so errors.AsType[*IntegrityError] still finds it. err is
-// returned as it is when no *url.Error is in its chain.
+// returned as it is when no *url.Error is in its chain. net/http also builds
+// "failed to parse Location header %q" around the raw Location, which is a
+// redirect target too, so that cause is replaced by a fixed message.
 func redactURLError(err error) error {
 	ue, ok := errors.AsType[*url.Error](err)
 	if !ok {
@@ -782,5 +804,9 @@ func redactURLError(err error) error {
 		u.User, u.RawQuery, u.ForceQuery, u.Fragment, u.RawFragment = nil, "", false, "", ""
 		redacted = u.String()
 	}
-	return &url.Error{Op: ue.Op, URL: redacted, Err: ue.Err}
+	cause := ue.Err
+	if cause != nil && strings.HasPrefix(cause.Error(), locationParseFailure) {
+		cause = errUnparsableLocation
+	}
+	return &url.Error{Op: ue.Op, URL: redacted, Err: cause}
 }
