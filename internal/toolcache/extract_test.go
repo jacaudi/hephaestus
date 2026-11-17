@@ -8,6 +8,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"runtime"
 	"strconv"
 	"testing"
 	"time"
@@ -17,6 +18,9 @@ import (
 
 // maxFuzzRead bounds how much of a returned member a fuzz body reads.
 const maxFuzzRead = 1 << 20
+
+// openDeadline is how long a test waits for OpenMember before it calls a hang.
+const openDeadline = 5 * time.Second
 
 // zipEntry is one member a test zip is built from. A symlink entry carries
 // its target as the body, as zip tools write it.
@@ -182,8 +186,10 @@ func TestOpenMember_UnsafeMembers(t *testing.T) {
 		{"iso directory", catalog.ContainerISO, iso, "boot", ErrUnsafeMember},
 		{"zip missing", catalog.ContainerZip, liveZip(t), "live/missing", ErrMemberNotFound},
 		{"iso missing", catalog.ContainerISO, iso, "boot/missing", ErrMemberNotFound},
-		{"garbage zip", catalog.ContainerZip, []byte("this is not a zip archive at all"), "live/vmlinuz", ErrMalformed},
-		{"garbage iso", catalog.ContainerISO, bytes.Repeat([]byte("garbage "), 8192), "boot/vmlinuz", ErrMalformed},
+		{"iso missing directory", catalog.ContainerISO, iso, "nosuch/vmlinuz", ErrMemberNotFound},
+		{"iso missing nested directory", catalog.ContainerISO, iso, "boot/nosuch/deeper/vmlinuz", ErrMemberNotFound},
+		{"garbage zip", catalog.ContainerZip, garbageZip(), "live/vmlinuz", ErrMalformed},
+		{"garbage iso", catalog.ContainerISO, garbageISO(), "boot/vmlinuz", ErrMalformed},
 		{"empty iso", catalog.ContainerISO, nil, "boot/vmlinuz", ErrMalformed},
 	}
 	for _, tt := range tests {
@@ -206,8 +212,7 @@ func TestOpenMember_UnknownContainer(t *testing.T) {
 }
 
 func TestOpenMember_ISOTruncatedMetadata(t *testing.T) {
-	cut := readFixture(t)[:40<<10]
-	r, _, err := open(catalog.ContainerISO, cut, "boot/vmlinuz")
+	r, _, err := open(catalog.ContainerISO, truncatedMetadataISO(t), "boot/vmlinuz")
 	if !errors.Is(err, ErrMalformed) {
 		t.Fatalf("error %v, want ErrMalformed", err)
 	}
@@ -216,46 +221,22 @@ func TestOpenMember_ISOTruncatedMetadata(t *testing.T) {
 	}
 }
 
-// Each corruption makes go-diskfs v1.9.4 panic, both found by fuzzing: a slice
-// out of range in parsePathTable (pathtable.go:196) and in parseTimestamps
-// (rockridge.go:905). OpenMember must turn the panic into ErrMalformed.
-func TestOpenMember_ISOParserPanicIsMalformed(t *testing.T) {
-	const pvd = 16 * isoBlockSize // the primary volume descriptor
-	tests := []struct {
-		name    string
-		corrupt func(t *testing.T, data []byte)
-	}{
-		{"path table entry overruns the table", func(_ *testing.T, data []byte) {
-			// The path table size, in both byte orders, shorter than its first entry.
-			binary.LittleEndian.PutUint32(data[pvd+132:], 3)
-			binary.BigEndian.PutUint32(data[pvd+136:], 3)
-		}},
-		{"timestamps flagged beyond the entry", func(t *testing.T, data []byte) {
-			t.Helper()
-			// Every Rock Ridge TF entry (xorriso writes three short-form
-			// timestamps, flags 0x0e) now claims all seven.
-			tf := []byte{'T', 'F', 26, 1, 0x0e}
-			hits := 0
-			for off := 0; ; hits++ {
-				i := bytes.Index(data[off:], tf)
-				if i < 0 {
-					break
-				}
-				data[off+i+4] = 0x7f
-				off += i + len(tf)
-			}
-			if hits == 0 {
-				t.Fatal("no TF entry in the fixture")
-			}
-		}},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			data := readFixture(t)
-			tt.corrupt(t, data)
-			r, _, err := open(catalog.ContainerISO, data, "boot/vmlinuz")
+// Each image is rr.iso with one header field bent. go-diskfs v1.9.4 panics on
+// the first two (found by fuzzing: a slice out of range in parsePathTable,
+// pathtable.go:196, and in parseTimestamps, rockridge.go:905), spins forever
+// on the third (a SUSP continuation entry that points at itself), allocates
+// the size a path table claims on the next two, and wraps the failure to read
+// an oversized directory in a *fs.PathError on the last. OpenMember must
+// return ErrMalformed, promptly, and never a local-disk error.
+func TestOpenMember_ISOCraftedMetadata(t *testing.T) {
+	for _, img := range craftedISOs(t) {
+		t.Run(img.name, func(t *testing.T) {
+			r, _, err := openWithin(t, catalog.ContainerISO, img.data, "boot/vmlinuz")
 			if !errors.Is(err, ErrMalformed) {
 				t.Fatalf("error %v, want ErrMalformed", err)
+			}
+			if pe, ok := errors.AsType[*fs.PathError](err); ok {
+				t.Errorf("a malformed image reports a local failure: %v", pe)
 			}
 			if r != nil {
 				t.Error("returned a reader alongside the error")
@@ -264,17 +245,33 @@ func TestOpenMember_ISOParserPanicIsMalformed(t *testing.T) {
 	}
 }
 
+// A path table size from the header is allocated before anything is read, so
+// 0xFFFFFF00 asks for 4 GiB on a 745 KB image: OpenMember must refuse it first.
+func TestOpenMember_ISOPathTableSizeIsNotAllocated(t *testing.T) {
+	const limit = 64 << 20
+	for name, data := range map[string][]byte{
+		"primary":       hugePathTableISO(t, isoPrimary),
+		"supplementary": hugePathTableISO(t, isoSupplementary),
+	} {
+		t.Run(name, func(t *testing.T) {
+			var before, after runtime.MemStats
+			runtime.ReadMemStats(&before)
+			_, _, err := open(catalog.ContainerISO, data, "boot/vmlinuz")
+			runtime.ReadMemStats(&after)
+			if !errors.Is(err, ErrMalformed) {
+				t.Errorf("error %v, want ErrMalformed", err)
+			}
+			if grew := after.TotalAlloc - before.TotalAlloc; grew > limit {
+				t.Errorf("allocated %d bytes for a %d-byte image", grew, len(data))
+			}
+		})
+	}
+}
+
 // go-diskfs's File.Read invents the tail of a file cut short, so OpenMember
 // must refuse a member whose declared bytes are not all in the image.
 func TestOpenMember_ISOTruncatedData(t *testing.T) {
-	full := readFixture(t)
-	squashfs := seqText(40000)
-	off := bytes.Index(full, squashfs[:64])
-	if off < 0 {
-		t.Fatal("the squashfs member is not in the fixture")
-	}
-	cut := full[:off+len(squashfs)/2]
-	r, n, err := open(catalog.ContainerISO, cut, "live/tool-amd64/tool-amd64.squashfs")
+	r, n, err := open(catalog.ContainerISO, truncatedSquashfsISO(t), "live/tool-amd64/tool-amd64.squashfs")
 	if !errors.Is(err, ErrMalformed) {
 		t.Fatalf("error %v, want ErrMalformed", err)
 	}
@@ -305,8 +302,164 @@ func TestOpenMember_ReadFailureKeepsPathError(t *testing.T) {
 	}
 }
 
+// namedImage is a test input with the name of its subtest.
+type namedImage struct {
+	name string
+	data []byte
+}
+
+func garbageZip() []byte { return []byte("this is not a zip archive at all") }
+
+func garbageISO() []byte { return bytes.Repeat([]byte("garbage "), 8192) }
+
+// truncatedMetadataISO is rr.iso cut inside its directory metadata.
+func truncatedMetadataISO(tb testing.TB) []byte {
+	tb.Helper()
+	return readFixture(tb)[:40<<10]
+}
+
+// truncatedSquashfsISO is rr.iso cut half way through the squashfs member.
+func truncatedSquashfsISO(tb testing.TB) []byte {
+	tb.Helper()
+	full := readFixture(tb)
+	squashfs := seqText(40000)
+	off := bytes.Index(full, squashfs[:64])
+	if off < 0 {
+		tb.Fatal("the squashfs member is not in the fixture")
+	}
+	return full[:off+len(squashfs)/2]
+}
+
+// corruptISO returns rr.iso after fn has edited it.
+func corruptISO(tb testing.TB, fn func(tb testing.TB, data []byte)) []byte {
+	tb.Helper()
+	data := readFixture(tb)
+	fn(tb, data)
+	return data
+}
+
+// putBoth32 writes v at b[0:4] little-endian and b[4:8] big-endian, ECMA-119's
+// both-byte-order 32-bit field.
+func putBoth32(b []byte, v uint32) {
+	binary.LittleEndian.PutUint32(b, v)
+	binary.BigEndian.PutUint32(b[4:], v)
+}
+
+// isoDescriptor returns the offset of the first volume descriptor of type typ.
+func isoDescriptor(tb testing.TB, data []byte, typ byte) int {
+	tb.Helper()
+	for off := isoDescriptorStart; off+isoBlockSize <= len(data) && string(data[off+1:off+6]) == "CD001"; off += isoBlockSize {
+		if data[off] == typ {
+			return off
+		}
+	}
+	tb.Fatalf("no volume descriptor of type %d in the fixture", typ)
+	return 0
+}
+
+// isoRootDir returns the offset and size of the root directory.
+func isoRootDir(tb testing.TB, data []byte) (off, size int) {
+	tb.Helper()
+	record := isoDescriptor(tb, data, isoPrimary) + 156 // the root record, 34 bytes
+	return int(binary.LittleEndian.Uint32(data[record+2:])) * isoBlockSize, int(binary.LittleEndian.Uint32(data[record+10:]))
+}
+
+// hugePathTableISO claims a 0xFFFFFF00-byte path table in the descriptor of
+// type typ.
+func hugePathTableISO(tb testing.TB, typ byte) []byte {
+	tb.Helper()
+	return corruptISO(tb, func(tb testing.TB, data []byte) {
+		tb.Helper()
+		putBoth32(data[isoDescriptor(tb, data, typ)+isoPathTableSize:], 0xFFFFFF00)
+	})
+}
+
+// craftedISOs are the malformed images of TestOpenMember_ISOCraftedMetadata.
+func craftedISOs(tb testing.TB) []namedImage {
+	tb.Helper()
+	return []namedImage{
+		{"path table entry overruns the table", corruptISO(tb, func(tb testing.TB, data []byte) {
+			tb.Helper()
+			putBoth32(data[isoDescriptor(tb, data, isoPrimary)+isoPathTableSize:], 3) // shorter than its first entry
+		})},
+		{"timestamps flagged beyond the entry", corruptISO(tb, func(tb testing.TB, data []byte) {
+			tb.Helper()
+			// Every Rock Ridge TF entry (xorriso writes three short-form
+			// timestamps, flags 0x0e) now claims all seven.
+			tf := []byte{'T', 'F', 26, 1, 0x0e}
+			hits := 0
+			for off := 0; ; hits++ {
+				i := bytes.Index(data[off:], tf)
+				if i < 0 {
+					break
+				}
+				data[off+i+4] = 0x7f
+				off += i + len(tf)
+			}
+			if hits == 0 {
+				tb.Fatal("no TF entry in the fixture")
+			}
+		})},
+		{"continuation entry points at itself", corruptISO(tb, func(tb testing.TB, data []byte) {
+			tb.Helper()
+			root, _ := isoRootDir(tb, data)
+			ce := []byte{'C', 'E', 28, 1}
+			i := bytes.Index(data[root:root+int(data[root])], ce) // in the root's "." record
+			if i < 0 {
+				tb.Fatal("no CE entry in the root record")
+			}
+			const block = 20
+			for _, at := range []int{root + i, block * isoBlockSize} {
+				copy(data[at:], ce)
+				putBoth32(data[at+4:], block) // block 20, offset 0, 28 bytes: the entry itself
+				putBoth32(data[at+12:], 0)
+				putBoth32(data[at+20:], 28)
+			}
+		})},
+		{"primary path table larger than the image", hugePathTableISO(tb, isoPrimary)},
+		{"supplementary path table larger than the image", hugePathTableISO(tb, isoSupplementary)},
+		{"directory larger than the image", corruptISO(tb, func(tb testing.TB, data []byte) {
+			tb.Helper()
+			root, size := isoRootDir(tb, data)
+			i := bytes.Index(data[root:root+size], []byte{4, 'B', 'O', 'O', 'T'}) // the name length, then the name
+			if i < 32 {
+				tb.Fatal("no BOOT record in the root directory")
+			}
+			putBoth32(data[root+i-32+10:], 1<<20) // the record's data length
+		})},
+		{"truncated metadata", truncatedMetadataISO(tb)},
+		{"garbage", garbageISO()},
+		{"empty", nil},
+	}
+}
+
+// openResult is what OpenMember returned.
+type openResult struct {
+	r   io.Reader
+	n   int64
+	err error
+}
+
+// openWithin calls OpenMember in a goroutine and fails tb when it has not
+// returned in openDeadline, so a hang is a failure and not a stuck run.
+func openWithin(tb testing.TB, c catalog.Container, data []byte, name string) (io.Reader, int64, error) {
+	tb.Helper()
+	done := make(chan openResult, 1)
+	go func() {
+		r, n, err := open(c, data, name)
+		done <- openResult{r, n, err}
+	}()
+	select {
+	case res := <-done:
+		return res.r, res.n, res.err
+	case <-time.After(openDeadline):
+		tb.Fatalf("OpenMember did not return within %s", openDeadline)
+		return nil, 0, nil
+	}
+}
+
 func FuzzOpenMemberZip(f *testing.F) {
-	for _, seed := range [][]byte{liveZip(f), symlinkZip(f), directoryZip(f), duplicateZip(f), []byte("this is not a zip archive at all")} {
+	for _, seed := range [][]byte{liveZip(f), symlinkZip(f), directoryZip(f), duplicateZip(f), garbageZip()} {
 		f.Add(seed)
 	}
 	f.Fuzz(func(t *testing.T, data []byte) {
@@ -321,26 +474,18 @@ func FuzzOpenMemberZip(f *testing.F) {
 }
 
 func FuzzOpenMemberISO(f *testing.F) {
-	full := readFixture(f)
-	f.Add(full)
-	f.Add(full[:40<<10])
-	f.Add(full[:bytes.Index(full, seqText(40000)[:64])+len(seqText(40000))/2])
+	f.Add(readFixture(f))
+	f.Add(truncatedSquashfsISO(f))
+	for _, img := range craftedISOs(f) {
+		f.Add(img.data)
+	}
 	f.Fuzz(func(t *testing.T, data []byte) {
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			r, _, err := open(catalog.ContainerISO, data, "boot/vmlinuz")
-			if err != nil {
-				return
-			}
-			if _, err := io.Copy(io.Discard, io.LimitReader(r, maxFuzzRead)); err != nil {
-				return
-			}
-		}()
-		select {
-		case <-done:
-		case <-time.After(10 * time.Second):
-			t.Fatal("OpenMember hung")
+		r, _, err := openWithin(t, catalog.ContainerISO, data, "boot/vmlinuz")
+		if err != nil {
+			return
+		}
+		if _, err := io.Copy(io.Discard, io.LimitReader(r, maxFuzzRead)); err != nil {
+			return
 		}
 	})
 }
