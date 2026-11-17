@@ -3,19 +3,157 @@
 package catalog
 
 // pins holds the generated pin of every entry `task catalog:pin` has pinned.
-var pins = map[Key]Pin{}
+var pins = map[Key]Pin{
+	{Entry: "clonezilla", Arch: "amd64"}: {
+		ID: "c671a99fbc85",
+		Objects: []ObjectPin{
+			{
+				URL:    "https://downloads.sourceforge.net/clonezilla/clonezilla-live-3.3.3-37-amd64.zip",
+				Size:   494074389,
+				SHA256: "bbb02b409708cf37774debe00f96c642c59c48ebb216f7349dc2252f705ff10e",
+				Signer: "54C0821A48715DAFD61BFCAF667857D045599AFD",
+				Files: []FilePin{
+					{Path: "live/vmlinuz", Size: 14202816, SHA256: "2069818aad331848e3feea4e06ae271d894919f8354f2a9ccb10e770707aedc8", EFIStub: true},
+					{Path: "live/initrd.img", Size: 51411804, SHA256: "74782dbcc610af22a0ceef026c62b045f8d29db862691f850dc5206f090fbbda"},
+					{Path: "live/filesystem.squashfs", Size: 420614144, SHA256: "64e572205b504f8b07eb20ca3f927ac1476183dfb69815e019ac90095c92bd02"},
+				},
+			},
+		},
+	},
+	{Entry: "gparted", Arch: "amd64"}: {
+		ID: "596201559564",
+		Objects: []ObjectPin{
+			{
+				URL:    "https://downloads.sourceforge.net/gparted/gparted-live-1.8.1-6-amd64.zip",
+				Size:   718474194,
+				SHA256: "cf910dff760d2bbd6d51160529952fa9f3fd80126bab6cd1842f2677508ae1ca",
+				Signer: "EB1DD5BF6F88820BBCF5356C8E94C9CD163E3FB0",
+				Files: []FilePin{
+					{Path: "live/vmlinuz", Size: 14202816, SHA256: "5e2698f8628f2dbabd7ae6a377a925feee4dae4d62ca314cd92ec8eb88fd49a9", EFIStub: true},
+					{Path: "live/initrd.img", Size: 49595168, SHA256: "c3b62bcfb70e542f0c40d8882734661af05096db2432747f1dd31a6be5d324eb"},
+					{Path: "live/filesystem.squashfs", Size: 639131648, SHA256: "0dac05f9a571d3e8dfc386ec86c5d9fdd1f0b0f8f0a136d493bf6a4d3ae6b0d2"},
+				},
+			},
+		},
+	},
+	{Entry: "grml", Arch: "amd64"}: {
+		ID: "dde25ccefd66",
+		Objects: []ObjectPin{
+			{
+				URL:    "https://ftp-master.grml.org/grml-full-2026.09-amd64.iso",
+				Size:   1153918976,
+				SHA256: "76e8019ff1b68ddb3e49cecb1ea35ecead9e0f1c1ba22c0e819c9b13de939e72",
+				Signer: "33CCB136401AFEC843A3876396A87872B7EA3737",
+				Files: []FilePin{
+					{Path: "boot/grmlfullamd64/vmlinuz", Size: 14202816, SHA256: "5e2698f8628f2dbabd7ae6a377a925feee4dae4d62ca314cd92ec8eb88fd49a9", EFIStub: true},
+					{Path: "boot/grmlfullamd64/initrd.img", Size: 56385048, SHA256: "4cb7f85428b8e2d42fa9706b6dd9f5eb8624703b5c30ca1d092f6c424a267fb4"},
+					{Path: "live/grml-full-amd64/grml-full-amd64.squashfs", Size: 1062141952, SHA256: "a378d257b87940069c8c733c098dc5688f5af0290dbcdfb33c8338fb23506835"},
+				},
+			},
+		},
+	},
+	{Entry: "grml", Arch: "arm64"}: {
+		ID: "00096290e67d",
+		Objects: []ObjectPin{
+			{
+				URL:    "https://ftp-master.grml.org/grml-full-2026.09-arm64.iso",
+				Size:   1092343808,
+				SHA256: "3f8c06ab253a5e065797f2bf24b557c31ffc9915430018a22837e71c3333ab49",
+				Signer: "33CCB136401AFEC843A3876396A87872B7EA3737",
+				Files: []FilePin{
+					{Path: "boot/grmlfullarm64/vmlinuz", Size: 46358464, SHA256: "0ad0a1b31f6a23102d7db58052b226a04ffa554ee20f1009a0adfd5e3ca22ed5", EFIStub: true},
+					{Path: "boot/grmlfullarm64/initrd.img", Size: 53537092, SHA256: "d456d4977fa553091ba6b8ffb1d1f34442c0097e38df8fe4333af356640a5d0b"},
+					{Path: "live/grml-full-arm64/grml-full-arm64.squashfs", Size: 978448384, SHA256: "74f76f6b803cffcd3e5b90bd428a35e378a92ee15e65be5cc0b7a0938dae6436"},
+				},
+			},
+		},
+	},
+	{Entry: "memtest86plus", Arch: "amd64"}: {
+		ID: "cccf6e58caec",
+		Objects: []ObjectPin{
+			{
+				URL:    "https://www.memtest.org/download/v9.00/mt86plus_9.00.binaries.zip",
+				Size:   383461,
+				SHA256: "7b2e294c5f30ddc8a01bbfce0dba7370765a867b745e0494ff811de4463eeb5d",
+				Files: []FilePin{
+					{Path: "mt86p_900_x86_64", Size: 207776, SHA256: "e1e9bf61c925e358464bd7896105f59c56015074493bee759aa25498a0935a99", EFIStub: true},
+				},
+			},
+		},
+	},
+	{Entry: "memtest86plus", Arch: "arm64"}: {
+		ID: "3d7f5e622fa2",
+		Objects: []ObjectPin{
+			{
+				URL:    "https://www.memtest.org/download/v9.00/mt86plus_9.00.binaries.zip",
+				Size:   383461,
+				SHA256: "7b2e294c5f30ddc8a01bbfce0dba7370765a867b745e0494ff811de4463eeb5d",
+				Files: []FilePin{
+					{Path: "mt86p_900_arm64", Size: 173056, SHA256: "d3a03009f5e8a33a030d1f6e9604ddbc715420956881473ea30ef463c6421250", EFIStub: true},
+				},
+			},
+		},
+	},
+	{Entry: "shredos", Arch: "amd64"}: {
+		ID: "986a8b1e4fe5",
+		Objects: []ObjectPin{
+			{
+				URL:    "https://github.com/PartialVolume/shredos.x86_64/releases/download/v2025.11_32_x86-64_0.43.1/shredos-2025.11_32_x86-64_v0.43.1_20261010.iso",
+				Size:   358612992,
+				SHA256: "d0ffb8d7b346289db93094dbf1d2a64692b7f7cb179cc1ca76b74fdffbac1414",
+				Files: []FilePin{
+					{Path: "boot/bzImage", Size: 351966208, SHA256: "6497b73a06d9a1f9cab14b7016c8aabe989408f739a12d509005dd5b676497ec", EFIStub: true},
+				},
+			},
+		},
+	},
+	{Entry: "systemrescue", Arch: "amd64"}: {
+		ID: "377eddae20f4",
+		Objects: []ObjectPin{
+			{
+				URL:    "https://fastly-cdn.system-rescue.org/releases/13.03/systemrescue-13.03-amd64.iso",
+				Size:   1434386432,
+				SHA256: "b71b98ba6b92145524cb1a72206b9888a59861ad6fb05d127faf618ca0136891",
+				Signer: "0FF11AF081E98345594812037091115F8320B897",
+				Files: []FilePin{
+					{Path: "sysresccd/boot/x86_64/vmlinuz", Size: 16511488, SHA256: "0052b4a8fdaa9e808186f3e6b6fcc58e24d3dbc3d514bab0bf42418cd9349c8a", EFIStub: true},
+					{Path: "sysresccd/boot/intel_ucode.img", Size: 15265792, SHA256: "20ea4ffdb9e42e7db372b0b541302cc6f61da387ae5c93f69e5ba5ff1ddc1978"},
+					{Path: "sysresccd/boot/amd_ucode.img", Size: 307200, SHA256: "b238f07e45318170ff671bc7d9a8e89498674ad6565d56de02a3d9a2c5b54da6"},
+					{Path: "sysresccd/boot/x86_64/sysresccd.img", Size: 185679868, SHA256: "2af587deb9445346f4ce4137419fb77269a188536761e7c54a6fd2ebc16065df"},
+					{Path: "sysresccd/x86_64/airootfs.sfs", Size: 1204379648, SHA256: "91157bfc4e18583c73960402031598d5b09d37089ab32aa08466b083ce07ea6a"},
+					{Path: "sysresccd/x86_64/airootfs.sha512", Size: 143, SHA256: "58379482b8e6cd6fa6987a253b72dee93215d00820b6b28761be471926606578"},
+				},
+			},
+		},
+	},
+	{Entry: "uefishell", Arch: "amd64"}: {
+		ID: "89b7aa4cdd97",
+		Objects: []ObjectPin{
+			{
+				URL:    "https://github.com/tianocore/edk2/releases/download/edk2-stable202002/ShellBinPkg.zip",
+				Size:   1642082,
+				SHA256: "d6876ef9b9a48ca612149b888d4f4e923d1b8ccf495b8f6f6c3f83defb40b56a",
+				Files: []FilePin{
+					{Path: "ShellBinPkg/UefiShell/X64/Shell.efi", Size: 939648, SHA256: "24dcc034bf6a5158f43b23b71a16acbfdcf1597de55aa309f7f6ac5af90666e6", EFIStub: true},
+				},
+			},
+		},
+	},
+	{Entry: "uefishell", Arch: "arm64"}: {
+		ID: "5709af5d7c93",
+		Objects: []ObjectPin{
+			{
+				URL:    "https://github.com/tianocore/edk2/releases/download/edk2-stable202002/ShellBinPkg.zip",
+				Size:   1642082,
+				SHA256: "d6876ef9b9a48ca612149b888d4f4e923d1b8ccf495b8f6f6c3f83defb40b56a",
+				Files: []FilePin{
+					{Path: "ShellBinPkg/UefiShell/AArch64/Shell.efi", Size: 892928, SHA256: "0763f2ca93a0309be1597c9581ea3e334bd670d32a600f7d1d3ccfff35fcf3a5", EFIStub: true},
+				},
+			},
+		},
+	},
+}
 
 // absent holds the reason each entry has no pin: the ledger of entries the
 // pin step could not or did not pin.
-var absent = map[Key]string{
-	{Entry: "clonezilla", Arch: "amd64"}:    "not pinned yet: run task catalog:pin",
-	{Entry: "gparted", Arch: "amd64"}:       "not pinned yet: run task catalog:pin",
-	{Entry: "grml", Arch: "amd64"}:          "not pinned yet: run task catalog:pin",
-	{Entry: "grml", Arch: "arm64"}:          "not pinned yet: run task catalog:pin",
-	{Entry: "memtest86plus", Arch: "amd64"}: "not pinned yet: run task catalog:pin",
-	{Entry: "memtest86plus", Arch: "arm64"}: "not pinned yet: run task catalog:pin",
-	{Entry: "shredos", Arch: "amd64"}:       "not pinned yet: run task catalog:pin",
-	{Entry: "systemrescue", Arch: "amd64"}:  "not pinned yet: run task catalog:pin",
-	{Entry: "uefishell", Arch: "amd64"}:     "not pinned yet: run task catalog:pin",
-	{Entry: "uefishell", Arch: "arm64"}:     "not pinned yet: run task catalog:pin",
-}
+var absent = map[Key]string{}
