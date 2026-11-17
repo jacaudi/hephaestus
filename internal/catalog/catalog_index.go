@@ -210,6 +210,13 @@ func (s Spec) validateBoot() error {
 	if !scriptSafe(s.Args, true) {
 		errs = append(errs, fmt.Errorf("args %q carry a control character, $ or a byte outside printable ASCII", s.Args))
 	}
+	// iPXE splits a line on whitespace with no quoting: a token of ;, || or &&
+	// ends the command and a token starting with # starts a comment
+	// (src/core/exec.c), so either would run a second command or drop the
+	// recipe's tail.
+	if i := strings.IndexAny(s.Args, ";|&#"); i >= 0 {
+		errs = append(errs, fmt.Errorf("args %q carry %q, which iPXE reads as a command separator or a comment", s.Args, s.Args[i]))
+	}
 	return errors.Join(errs...)
 }
 

@@ -107,9 +107,7 @@ func TestRecipe_HonoursBootIF(t *testing.T) {
 // header, one kernel or chain line, the initrd lines, and boot where the
 // recipe needs it. A line anywhere else is a script-injection hole.
 func TestScript_LineStructure(t *testing.T) {
-	specs := catalog.Specs()
-	for i := range specs {
-		s := &specs[i]
+	for _, s := range catalog.Specs() {
 		script := s.Script(testAddr(t))
 		if !strings.HasSuffix(script, "\n") || strings.Contains(script, "\r") {
 			t.Errorf("%v: script does not end in one LF or carries a CR: %q", s.Key(), script)
