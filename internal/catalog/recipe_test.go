@@ -102,3 +102,43 @@ func TestRecipe_HonoursBootIF(t *testing.T) {
 		}
 	}
 }
+
+// TestScript_LineStructure pins the shape of every production script: the
+// header, one kernel or chain line, the initrd lines, and boot where the
+// recipe needs it. A line anywhere else is a script-injection hole.
+func TestScript_LineStructure(t *testing.T) {
+	specs := catalog.Specs()
+	for i := range specs {
+		s := &specs[i]
+		script := s.Script(testAddr(t))
+		if !strings.HasSuffix(script, "\n") || strings.Contains(script, "\r") {
+			t.Errorf("%v: script does not end in one LF or carries a CR: %q", s.Key(), script)
+			continue
+		}
+		lines := strings.Split(strings.TrimSuffix(script, "\n"), "\n")
+		if lines[0] != "#!ipxe" {
+			t.Errorf("%v: first line %q, want #!ipxe", s.Key(), lines[0])
+		}
+		if s.Recipe == catalog.RecipeChain {
+			if len(lines) != 2 || !strings.HasPrefix(lines[1], "chain ") {
+				t.Errorf("%v: chain script is %q, want a header and one chain line", s.Key(), lines)
+			}
+			continue
+		}
+		if len(lines) != 3+len(s.Boot.Initrds) {
+			t.Errorf("%v: %d lines, want %d: %q", s.Key(), len(lines), 3+len(s.Boot.Initrds), lines)
+			continue
+		}
+		if !strings.HasPrefix(lines[1], "kernel ") {
+			t.Errorf("%v: second line %q, want a kernel line", s.Key(), lines[1])
+		}
+		for _, l := range lines[2 : len(lines)-1] {
+			if !strings.HasPrefix(l, "initrd ") {
+				t.Errorf("%v: line %q between kernel and boot is not an initrd", s.Key(), l)
+			}
+		}
+		if last := lines[len(lines)-1]; last != "boot" {
+			t.Errorf("%v: last line %q, want boot", s.Key(), last)
+		}
+	}
+}

@@ -12,7 +12,8 @@ import (
 const bootIFArg = "BOOTIF=01-${net${idx}/mac:hexhyp}"
 
 // BaseURL returns the URL the entry's files are served under, ending in "/".
-// addr is the provisioning address: live-boot's fetch= accepts an IP only.
+// addr is the provisioning address and must be a valid IPv4 address, which
+// config guarantees; live-boot's fetch= accepts an IP only.
 func (s Spec) BaseURL(addr netip.Addr) string {
 	return "http://" + addr.String() + "/u/" + s.Entry + "/" + s.Arch + "/" + s.Version + "/"
 }

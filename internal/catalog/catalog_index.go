@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"net/url"
 	"slices"
 	"strings"
 )
@@ -15,9 +16,6 @@ const (
 	archAMD64 = "amd64"
 	archARM64 = "arm64"
 )
-
-// httpsPrefix starts every URL a spec names.
-const httpsPrefix = "https://"
 
 // Catalog is the validated set of entries: every spec that has a pin.
 type Catalog struct {
@@ -58,12 +56,12 @@ func New(specs []Spec, pins map[Key]Pin) (*Catalog, error) {
 	var errs []error
 	bySpec := make(map[Key]Spec, len(specs))
 	for i := range specs {
-		s := specs[i]
+		s := &specs[i]
 		if _, dup := bySpec[s.Key()]; dup {
 			errs = append(errs, fmt.Errorf("spec %s/%s: listed twice", s.Entry, s.Arch))
 			continue
 		}
-		bySpec[s.Key()] = s
+		bySpec[s.Key()] = *s
 		if err := s.validate(); err != nil {
 			errs = append(errs, fmt.Errorf("spec %s/%s: %w", s.Entry, s.Arch, err))
 		}
@@ -197,18 +195,22 @@ func (s Spec) validateIdentity() error {
 
 // validateBoot checks what the recipe kind requires of Boot and Args.
 func (s Spec) validateBoot() error {
+	var errs []error
 	switch s.Recipe {
 	case RecipeChain:
 		if len(s.Boot.Initrds) > 0 || s.Boot.Second != "" || s.Args != "" {
-			return errors.New("a chain recipe takes a kernel only: no initrds, second stage or args")
+			errs = append(errs, errors.New("a chain recipe takes a kernel only: no initrds, second stage or args"))
 		}
 	case RecipeArchiso, RecipeLiveBoot:
 		if s.Boot.Second == "" {
-			return fmt.Errorf("a %s recipe needs a second stage", s.Recipe)
+			errs = append(errs, fmt.Errorf("a %s recipe needs a second stage", s.Recipe))
 		}
 	case RecipeKernel:
 	}
-	return nil
+	if !scriptSafe(s.Args, true) {
+		errs = append(errs, fmt.Errorf("args %q carry a control character, $ or a byte outside printable ASCII", s.Args))
+	}
+	return errors.Join(errs...)
 }
 
 // bootFiles returns the files Boot must name: the kernel, the initrds and, when
@@ -225,7 +227,7 @@ func (s Spec) bootFiles() []string {
 // path an earlier object already lists.
 func (o ObjectSpec) validate(seen map[string]bool) error {
 	var errs []error
-	if !strings.HasPrefix(o.URL, httpsPrefix) {
+	if !isHTTPS(o.URL) {
 		errs = append(errs, fmt.Errorf("object URL %q is not https", o.URL))
 	}
 	switch o.Container {
@@ -235,10 +237,13 @@ func (o ObjectSpec) validate(seen map[string]bool) error {
 	}
 	errs = append(errs, o.Signature.validate())
 	for _, f := range o.Files {
-		switch {
-		case !ValidPath(f):
+		if !ValidPath(f) {
 			errs = append(errs, fmt.Errorf("file path %q is not a clean relative path", f))
-		case seen[f]:
+		}
+		if !scriptSafe(f, false) || strings.Contains(f, "#") {
+			errs = append(errs, fmt.Errorf("file path %q is not script-safe: it carries a control character, space, $, # or a byte outside printable ASCII", f))
+		}
+		if seen[f] {
 			errs = append(errs, fmt.Errorf("file %q is listed twice", f))
 		}
 		seen[f] = true
@@ -259,7 +264,7 @@ func (g Signature) validate() error {
 		errs = append(errs, errors.New("signature is neither TOFU nor a SigURL with a Key"))
 	}
 	for _, u := range []string{g.SigURL, g.ChecksumsURL} {
-		if u != "" && !strings.HasPrefix(u, httpsPrefix) {
+		if u != "" && !isHTTPS(u) {
 			errs = append(errs, fmt.Errorf("signature URL %q is not https", u))
 		}
 	}
@@ -315,9 +320,10 @@ func validateObjectPin(s ObjectSpec, o ObjectPin) error {
 }
 
 // pathSafe reports whether s is non-empty and made of [A-Za-z0-9._-] only, so
-// it is one URL path element that needs no escaping.
+// it is one URL path element that needs no escaping. "." and ".." are not: they
+// are path steps, not names.
 func pathSafe(s string) bool {
-	if s == "" {
+	if s == "" || s == "." || s == ".." {
 		return false
 	}
 	for _, r := range s {
@@ -337,6 +343,27 @@ func isSHA256(s string) bool {
 	}
 	for _, r := range s {
 		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// isHTTPS reports whether u parses as an https URL with a host.
+func isHTTPS(u string) bool {
+	p, err := url.Parse(u)
+	return err == nil && p.Scheme == "https" && p.Host != ""
+}
+
+// scriptSafe reports whether s can be written into an iPXE script line
+// without ending it or expanding a setting: every byte is printable ASCII
+// and not '$', with the space allowed only when allowSpace is set (Args holds
+// several arguments; a file path is one word).
+func scriptSafe(s string, allowSpace bool) bool {
+	for i := range len(s) {
+		switch c := s[i]; {
+		case c == ' ' && allowSpace:
+		case c <= ' ' || c >= 0x7f || c == '$':
 			return false
 		}
 	}
