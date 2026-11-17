@@ -9,10 +9,12 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"io/fs"
 	"log/slog"
 	"maps"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -26,8 +28,12 @@ import (
 
 	"go.jacaudi.dev/hephaestus/internal/catalog"
 	"go.jacaudi.dev/hephaestus/internal/catalog/catalogtest"
+	"go.jacaudi.dev/hephaestus/internal/db"
+	"go.jacaudi.dev/hephaestus/internal/fleet"
 	"go.jacaudi.dev/hephaestus/internal/secret"
+	"go.jacaudi.dev/hephaestus/internal/store"
 	"go.jacaudi.dev/hephaestus/internal/tlscert/tlscerttest"
+	"go.jacaudi.dev/hephaestus/internal/toolcache"
 )
 
 const (
@@ -114,7 +120,7 @@ func testDeps(t *testing.T, root *x509.Certificate) serveDeps {
 	t.Helper()
 
 	lns := listenLoopback(t, 3)
-	return serveDeps{httpLn: lns[0], httpsLn: lns[1], adminLn: lns[2], files: testFiles(), roots: []*x509.Certificate{root}, catalog: testCatalog(t)}
+	return serveDeps{httpLn: lns[0], httpsLn: lns[1], adminLn: lns[2], files: testFiles(), roots: []*x509.Certificate{root}, catalog: testCatalog(t), client: testUpstreamClient()}
 }
 
 // testProxyDeps is the proxy-mode wiring: boot HTTP, proxy and admin listeners.
@@ -122,7 +128,7 @@ func testProxyDeps(t *testing.T) serveDeps {
 	t.Helper()
 
 	lns := listenLoopback(t, 3)
-	return serveDeps{httpLn: lns[0], proxyLn: lns[1], adminLn: lns[2], files: testFiles(), catalog: testCatalog(t)}
+	return serveDeps{httpLn: lns[0], proxyLn: lns[1], adminLn: lns[2], files: testFiles(), catalog: testCatalog(t), client: testUpstreamClient()}
 }
 
 func (d serveDeps) httpURL() string  { return "http://" + d.httpLn.Addr().String() }
@@ -820,5 +826,282 @@ func TestRunServe_CorruptStoreIndexMovedAside(t *testing.T) {
 	}
 	if got := lines[0]["path"]; got != moved[0] {
 		t.Errorf("path = %v, want %v", got, moved[0])
+	}
+}
+
+// testUpstreamClient is the upstream client the serve tests that fetch nothing
+// run with: the production client, trusting the system roots.
+func testUpstreamClient() *http.Client { return toolcache.NewHTTPClient("hephaestus/test", nil) }
+
+// utilityUpstream is a TLS 1.3 fake object server. Its handler is swapped
+// atomically, so the fixture catalog can be built from the server's own URL.
+type utilityUpstream struct {
+	*httptest.Server
+
+	handler atomic.Pointer[http.Handler]
+}
+
+// newUtilityUpstream starts the server. The caller closes it with defer, after
+// its goleak defer, so the upstream's connections close before goleak looks:
+// the production client keeps its connections alive and exposes no transport.
+func newUtilityUpstream() *utilityUpstream {
+	u := &utilityUpstream{}
+	u.serve(http.NotFoundHandler())
+	u.Server = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		(*u.handler.Load()).ServeHTTP(w, r)
+	}))
+	u.Config.ErrorLog = slog.NewLogLogger(slog.DiscardHandler, slog.LevelError)
+	u.TLS = &tls.Config{MinVersion: tls.VersionTLS13}
+	u.StartTLS()
+	return u
+}
+
+func (u *utilityUpstream) serve(h http.Handler) { u.handler.Store(&h) }
+
+// client is the production upstream client trusting this server.
+func (u *utilityUpstream) client() *http.Client {
+	pool := x509.NewCertPool()
+	pool.AddCert(u.Certificate())
+	return toolcache.NewHTTPClient("hephaestus/test", pool)
+}
+
+// serveObjects serves each object at its URL's path, with a strong ETag and range support.
+func serveObjects(base string, objects map[string][]byte) http.Handler {
+	mux := http.NewServeMux()
+	for url, body := range objects {
+		mux.HandleFunc("GET "+strings.TrimPrefix(url, base), func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("ETag", `"v1"`)
+			http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(body))
+		})
+	}
+	return mux
+}
+
+// openCache opens and migrates the database cfg names, as serve will find it.
+// The returned function closes it; call it with defer, after the goleak defer,
+// because an open database holds a goroutine.
+func openCache(t *testing.T, cfg serveConfig) (*fleet.Repository, func()) {
+	t.Helper()
+	d, err := db.Open(t.Context(), cfg.DatabaseURL)
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+	}
+	if err := d.Migrate(t.Context()); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	return fleet.NewRepository(d), func() {
+		if err := d.Close(); err != nil {
+			t.Errorf("close database: %v", err)
+		}
+	}
+}
+
+// waitCacheState polls the row at key until it is in state, failing the test after within.
+func waitCacheState(t *testing.T, repo *fleet.Repository, key fleet.CacheKey, state fleet.CacheState, within time.Duration) fleet.CacheRow {
+	t.Helper()
+	var row fleet.CacheRow
+	deadline := time.Now().Add(within)
+	for time.Now().Before(deadline) {
+		var ok bool
+		var err error
+		row, ok, err = repo.CacheRow(t.Context(), key)
+		if err != nil {
+			t.Fatalf("CacheRow(%v): %v", key, err)
+		}
+		if ok && row.State == state {
+			return row
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("row %v = %s (%q) after %s, want %s", key, row.State, row.LastError, within, state)
+	return row
+}
+
+// logRecords decodes the JSON log lines whose msg is msg.
+func logRecords(logs []byte, msg string) []map[string]any {
+	var out []map[string]any
+	for line := range bytes.SplitSeq(logs, []byte("\n")) {
+		var rec map[string]any
+		if json.Unmarshal(line, &rec) != nil {
+			continue
+		}
+		if rec["msg"] == msg {
+			out = append(out, rec)
+		}
+	}
+	return out
+}
+
+func tshellAMD64Key() fleet.CacheKey { return fleet.CacheKey{Entry: "tshell", Arch: fleet.ArchAMD64} }
+
+func TestRunServe_FetchesWantedUtility(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	up := newUtilityUpstream()
+	defer up.Close()
+	fx := catalogtest.New(t, up.URL)
+	up.serve(serveObjects(up.URL, fx.Objects))
+
+	var logs bytes.Buffer
+	cfg, root := testServeConfig(t)
+	deps := testDeps(t, root)
+	deps.catalog, deps.client = fx.Catalog, up.client()
+	repo, closeDB := openCache(t, cfg)
+	defer closeDB()
+	entry, _ := fx.Catalog.Lookup("tshell", "amd64")
+	if _, err := repo.RequestFetch(t.Context(), tshellAMD64Key(), entry.Pin.ID, 0, time.Now()); err != nil {
+		t.Fatalf("RequestFetch: %v", err)
+	}
+	stop, done := startServe(t, cfg, slog.New(slog.NewJSONHandler(&logs, nil)), deps)
+	waitStatus(t, deps.adminURL()+"/readyz", done)
+
+	waitCacheState(t, repo, tshellAMD64Key(), fleet.CacheReady, 5*time.Second)
+
+	health := get(t, testClient(nil), deps.adminURL()+"/health")
+	var doc struct {
+		Checks map[string][]struct {
+			Status string `json:"status"`
+		} `json:"checks"`
+	}
+	if err := json.Unmarshal([]byte(health.body), &doc); err != nil {
+		t.Fatalf("decode /health: %v\n%s", err, health.body)
+	}
+	if got := doc.Checks["store:readable"]; len(got) != 1 || got[0].Status != "pass" {
+		t.Errorf("GET /health store:readable = %v, want one passing check:\n%s", got, health.body)
+	}
+	if _, ok := doc.Checks["store:bytes"]; !ok {
+		t.Errorf("GET /health lacks the store:bytes check:\n%s", health.body)
+	}
+	if metrics := get(t, testClient(nil), deps.adminURL()+"/metrics"); !strings.Contains(metrics.body, "hephaestus_utility_fetch_bytes_total") {
+		t.Errorf("GET /metrics lacks hephaestus_utility_fetch_bytes_total:\n%s", metrics.body)
+	}
+
+	stop()
+	if err := waitDone(t, done, 10*time.Second); err != nil {
+		t.Fatalf("runServe after cancel = %v, want nil", err)
+	}
+
+	// runServe has returned, so nothing writes to logs any more.
+	var ready int
+	for _, rec := range logRecords(logs.Bytes(), "utility fetch") {
+		if rec["to"] == "ready" {
+			ready++
+			if rec["entry"] != "tshell" || rec["arch"] != "amd64" || rec["pin"] != entry.Pin.ID || rec["from"] != "fetching" {
+				t.Errorf("ready record = %v, want tshell/amd64 at %s from fetching", rec, entry.Pin.ID)
+			}
+		}
+	}
+	if ready != 1 {
+		t.Errorf("%d \"utility fetch\" lines with to ready, want 1\n%s", ready, logs.String())
+	}
+
+	// The check is called directly: /health shows the value of its last
+	// scheduled run, which may predate the fetch.
+	st, _, err := store.Open(t.Context(), filepath.Join(cfg.DataDir, "store"), time.Now)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	for _, check := range st.Checks() {
+		if check.Name != "store:bytes" {
+			continue
+		}
+		res := check.Run(t.Context())
+		if n, ok := res.ObservedValue.(int64); !ok || n <= 0 {
+			t.Errorf("store:bytes = %+v, want a positive byte count", res)
+		}
+	}
+}
+
+func TestRunServe_ReconcilesBeforeServing(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	var logs bytes.Buffer
+	cfg, root := testServeConfig(t)
+	deps := testDeps(t, root)
+	deps.catalog = catalogtest.New(t, "https://127.0.0.1:1").Catalog // nothing listens: a fetch fails at once
+	repo, closeDB := openCache(t, cfg)
+	defer closeDB()
+	entry, _ := deps.catalog.Lookup("tshell", "amd64")
+	if _, err := repo.RequestFetch(t.Context(), tshellAMD64Key(), entry.Pin.ID, 0, time.Now()); err != nil {
+		t.Fatalf("RequestFetch: %v", err)
+	}
+	if _, claimed, err := repo.ClaimFetch(t.Context(), time.Now()); err != nil || !claimed { // wanted to fetching: the process that fetched it died
+		t.Fatalf("ClaimFetch = %v, %v; want true, nil", claimed, err)
+	}
+	spool := filepath.Join(cfg.DataDir, "spool")
+	if err := os.MkdirAll(spool, 0o700); err != nil {
+		t.Fatalf("create spool dir: %v", err)
+	}
+	junk := filepath.Join(spool, "junk")
+	if err := os.WriteFile(junk, []byte("partial"), 0o600); err != nil {
+		t.Fatalf("write spool file: %v", err)
+	}
+	stop, done := startServe(t, cfg, slog.New(slog.NewJSONHandler(&logs, nil)), deps)
+
+	waitStatus(t, deps.adminURL()+"/readyz", done)
+
+	if _, err := os.Stat(junk); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("stat the junk spool file = %v, want it removed", err)
+	}
+	stop()
+	if err := waitDone(t, done, 10*time.Second); err != nil {
+		t.Fatalf("runServe after cancel = %v, want nil", err)
+	}
+
+	// runServe has returned, so nothing writes to logs any more.
+	reconciled := logRecords(logs.Bytes(), "utility reconciled")
+	if len(reconciled) != 1 {
+		t.Fatalf("%d \"utility reconciled\" lines, want 1\n%s", len(reconciled), logs.String())
+	}
+	if rec := reconciled[0]; rec["interrupted"] != float64(1) || rec["spool_removed"] != float64(1) {
+		t.Errorf("record = %v, want interrupted 1 and spool_removed 1", rec)
+	}
+	var order []string
+	for line := range bytes.SplitSeq(logs.Bytes(), []byte("\n")) {
+		var rec map[string]any
+		if json.Unmarshal(line, &rec) != nil {
+			continue
+		}
+		if msg, _ := rec["msg"].(string); msg == "utility reconciled" || msg == "request" {
+			order = append(order, msg)
+		}
+	}
+	if len(order) < 2 || order[0] != "utility reconciled" {
+		t.Errorf("log order = %v, want \"utility reconciled\" before the first \"request\"", order)
+	}
+	if gc := logRecords(logs.Bytes(), "utility garbage collected"); len(gc) != 1 || gc[0]["untagged"] != float64(0) {
+		t.Errorf("\"utility garbage collected\" records = %v, want one with untagged 0", gc)
+	}
+}
+
+func TestRunServe_FetchFailureDoesNotStopServe(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	up := newUtilityUpstream()
+	defer up.Close()
+	up.serve(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { http.Error(w, "down", http.StatusServiceUnavailable) }))
+	fx := catalogtest.New(t, up.URL)
+
+	cfg, root := testServeConfig(t)
+	deps := testDeps(t, root)
+	deps.catalog, deps.client = fx.Catalog, up.client()
+	repo, closeDB := openCache(t, cfg)
+	defer closeDB()
+	entry, _ := fx.Catalog.Lookup("tshell", "amd64")
+	if _, err := repo.RequestFetch(t.Context(), tshellAMD64Key(), entry.Pin.ID, 0, time.Now()); err != nil {
+		t.Fatalf("RequestFetch: %v", err)
+	}
+	stop, done := startServe(t, cfg, discardLogger(), deps)
+	waitStatus(t, deps.adminURL()+"/readyz", done)
+
+	waitCacheState(t, repo, tshellAMD64Key(), fleet.CacheFailed, 5*time.Second)
+
+	client := testClient(nil)
+	for end := time.Now().Add(2 * time.Second); time.Now().Before(end); time.Sleep(200 * time.Millisecond) {
+		if probe := get(t, client, deps.adminURL()+"/readyz"); probe.status != http.StatusOK {
+			t.Fatalf("GET /readyz after the failed fetch = %d, want 200", probe.status)
+		}
+	}
+	stop()
+	if err := waitDone(t, done, 10*time.Second); err != nil {
+		t.Errorf("runServe after cancel = %v, want nil", err)
 	}
 }

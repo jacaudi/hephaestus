@@ -1,0 +1,191 @@
+package toolcache
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"time"
+
+	"go.jacaudi.dev/hephaestus/internal/catalog"
+	"go.jacaudi.dev/hephaestus/internal/fleet"
+	"go.jacaudi.dev/hephaestus/internal/store"
+)
+
+// ReconcileConfig is what Reconcile brings into agreement. Every field is
+// required.
+type ReconcileConfig struct {
+	// Repo holds the utility_cache rows.
+	Repo *fleet.Repository
+	// Store holds the fetched content.
+	Store *store.Store
+	// Catalog says which entries and pins are current.
+	Catalog *catalog.Catalog
+	// SpoolDir holds the partial downloads; it must exist.
+	SpoolDir string
+	// At is the time written to every row Reconcile changes.
+	At time.Time
+}
+
+// ReconcileReport counts what Reconcile changed.
+type ReconcileReport struct {
+	// Interrupted is the fetching rows given back to wanted.
+	Interrupted int
+	// Deleted is the rows of entries the catalog no longer has.
+	Deleted int
+	// Repinned is the rows moved to the catalog's current pin.
+	Repinned int
+	// Requeued is the ready rows whose content is missing from the store.
+	Requeued int
+	// Restored is the rows found complete in the store and made ready.
+	Restored int
+	// SpoolRemoved is the spool files and directories removed.
+	SpoolRemoved int
+}
+
+// Reconcile brings the utility_cache rows, the store and the spool into
+// agreement with the catalog, in design section 5.7's order: fetching rows
+// become wanted; a row of an entry or architecture the catalog lacks is
+// deleted; a row at another pin is repinned; a ready row whose tag or layers
+// are not in the store is requeued; a wanted or failed row whose content is
+// complete in the store becomes ready; and every spool file that is not a
+// current pin's is removed. It runs before the fetcher starts. It stops at the
+// first repository error, which a done ctx causes.
+func Reconcile(ctx context.Context, cfg ReconcileConfig) (ReconcileReport, error) {
+	var rep ReconcileReport
+	n, err := cfg.Repo.ResetFetching(ctx, cfg.At)
+	if err != nil {
+		return rep, err
+	}
+	rep.Interrupted = n
+
+	rows, err := cfg.Repo.CacheRows(ctx)
+	if err != nil {
+		return rep, err
+	}
+	for i := range rows {
+		if err := reconcileRow(ctx, cfg, rows[i], &rep); err != nil {
+			return rep, err
+		}
+	}
+
+	entries := cfg.Catalog.Entries()
+	for i := range entries {
+		e := &entries[i]
+		if cfg.Store.CheckLayers(ctx, e.Tag()) != nil {
+			continue
+		}
+		key := fleet.CacheKey{Entry: e.Entry, Arch: fleet.Arch(e.Arch)}
+		moved, err := cfg.Repo.RestoreReady(ctx, key, e.Pin.ID, cfg.At)
+		if err != nil {
+			return rep, err
+		}
+		if moved {
+			rep.Restored++
+		}
+	}
+
+	rep.SpoolRemoved, err = sweepSpool(cfg)
+	return rep, err
+}
+
+// reconcileRow settles one row against the catalog and the store. A ready row
+// whose store check fails for any reason has no content to serve, so it goes
+// back to wanted and is refetched, unattended. A done ctx fails the repository
+// call that follows, so a check that failed only because of it requeues nothing.
+func reconcileRow(ctx context.Context, cfg ReconcileConfig, row fleet.CacheRow, rep *ReconcileReport) error {
+	key := row.Key()
+	e, ok := cfg.Catalog.Lookup(row.Entry, string(row.Arch))
+	switch {
+	case !ok:
+		if err := cfg.Repo.DeleteCacheRow(ctx, key); err != nil {
+			return err
+		}
+		rep.Deleted++
+	case row.Pin != e.Pin.ID:
+		moved, err := cfg.Repo.Repin(ctx, key, row.Pin, e.Pin.ID, cfg.At)
+		if err != nil {
+			return err
+		}
+		if moved {
+			rep.Repinned++
+		}
+	case row.State == fleet.CacheReady:
+		if cfg.Store.CheckLayers(ctx, e.Tag()) == nil {
+			return nil
+		}
+		moved, err := cfg.Repo.Requeue(ctx, key, row.Pin, cfg.At)
+		if err != nil {
+			return err
+		}
+		if moved {
+			rep.Requeued++
+		}
+	}
+	return nil
+}
+
+// sweepSpool removes every entry of the spool directory that is not the spool
+// file or ETag sidecar of some current pin's object. It removes what it can and
+// joins the failures. It returns how many entries it removed.
+func sweepSpool(cfg ReconcileConfig) (removed int, err error) {
+	keep := map[string]bool{}
+	current := cfg.Catalog.Entries()
+	for i := range current {
+		pin := &current[i].Pin
+		for n := range pin.Objects {
+			keep[SpoolName(pin.ID, n)] = true
+			keep[ETagName(pin.ID, n)] = true
+		}
+	}
+	root, err := os.OpenRoot(cfg.SpoolDir)
+	if err != nil {
+		return 0, fmt.Errorf("toolcache: open the spool dir: %w", err)
+	}
+	defer func() { err = errors.Join(err, root.Close()) }()
+	entries, err := fs.ReadDir(root.FS(), ".")
+	if err != nil {
+		return 0, fmt.Errorf("toolcache: list the spool dir: %w", err)
+	}
+	var errs []error
+	for _, ent := range entries {
+		if keep[ent.Name()] {
+			continue
+		}
+		if err := root.RemoveAll(ent.Name()); err != nil {
+			errs = append(errs, fmt.Errorf("toolcache: remove spool entry %s: %w", ent.Name(), err))
+			continue
+		}
+		removed++
+	}
+	return removed, errors.Join(errs...)
+}
+
+// CollectGarbage untags every tag that starts with catalog.TagPrefix and is not
+// the tag of some current catalog entry, then removes the blobs no tag reaches
+// (the store keeps unreachable blobs written in the last hour). Tags of other
+// prefixes are left alone. It returns how many tags it removed. Run it at
+// startup only: nothing may be pushing blobs, and a removed tag is not served.
+func CollectGarbage(ctx context.Context, st *store.Store, cat *catalog.Catalog) (int, error) {
+	current := map[string]bool{}
+	entries := cat.Entries()
+	for i := range entries {
+		current[entries[i].Tag()] = true
+	}
+	tags, err := st.Tags(ctx, catalog.TagPrefix)
+	if err != nil {
+		return 0, err
+	}
+	var untagged int
+	for _, tag := range tags {
+		if current[tag] {
+			continue
+		}
+		if err := st.Untag(ctx, tag); err != nil {
+			return untagged, err
+		}
+		untagged++
+	}
+	return untagged, st.GC(ctx)
+}

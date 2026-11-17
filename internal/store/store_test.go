@@ -713,6 +713,30 @@ func TestChecks(t *testing.T) {
 	}
 }
 
+// TestChecks_FreshStore pins that a store nothing was pushed to is healthy: oras
+// creates blobs/sha256 with the first blob, so a first run has no such directory.
+func TestChecks_FreshStore(t *testing.T) {
+	s, root := newStore(t)
+	byName := map[string]admin.Check{}
+	for _, c := range s.Checks() {
+		byName[c.Name] = c
+	}
+
+	if got := byName["store:readable"].Run(t.Context()); got.Status != admin.StatusPass {
+		t.Errorf("store:readable on a fresh store = %+v, want pass", got)
+	}
+	if got := byName["store:bytes"].Run(t.Context()); got.Status != admin.StatusPass || got.ObservedValue != int64(0) {
+		t.Errorf("store:bytes on a fresh store = %+v, want pass, 0 bytes", got)
+	}
+
+	if err := os.RemoveAll(filepath.Join(root, "blobs")); err != nil {
+		t.Fatalf("remove blobs: %v", err)
+	}
+	if got := byName["store:readable"].Run(t.Context()); got.Status != admin.StatusFail {
+		t.Errorf("store:readable without the blobs directory = %+v, want fail", got)
+	}
+}
+
 func TestLayers_MissingManifestBlob(t *testing.T) {
 	s, root := newStore(t)
 	m := tagLayers(t, s, utilityRef, pushLayer(t, s, "boot/vmlinuz", []byte("kernel")))

@@ -29,6 +29,7 @@ import (
 	"go.jacaudi.dev/hephaestus/internal/third_party/omniprovider/dhcp"
 	"go.jacaudi.dev/hephaestus/internal/third_party/omniprovider/tftp"
 	"go.jacaudi.dev/hephaestus/internal/tlscert"
+	"go.jacaudi.dev/hephaestus/internal/toolcache"
 )
 
 const (
@@ -128,7 +129,10 @@ func listenAndServe(ctx context.Context, cfg serveConfig, logger *slog.Logger) e
 	if err != nil {
 		return err
 	}
-	deps := serveDeps{httpLn: lns[0], adminLn: lns[2], udp: true, files: files, roots: roots, catalog: cat}
+	deps := serveDeps{
+		httpLn: lns[0], adminLn: lns[2], udp: true, files: files, roots: roots, catalog: cat,
+		client: toolcache.NewHTTPClient("hephaestus/"+buildVersion(), nil),
+	}
 	if cfg.TLSMode == tlsModeProxy {
 		deps.proxyLn = lns[1]
 	} else {
@@ -159,8 +163,11 @@ type serveDeps struct {
 	// roots are the certificates the iPXE binaries trust; a file-mode certificate
 	// must chain to one of them.
 	roots []*x509.Certificate
-	// catalog is the utility catalog boot-next entries are looked up in.
+	// catalog is the utility catalog boot-next entries are looked up in and the
+	// fetcher downloads.
 	catalog *catalog.Catalog
+	// client is the upstream client the fetcher downloads utility content with.
+	client *http.Client
 }
 
 // listen opens a TCP listener on each address, in order. On a failure it
@@ -237,6 +244,16 @@ func runServe(ctx context.Context, cfg serveConfig, logger *slog.Logger, deps se
 
 	repo := fleet.NewRepository(dbh)
 
+	// Bring the cache rows, the store and the spool into agreement with the
+	// catalog before anything serves or fetches (design section 5.7).
+	rc := toolcache.ReconcileConfig{
+		Repo: repo, Store: content, Catalog: deps.catalog, SpoolDir: filepath.Join(cfg.DataDir, "spool"), At: time.Now(),
+	}
+	fetcher, err := prepareUtility(ctx, logger, metrics, rc, deps.client)
+	if err != nil {
+		return err
+	}
+
 	// File mode serves the certificate files; an unusable pair stops startup
 	// before anything serves. Proxy mode has no certificate: the proxy holds it.
 	var loader *tlscert.Loader
@@ -257,6 +274,7 @@ func runServe(ctx context.Context, cfg serveConfig, logger *slog.Logger, deps se
 
 	registry := admin.NewRegistry(slices.Concat(
 		dbh.Checks(),
+		content.Checks(),
 		[]admin.Check{admin.DiskCheck("disk:data_dir", cfg.DataDir, minFreeDisk)},
 		tlsChecks,
 	)...)
@@ -298,7 +316,7 @@ func runServe(ctx context.Context, cfg serveConfig, logger *slog.Logger, deps se
 	httpHandler := telemetry.WideEvents(metrics.Instrument(handlers.PlainHTTP(), "boot-http", deps.httpLn.Addr().String()), logger, slog.LevelInfo)
 
 	p := &plane{
-		cfg: cfg, deps: deps, logger: logger, life: life, registry: registry, loader: loader,
+		cfg: cfg, deps: deps, logger: logger, life: life, registry: registry, loader: loader, fetcher: fetcher,
 		adminSrv: newServer(deps.adminLn, adminHandler, 10*time.Second, logger),
 		httpSrv:  newServer(deps.httpLn, httpHandler, time.Minute, logger),
 	}
@@ -322,6 +340,51 @@ func runServe(ctx context.Context, cfg serveConfig, logger *slog.Logger, deps se
 		}
 	}
 	return p.run(ctx)
+}
+
+// prepareUtility runs design section 5.7's steps 2 to 5: it creates the spool
+// directory, reconciles the cache rows, the store and the spool with the
+// catalog, and collects the garbage of tags that are no longer current, logging
+// what each changed. It returns the fetcher over the same rows, store and
+// spool, not yet started.
+func prepareUtility(ctx context.Context, logger *slog.Logger, metrics *telemetry.Metrics, rc toolcache.ReconcileConfig, client *http.Client) (*toolcache.Fetcher, error) {
+	if err := os.MkdirAll(rc.SpoolDir, 0o700); err != nil {
+		return nil, fmt.Errorf("create spool dir: %w", err)
+	}
+	rep, err := toolcache.Reconcile(ctx, rc)
+	if err != nil {
+		return nil, fmt.Errorf("reconcile utility cache: %w", err)
+	}
+	logger.InfoContext(ctx, "utility reconciled",
+		"interrupted", rep.Interrupted, "deleted", rep.Deleted, "repinned", rep.Repinned,
+		"requeued", rep.Requeued, "restored", rep.Restored, "spool_removed", rep.SpoolRemoved)
+	untagged, err := toolcache.CollectGarbage(ctx, rc.Store, rc.Catalog)
+	if err != nil {
+		return nil, fmt.Errorf("collect utility garbage: %w", err)
+	}
+	logger.InfoContext(ctx, "utility garbage collected", "untagged", untagged)
+
+	return toolcache.NewFetcher(
+		toolcache.FetcherConfig{Repo: rc.Repo, Store: rc.Store, Catalog: rc.Catalog, Client: client, SpoolDir: rc.SpoolDir},
+		toolcache.WithMeter(metrics.Meter()),
+		toolcache.WithEvents(func(ctx context.Context, ev toolcache.FetchEvent) { logFetchEvent(ctx, logger, ev) }),
+		toolcache.WithErrorHandler(func(ctx context.Context, err error) {
+			logger.WarnContext(ctx, "utility fetch loop error", "error", err)
+		}),
+	)
+}
+
+// logFetchEvent logs one state change of a utility cache row at Info. The
+// event's error has the userinfo, query and fragment of any URL removed already.
+func logFetchEvent(ctx context.Context, logger *slog.Logger, ev toolcache.FetchEvent) {
+	var cause string
+	if ev.Err != nil {
+		cause = ev.Err.Error()
+	}
+	logger.InfoContext(ctx, "utility fetch",
+		"entry", ev.Key.Entry, "arch", string(ev.Key.Arch), "pin", ev.Pin,
+		"from", string(ev.From), "to", string(ev.To), "attempts", ev.Attempts,
+		"class", ev.Class, "error", cause, "bytes", ev.Bytes, "duration_ms", ev.Duration.Milliseconds())
 }
 
 // newServer returns an http.Server for ln with every timeout set. Its
@@ -348,6 +411,8 @@ type plane struct {
 	registry *admin.Registry
 	// loader serves and follows the certificate files; nil in proxy mode.
 	loader *tlscert.Loader
+	// fetcher downloads the utility content that cache rows ask for.
+	fetcher *toolcache.Fetcher
 
 	adminSrv, httpSrv *http.Server
 	// httpsSrv is the boot HTTPS server in file mode and proxySrv the one behind
@@ -387,6 +452,7 @@ func (p *plane) run(ctx context.Context) error {
 		web.start("boot proxy server", func() error { return serveErr(p.proxySrv.Serve(p.deps.proxyLn)) })
 	}
 	work.start("health checks", func() error { p.registry.Run(workCtx); return nil })
+	work.start("utility fetcher", func() error { return p.fetcher.Run(workCtx) })
 	if p.loader != nil {
 		work.start("certificate loader", func() error { return p.loader.Run(workCtx) })
 	}

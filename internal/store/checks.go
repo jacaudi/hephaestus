@@ -139,7 +139,16 @@ func decodeIndex(r *os.Root) error {
 	return errors.Join(err, f.Close())
 }
 
-// readBlobDir lists the sha256 blob directory under r.
+// readBlobDir lists the sha256 blob directory under r. oras creates that
+// directory with the first blob, so a store nothing was pushed to lacks it and
+// the list is empty, provided the blobs directory itself is there.
 func readBlobDir(r *os.Root) ([]fs.DirEntry, error) {
-	return fs.ReadDir(r.FS(), path.Join(ocispec.ImageBlobsDir, digest.Canonical.String()))
+	entries, err := fs.ReadDir(r.FS(), path.Join(ocispec.ImageBlobsDir, digest.Canonical.String()))
+	if !errors.Is(err, fs.ErrNotExist) {
+		return entries, err
+	}
+	if _, err := r.Stat(ocispec.ImageBlobsDir); err != nil {
+		return nil, err
+	}
+	return nil, nil
 }

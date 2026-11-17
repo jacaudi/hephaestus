@@ -155,6 +155,50 @@ Every command takes `--json`. A boot-next flag expires 24 hours after it was set
 
 Shell access to the container is the authorization; the CLI has no network surface and no credentials of its own. It refuses to run, with exit status 1, while the database has pending migrations: start `hephaestus serve` once to apply them. A wrong number of arguments or an unknown flag exits with status 2.
 
+## Operations: utility content
+
+`serve` downloads the utility operating systems itself and keeps them in the data directory (`HEPHAESTUS_DATA_DIR`). The internet is needed only for the first fetch of each entry: once an entry is `ready`, it boots with no upstream.
+
+| Path | Holds |
+|---|---|
+| `<data>/store` | The content store, an OCI image layout. Each entry is one tag, `utility/<entry>-<arch>:<pin id>`, over one blob per extracted file. Blob files are read-only (0444) and never edited in place |
+| `<data>/spool` | Partial downloads, `<pin id>-<object index>` with an `.etag` sidecar. A fetch resumes from them after a restart |
+| `<data>/store.corrupt-<UTC time>` | A store `serve` set aside at startup (below). Only the newest is kept |
+
+**A fetch needs free space** on the spool volume: twice the object's size plus a 1 GiB reserve. The data directory also holds the database, so `/health` warns on `disk:data_dir` below 10% free.
+
+**When the store is moved aside.** If `index.json` cannot be decoded or has the wrong type, if the `oci-layout` version is unsupported, if a digest is malformed, or if a manifest does not match its digest or is truncated, `serve` renames `<data>/store` to `store.corrupt-<UTC time>`, logs one `store was unusable; moved aside` line at Error with the new path, starts an empty store and refetches. Any other failure, a permission or I/O error included, stops `serve` with that error and moves nothing. An empty `index.json` is not corruption: the store resets it in place and keeps its blobs.
+
+**Startup reconciliation** runs after the database and the store are open and before anything serves or fetches. It logs one `utility reconciled` line with these counts:
+
+| Count | What it did |
+|---|---|
+| `interrupted` | Rows that were `fetching` when the last process stopped go back to `wanted` |
+| `deleted` | Rows of an entry or architecture the catalog no longer has are removed |
+| `repinned` | A row at an older pin moves to `wanted` at the catalog's pin, with its attempts and error reset |
+| `requeued` | A `ready` row whose tag or any layer is missing or the wrong size goes back to `wanted`, so a restored or repaired host refetches its cache unattended |
+| `restored` | A `wanted` or `failed` row whose content is complete in the store becomes `ready` (a crash between tagging and the state update). A `broken` row stays broken |
+| `spool_removed` | Spool files that no current pin owns are deleted |
+
+**Garbage collection is restart-only.** After reconciliation, `serve` untags every `utility/*` tag that is not a current entry's, logs `utility garbage collected` with the `untagged` count, and deletes the blobs no tag reaches. The store spares unreferenced blobs written in the last hour. Tags outside `utility/` are never touched. Nothing collects while `serve` runs, so a catalog change frees its disk on the next restart.
+
+**Fetch log lines.** Every state change of a cache row logs one Info line, `utility fetch`, with `entry`, `arch`, `pin`, `from`, `to`, `attempts`, `class` (`integrity` or `other` for a failure), `error`, `bytes` and `duration_ms`. An error that the fetcher could not store on a row logs `utility fetch loop error` at Warn and polling continues; a failed fetch never stops `serve`. A transient failure is retried after a backoff that starts at one minute, doubles and caps at one hour, and the tenth failure makes the row `broken`. An integrity failure (a hash that does not match, a redirect off https) makes it `broken` at once. `hephaestus utility fetch <entry>` re-arms a `failed` or `broken` row.
+
+**`/health` items** (`GET /health` on the admin listener):
+
+| Item | Meaning |
+|---|---|
+| `store:readable` | Critical. Passes when `index.json` decodes and the blob directory lists; a failure takes `/readyz` to 503 |
+| `store:bytes` | Informational. The total size of the blob files, as an observed value in bytes |
+
+**Metrics** (`GET /metrics` on the admin listener):
+
+| Metric | Meaning |
+|---|---|
+| `hephaestus_utility_fetch_bytes_total` | Bytes downloaded from upstreams |
+| `hephaestus_utility_fetch_failures_total{class}` | Failed fetches, by class `integrity` or `other` |
+| `hephaestus_utility_boots_total{entry}` | Utility boot scripts served |
+
 ## Build
 
 ```sh
