@@ -76,7 +76,11 @@ func noArgs(cmd *cobra.Command, args []string) error {
 }
 
 // newRootCmd builds the hephaestus root command with its subcommands.
-func newRootCmd() *cobra.Command {
+func newRootCmd() *cobra.Command { return newRootCmdWith(defaultCLIDeps()) }
+
+// newRootCmdWith is newRootCmd with the admin commands reading deps instead of
+// the host, so tests can supply a fake interface table, clock and catalog.
+func newRootCmdWith(deps cliDeps) *cobra.Command {
 	root := &cobra.Command{
 		Use:   "hephaestus",
 		Short: "Boot bare metal into configured Talos nodes",
@@ -96,7 +100,7 @@ Run "hephaestus version" to print the build version.`,
 	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error {
 		return usageError{err}
 	})
-	root.AddCommand(newVersionCmd(), newServeCmd())
+	root.AddCommand(newVersionCmd(), newServeCmd(), newBootNextCmd(deps), newUtilityCmd(deps))
 	return root
 }
 
