@@ -6,9 +6,10 @@ import (
 	"strings"
 )
 
-// ErrUnsupportedAction is returned by Render for an action whose script M1
-// does not have.
-var ErrUnsupportedAction = errors.New("boot: script for this action is not available in M1")
+// ErrUnsupportedAction is returned by Render for utility and install: the
+// handlers build the utility script from the catalog entry, and the install
+// script needs a config ticket.
+var ErrUnsupportedAction = errors.New("boot: Render does not render this action")
 
 // ErrUnknownAction is returned by Render for an action that is not one of the
 // Action constants, so a decision that was never set cannot render as an empty script.
@@ -16,7 +17,7 @@ var ErrUnknownAction = errors.New("boot: unknown action")
 
 // bootQuery is the /boot query string. Request facts reach it only as iPXE
 // variables, never as text.
-const bootQuery = "uuid=${uuid}&mac=${net${idx}/mac:hexhyp}&arch=${buildarch}" +
+const bootQuery = "uuid=${uuid}&mac=${net${idx}/mac:hexhyp}&arch=${buildarch}&platform=${platform}" +
 	"&serial=${serial:uristring}&product=${product:uristring}"
 
 // reportTemplate posts the machine's facts to /discover; <fqdn> is replaced by the FQDN.
@@ -66,9 +67,8 @@ func ReportScript(fqdn, then string) string {
 	return ipxeHeader + reportBlock(fqdn) + strings.TrimPrefix(then, ipxeHeader)
 }
 
-// Render returns the script for d. Utility and install scripts belong to M2
-// and M3; Render returns ErrUnsupportedAction for them, and ErrUnknownAction
-// for an action it does not know.
+// Render returns the script for d. It returns ErrUnsupportedAction for utility
+// and install, and ErrUnknownAction for an action it does not know.
 func Render(d Decision, fqdn string) (string, error) {
 	var script string
 	switch d.Action {

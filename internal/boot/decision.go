@@ -1,6 +1,14 @@
 package boot
 
-import "go.jacaudi.dev/hephaestus/internal/fleet"
+import (
+	"time"
+
+	"go.jacaudi.dev/hephaestus/internal/catalog"
+	"go.jacaudi.dev/hephaestus/internal/fleet"
+)
+
+// BootNextTTL is how long after it was set a boot-next flag may still fire.
+const BootNextTTL = 24 * time.Hour
 
 // Action is what a /boot answer does for the machine.
 type Action string
@@ -37,6 +45,22 @@ const (
 type Request struct {
 	UUID, MAC, Serial, Product string
 	Arch                       fleet.Arch
+	// Platform is the firmware the machine booted with, or "" when the request
+	// named none or one the catalog does not recognise.
+	Platform catalog.Platform
+}
+
+// UtilityFacts are what the boot-next utility is in the catalog and the store,
+// for the machine's architecture and firmware.
+type UtilityFacts struct {
+	// InCatalog is whether the catalog has the entry at all.
+	InCatalog bool
+	// Supported is whether the entry boots on the machine's architecture and a
+	// recognised firmware.
+	Supported bool
+	// Ready is whether the entry's cache row is ready at the catalog's pin and
+	// its layers pass the size check.
+	Ready bool
 }
 
 // Input is everything Decide looks at.
@@ -52,18 +76,26 @@ type Input struct {
 	Request Request
 	// UnknownAction is the unknown_action setting.
 	UnknownAction fleet.UnknownAction
-	// BootNext is the one-shot utility target, or "" when none is set.
-	BootNext string
-	// UtilityReady, AssetsReady and Drift are owned by M2 and M3: whether the
-	// BootNext utility is cached, whether the machine's boot assets are cached,
-	// and whether the machine's rendered configuration has drifted.
-	UtilityReady, AssetsReady, Drift bool
+	// Now is the time of the decision; BootNext's age is measured against it.
+	Now time.Time
+	// BootNext is the one-shot utility target and BootNextSetAt when it was set,
+	// or "" when none is set.
+	BootNext      string
+	BootNextSetAt time.Time
+	// PlatformKnown is whether Request.Platform is a recognised firmware.
+	PlatformKnown bool
+	// Utility is what BootNext is in the catalog and the store; it is read only
+	// when BootNext is set.
+	Utility UtilityFacts
+	// AssetsReady and Drift are owned by M3: whether the machine's boot assets
+	// are cached, and whether the machine's rendered configuration has drifted.
+	AssetsReady, Drift bool
 }
 
 // Decision is the answer to a /boot request. Row is the design section 5.2
-// row that matched. The caller applies Trigger, MarkJunk, Alert and
-// ClearBootNext, mints a ticket when NeedsTicket is set, and renders the
-// script with Render.
+// row that matched. The caller applies Trigger, MarkJunk, Alert,
+// BootNextClear and WantUtility, mints a ticket when NeedsTicket is set, and
+// renders the script with Render, or with the entry's recipe for ActionUtility.
 type Decision struct {
 	Row    int
 	Action Action
@@ -75,8 +107,11 @@ type Decision struct {
 	Trigger fleet.Trigger
 	// MarkJunk marks the machine's UUID junk; Alert raises an operator alert.
 	MarkJunk, Alert bool
-	// ClearBootNext clears the one-shot utility target.
-	ClearBootNext bool
+	// BootNextClear is why the caller compare-and-clears the one-shot utility
+	// target, or "" to leave it.
+	BootNextClear fleet.ClearReason
+	// WantUtility asks the caller to want the BootNext utility's content fetched.
+	WantUtility bool
 	// NeedsTicket asks the caller to mint a config ticket (row 10 only).
 	NeedsTicket bool
 	// Utility is the utility OS to boot (row 3 only).
@@ -93,12 +128,37 @@ func Decide(in Input) Decision {
 	case in.Known && (m.Serial != in.Request.Serial || m.Product != in.Request.Product):
 		// A repeat on an already-junk record holds without a second alert.
 		return Decision{Row: 2, Action: ActionHold, Reason: reasonConflict, MarkJunk: !m.Junk, Alert: !m.Junk}
-	case in.BootNext != "" && in.UtilityReady:
-		return Decision{Row: 3, Action: ActionUtility, Utility: in.BootNext, ClearBootNext: true}
+	case in.Known && in.BootNext != "":
+		return bootNextDecision(in)
 	case !in.Known:
 		return unknownDecision(in, fleet.TriggerFirstContact)
 	}
 	return knownDecision(in)
+}
+
+// bootNextDecision is row 3 for a recorded machine with a boot-next flag: a
+// stale, unknown or unsupported flag is cleared and rows 4 to 10 decide the
+// boot; a ready one boots its utility; one not ready is kept and wanted, and
+// rows 4 to 10 decide the boot.
+func bootNextDecision(in Input) Decision {
+	var why fleet.ClearReason
+	var want bool
+	switch {
+	case in.Now.Sub(in.BootNextSetAt) > BootNextTTL:
+		why = fleet.ClearExpired
+	case !in.Utility.InCatalog:
+		why = fleet.ClearUnknownEntry
+	case in.PlatformKnown && !in.Utility.Supported:
+		// An unrecognised platform is never unsupported, only not ready.
+		why = fleet.ClearUnsupported
+	case in.PlatformKnown && in.Utility.Ready:
+		return Decision{Row: 3, Action: ActionUtility, Utility: in.BootNext, BootNextClear: fleet.ClearServed}
+	default:
+		want = true
+	}
+	d := knownDecision(in)
+	d.BootNextClear, d.WantUtility = why, want
+	return d
 }
 
 // knownDecision is rows 4 to 10 for a recorded machine.

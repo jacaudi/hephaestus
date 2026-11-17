@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"slices"
 	"sync"
 	"time"
@@ -20,8 +21,10 @@ import (
 	"go.jacaudi.dev/hephaestus/internal/admin"
 	"go.jacaudi.dev/hephaestus/internal/boot"
 	"go.jacaudi.dev/hephaestus/internal/boot/ipxe"
+	"go.jacaudi.dev/hephaestus/internal/catalog"
 	"go.jacaudi.dev/hephaestus/internal/db"
 	"go.jacaudi.dev/hephaestus/internal/fleet"
+	"go.jacaudi.dev/hephaestus/internal/store"
 	"go.jacaudi.dev/hephaestus/internal/telemetry"
 	"go.jacaudi.dev/hephaestus/internal/third_party/omniprovider/dhcp"
 	"go.jacaudi.dev/hephaestus/internal/third_party/omniprovider/tftp"
@@ -107,6 +110,10 @@ func listenAndServe(ctx context.Context, cfg serveConfig, logger *slog.Logger) e
 	if err != nil {
 		return fmt.Errorf("load iPXE trusted roots: %w", err)
 	}
+	cat, err := catalog.Default()
+	if err != nil {
+		return fmt.Errorf("load utility catalog: %w", err)
+	}
 	// The second boot listener is HTTPS on the provisioning address in file
 	// mode, and the proxy's upstream in proxy mode.
 	bootTLSAddr := netip.AddrPortFrom(cfg.Address, bootHTTPSPort)
@@ -121,7 +128,7 @@ func listenAndServe(ctx context.Context, cfg serveConfig, logger *slog.Logger) e
 	if err != nil {
 		return err
 	}
-	deps := serveDeps{httpLn: lns[0], adminLn: lns[2], udp: true, files: files, roots: roots}
+	deps := serveDeps{httpLn: lns[0], adminLn: lns[2], udp: true, files: files, roots: roots, catalog: cat}
 	if cfg.TLSMode == tlsModeProxy {
 		deps.proxyLn = lns[1]
 	} else {
@@ -152,6 +159,8 @@ type serveDeps struct {
 	// roots are the certificates the iPXE binaries trust; a file-mode certificate
 	// must chain to one of them.
 	roots []*x509.Certificate
+	// catalog is the utility catalog boot-next entries are looked up in.
+	catalog *catalog.Catalog
 }
 
 // listen opens a TCP listener on each address, in order. On a failure it
@@ -218,6 +227,12 @@ func runServe(ctx context.Context, cfg serveConfig, logger *slog.Logger, deps se
 		return err
 	}
 
+	// ponytail: the moved-aside path is dropped here; it is logged, with its own test, by the store-open handling task.
+	content, _, err := store.Open(ctx, filepath.Join(cfg.DataDir, "store"), time.Now)
+	if err != nil {
+		return err
+	}
+
 	repo := fleet.NewRepository(dbh)
 
 	// File mode serves the certificate files; an unusable pair stops startup
@@ -245,7 +260,17 @@ func runServe(ctx context.Context, cfg serveConfig, logger *slog.Logger, deps se
 	)...)
 	registry.RunOnce(ctx)
 
-	handlers, err := boot.NewHandlers(repo, cfg.FQDN, cfg.Subnet, deps.files, boot.WithMeter(metrics.Meter()))
+	handlers, err := boot.NewHandlers(boot.Config{
+		Repo: repo, Store: content, Catalog: deps.catalog,
+		FQDN: cfg.FQDN, Address: cfg.Address, Subnet: cfg.Subnet, Files: deps.files,
+	}, boot.WithMeter(metrics.Meter()), boot.WithErrorHandler(func(ctx context.Context, err error) {
+		// A lost race with the CLI is expected now and then; lost content is not.
+		level := slog.LevelError
+		if errors.Is(err, boot.ErrBootNextRace) {
+			level = slog.LevelWarn
+		}
+		logger.Log(ctx, level, "boot error", "error", err)
+	}))
 	if err != nil {
 		return err
 	}

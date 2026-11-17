@@ -2,6 +2,7 @@ package boot
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -18,20 +19,26 @@ import (
 	"unicode/utf8"
 
 	"go.jacaudi.dev/hephaestus/internal/boot/ipxe"
+	"go.jacaudi.dev/hephaestus/internal/catalog"
+	"go.jacaudi.dev/hephaestus/internal/catalog/catalogtest"
 	"go.jacaudi.dev/hephaestus/internal/db"
 	"go.jacaudi.dev/hephaestus/internal/db/dbtest"
 	"go.jacaudi.dev/hephaestus/internal/fleet"
+	"go.jacaudi.dev/hephaestus/internal/store"
 	"go.jacaudi.dev/hephaestus/internal/telemetry"
 )
 
 const (
 	testClientAddr = "10.10.20.50:40000"
+	testAddress    = "10.10.20.5"
 	bootUUID       = "4c4c4544-0042-3510-8052-b4c04f4e4d32"
 	bootMAC        = "aa:bb:cc:00:00:01"
 	zeroUUID       = "00000000-0000-0000-0000-000000000000"
 
 	// bootQ is a boot query as iPXE sends it.
 	bootQ = "uuid=" + bootUUID + "&mac=aa-bb-cc-00-00-01&arch=x86_64&serial=S1&product=P1"
+	// efiQ is bootQ from a machine booting with UEFI firmware.
+	efiQ = bootQ + "&platform=efi"
 
 	holdingConflict = "holding: identity conflict"
 )
@@ -84,6 +91,11 @@ func parseCases() []parseCase {
 		{"long serial", "serial=" + long, Request{}, errValueTooLong},
 		{"long product", "product=" + long, Request{}, errValueTooLong},
 		{"long arch", "arch=" + long, Request{}, errValueTooLong},
+		{"platform efi", "platform=efi", Request{Arch: fleet.ArchAMD64, Platform: catalog.PlatformEFI}, nil},
+		{"platform pcbios", "platform=pcbios", Request{Arch: fleet.ArchAMD64, Platform: catalog.PlatformPCBIOS}, nil},
+		{"platform linux is unknown", "platform=linux", Request{Arch: fleet.ArchAMD64}, nil},
+		{"platform missing is unknown", "serial=S1", Request{Serial: "S1", Arch: fleet.ArchAMD64}, nil},
+		{"long platform", "platform=" + strings.Repeat("a", 300), Request{}, errValueTooLong},
 	}
 }
 
@@ -93,6 +105,7 @@ func bootQueries() []string {
 	qs := []string{
 		bootQ, queryWith("S2", "P1"), hostileQuery(), oversizeQuery(),
 		zeroQuery("S1"), zeroQuery("S2"), unidentifiedQuery,
+		efiQ, bootQ + "&platform=pcbios", bootQ + "&platform=linux",
 	}
 	cases := parseCases()
 	for i := range cases {
@@ -120,24 +133,53 @@ func newRequest(t *testing.T, target string, secure bool) *http.Request {
 	return req
 }
 
-// rig is the handlers over a migrated SQLite database.
+// testConfig is the handlers' Config over repo, with a store at storeRoot, the
+// fixture catalog and the test address. It returns the fixture whose bytes
+// catalogtest.Stock puts in the store.
+func testConfig(t *testing.T, repo *fleet.Repository, storeRoot string) (Config, catalogtest.Fixture) {
+	t.Helper()
+	st, _, err := store.Open(t.Context(), storeRoot, time.Now)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	fix := catalogtest.New(t, "https://upstream.invalid")
+	return Config{
+		Repo: repo, Store: st, Catalog: fix.Catalog, FQDN: testFQDN,
+		Address: netip.MustParseAddr(testAddress), Subnet: testSubnet(), Files: testFiles(),
+	}, fix
+}
+
+// rig is the handlers over a migrated SQLite database, a store and the fixture
+// catalog.
 type rig struct {
 	t    *testing.T
 	d    *db.DB
 	repo *fleet.Repository
-	h    *Handlers
+	st   *store.Store
+	// storeRoot is the directory the store lives in.
+	storeRoot string
+	fix       catalogtest.Fixture
+	h         *Handlers
+	// errs are what the handlers reported to their error handler.
+	errs []error
 }
 
 func newRig(t *testing.T, opts ...Option) *rig {
 	t.Helper()
 	d := dbtest.SQLite(t)
 	repo := fleet.NewRepository(d)
-	opts = append([]Option{WithClock(testNow)}, opts...)
-	h, err := NewHandlers(repo, testFQDN, testSubnet(), testFiles(), opts...)
+	root := t.TempDir()
+	cfg, fix := testConfig(t, repo, root)
+	g := &rig{t: t, d: d, repo: repo, st: cfg.Store, storeRoot: root, fix: fix}
+	opts = append([]Option{WithClock(testNow), WithErrorHandler(func(_ context.Context, err error) {
+		g.errs = append(g.errs, err)
+	})}, opts...)
+	h, err := NewHandlers(cfg, opts...)
 	if err != nil {
 		t.Fatalf("NewHandlers: %v", err)
 	}
-	return &rig{t: t, d: d, repo: repo, h: h}
+	g.h = h
+	return g
 }
 
 // plain serves a plain-HTTP GET through PlainHTTP.
@@ -609,22 +651,24 @@ func TestBoot_AlertCountedOnce(t *testing.T) {
 	}
 }
 
-func TestM1Fallback(t *testing.T) {
+func TestFallback(t *testing.T) {
+	served := Decision{Row: 3, Action: ActionUtility, Utility: "tshell", BootNextClear: fleet.ClearServed}
 	cases := []struct {
 		name string
 		in   Decision
 		want Decision
 	}{
-		{"ticket", Decision{Row: 10, Action: ActionInstall, NeedsTicket: true},
-			Decision{Row: 10, Action: ActionHold, Reason: "ticket minting not available (M3)"}},
-		{"utility", Decision{Row: 3, Action: ActionUtility, Utility: "memtest", ClearBootNext: true},
-			Decision{Row: 3, Action: ActionHold, Reason: "utility boot not available (M2)"}},
+		{"install holds on the ticket", Decision{Row: 10, Action: ActionInstall, NeedsTicket: true},
+			Decision{Row: 10, Action: ActionHold, NeedsTicket: true, Reason: "ticket minting not available (M3)"}},
+		{"install keeps the row 3 fields", Decision{Row: 10, Action: ActionInstall, NeedsTicket: true, BootNextClear: fleet.ClearExpired, WantUtility: true},
+			Decision{Row: 10, Action: ActionHold, NeedsTicket: true, Reason: "ticket minting not available (M3)", BootNextClear: fleet.ClearExpired, WantUtility: true}},
+		{"utility passes through", served, served},
 		{"exit unchanged", Decision{Row: 6, Action: ActionExit}, Decision{Row: 6, Action: ActionExit}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := m1Fallback(tc.in); got != tc.want {
-				t.Errorf("m1Fallback(%+v) = %+v, want %+v", tc.in, got, tc.want)
+			if got := fallback(tc.in); got != tc.want {
+				t.Errorf("fallback(%+v) = %+v, want %+v", tc.in, got, tc.want)
 			}
 		})
 	}
@@ -672,6 +716,9 @@ func FuzzParseBootQuery(f *testing.F) {
 				t.Errorf("%s = %q, want valid text of at most %d bytes without NUL", name, v, maxValueBytes)
 			}
 		}
+		if _, ok := catalog.ParsePlatform(string(got.Platform)); got.Platform != "" && !ok {
+			t.Errorf("Platform = %q, want a recognised platform or empty", got.Platform)
+		}
 	})
 }
 
@@ -704,7 +751,9 @@ func TestTFTPRoute_EmbeddedBinaries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ipxe.Files: %v", err)
 	}
-	h, err := NewHandlers(fleet.NewRepository(dbtest.SQLite(t)), testFQDN, testSubnet(), files, WithClock(testNow))
+	cfg, _ := testConfig(t, fleet.NewRepository(dbtest.SQLite(t)), t.TempDir())
+	cfg.Files = files
+	h, err := NewHandlers(cfg, WithClock(testNow))
 	if err != nil {
 		t.Fatalf("NewHandlers: %v", err)
 	}
@@ -725,7 +774,9 @@ func TestTFTPRoute_OnBothMuxes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ipxe.Files: %v", err)
 	}
-	h, err := NewHandlers(fleet.NewRepository(dbtest.SQLite(t)), testFQDN, testSubnet(), files, WithClock(testNow))
+	cfg, _ := testConfig(t, fleet.NewRepository(dbtest.SQLite(t)), t.TempDir())
+	cfg.Files = files
+	h, err := NewHandlers(cfg, WithClock(testNow))
 	if err != nil {
 		t.Fatalf("NewHandlers: %v", err)
 	}
@@ -754,8 +805,9 @@ func TestTFTPRoute_OnBothMuxes(t *testing.T) {
 }
 
 func TestTFTPRoute_DeadlineOnRealConn(t *testing.T) {
-	d := dbtest.SQLite(t)
-	h, err := NewHandlers(fleet.NewRepository(d), testFQDN, netip.MustParsePrefix("127.0.0.0/8"), testFiles())
+	cfg, _ := testConfig(t, fleet.NewRepository(dbtest.SQLite(t)), t.TempDir())
+	cfg.Subnet = netip.MustParsePrefix("127.0.0.0/8")
+	h, err := NewHandlers(cfg)
 	if err != nil {
 		t.Fatalf("NewHandlers: %v", err)
 	}
@@ -802,8 +854,9 @@ func (r *deadlineRecorder) Write(b []byte) (int, error) {
 
 func TestTFTPRoute_DeadlineBeforeEveryWrite(t *testing.T) {
 	big := bytes.Repeat([]byte{0xEF}, 200_000)
-	h, err := NewHandlers(fleet.NewRepository(dbtest.SQLite(t)), testFQDN, testSubnet(),
-		map[string][]byte{"amd64/snp.efi": big})
+	cfg, _ := testConfig(t, fleet.NewRepository(dbtest.SQLite(t)), t.TempDir())
+	cfg.Files = map[string][]byte{"amd64/snp.efi": big}
+	h, err := NewHandlers(cfg)
 	if err != nil {
 		t.Fatalf("NewHandlers: %v", err)
 	}

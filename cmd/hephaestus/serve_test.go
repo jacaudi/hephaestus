@@ -23,6 +23,8 @@ import (
 
 	"go.uber.org/goleak"
 
+	"go.jacaudi.dev/hephaestus/internal/catalog"
+	"go.jacaudi.dev/hephaestus/internal/catalog/catalogtest"
 	"go.jacaudi.dev/hephaestus/internal/secret"
 	"go.jacaudi.dev/hephaestus/internal/tlscert/tlscerttest"
 )
@@ -99,13 +101,19 @@ func testFiles() map[string][]byte {
 	return map[string][]byte{"amd64/snp.efi": []byte("amd64-efi"), "arm64/snp.efi": []byte("arm64-efi")}
 }
 
+// testCatalog is the fixture catalog the test servers boot utilities from.
+func testCatalog(t *testing.T) *catalog.Catalog {
+	t.Helper()
+	return catalogtest.New(t, "https://upstream.invalid").Catalog
+}
+
 // testDeps is the file-mode wiring: boot HTTP, boot HTTPS and admin listeners,
 // and root as the one root the iPXE binaries trust.
 func testDeps(t *testing.T, root *x509.Certificate) serveDeps {
 	t.Helper()
 
 	lns := listenLoopback(t, 3)
-	return serveDeps{httpLn: lns[0], httpsLn: lns[1], adminLn: lns[2], files: testFiles(), roots: []*x509.Certificate{root}}
+	return serveDeps{httpLn: lns[0], httpsLn: lns[1], adminLn: lns[2], files: testFiles(), roots: []*x509.Certificate{root}, catalog: testCatalog(t)}
 }
 
 // testProxyDeps is the proxy-mode wiring: boot HTTP, proxy and admin listeners.
@@ -113,7 +121,7 @@ func testProxyDeps(t *testing.T) serveDeps {
 	t.Helper()
 
 	lns := listenLoopback(t, 3)
-	return serveDeps{httpLn: lns[0], proxyLn: lns[1], adminLn: lns[2], files: testFiles()}
+	return serveDeps{httpLn: lns[0], proxyLn: lns[1], adminLn: lns[2], files: testFiles(), catalog: testCatalog(t)}
 }
 
 func (d serveDeps) httpURL() string  { return "http://" + d.httpLn.Addr().String() }

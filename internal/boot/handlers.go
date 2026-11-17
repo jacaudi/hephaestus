@@ -18,7 +18,9 @@ import (
 	"go.opentelemetry.io/otel/metric/noop"
 
 	"go.jacaudi.dev/hephaestus/internal/boot/ipxe"
+	"go.jacaudi.dev/hephaestus/internal/catalog"
 	"go.jacaudi.dev/hephaestus/internal/fleet"
+	"go.jacaudi.dev/hephaestus/internal/store"
 	"go.jacaudi.dev/hephaestus/internal/telemetry"
 )
 
@@ -27,17 +29,16 @@ const (
 	// SMBIOS strings are far shorter; longer ones are hostile or broken.
 	maxValueBytes = 256
 
-	// scriptDeadline bounds writing an iPXE script; tftpIdle bounds each write of
+	// scriptDeadline bounds writing an iPXE script; idleWrite bounds each write of
 	// a binary, so a slow client may take as long as it keeps making progress.
 	scriptDeadline = 10 * time.Second
-	tftpIdle       = 30 * time.Second
+	idleWrite      = 30 * time.Second
 
 	contentTypeScript = "text/plain; charset=utf-8"
 	contentTypeBinary = "application/octet-stream"
 
-	// M1 has neither utility boots nor ticket minting; the machine holds instead.
-	reasonNoTicket  = "ticket minting not available (M3)"
-	reasonNoUtility = "utility boot not available (M2)"
+	// Config tickets are not minted yet; a machine that would install holds instead.
+	reasonNoTicket = "ticket minting not available (M3)"
 
 	alertKindUUIDConflict = "uuid_conflict"
 )
@@ -46,20 +47,52 @@ const (
 // value over maxValueBytes, wrapped with the key it came from.
 var errValueTooLong = errors.New("boot: value too long")
 
+// ErrBootNextRace is reported to the error handler when /boot found a machine's
+// boot-next changed by another process on two decisions in a row. The boot is
+// answered by rows 4 to 10 and the flag is left as it is.
+var ErrBootNextRace = errors.New("boot: boot-next changed twice while deciding; not cleared")
+
+// ErrUtilityMissing is reported to the error handler when a utility whose cache
+// row is ready has lost content in the store. The row is put back to wanted.
+var ErrUtilityMissing = errors.New("boot: ready utility content is missing from the store; fetch re-queued")
+
+// Config is what Handlers serves from: the fleet and the utility content, the
+// service's name and address, and the iPXE binaries.
+type Config struct {
+	Repo *fleet.Repository
+	// Store holds the utility content and Catalog says which entries exist and
+	// how each boots.
+	Store   *store.Store
+	Catalog *catalog.Catalog
+	// FQDN names the service in the scripts. Address is its address on the
+	// provisioning subnet, the host of the utility scripts' URLs; only clients in
+	// Subnet are served.
+	FQDN    string
+	Address netip.Addr
+	Subnet  netip.Prefix
+	// Files holds the iPXE binaries by the names /tftp serves them under, such as
+	// "amd64/snp.efi".
+	Files map[string][]byte
+}
+
 // Handlers serves the boot routes: the iPXE chain scripts over plain HTTP, the
 // iPXE binaries over plain HTTP and TLS, and /boot and /discover over TLS.
 type Handlers struct {
-	repo   *fleet.Repository
-	fqdn   string
-	subnet netip.Prefix
-	files  map[string][]byte
-	now    func() time.Time
-	meter  metric.Meter
+	repo    *fleet.Repository
+	content *store.Store
+	catalog *catalog.Catalog
+	fqdn    string
+	address netip.Addr
+	subnet  netip.Prefix
+	files   map[string][]byte
+	now     func() time.Time
+	meter   metric.Meter
+	onError func(context.Context, error)
 
 	limit             limiterConfig
 	limiter           *windowLimiter
 	decisions, alerts metric.Int64Counter
-	reports           metric.Int64Counter
+	reports, boots    metric.Int64Counter
 }
 
 // limiterConfig is what WithLimiter sets and NewHandlers builds the limiter from.
@@ -93,14 +126,21 @@ func WithLimiter(limit int, window time.Duration, capacity int) Option {
 	return func(h *Handlers) { h.limit = limiterConfig{limit: limit, window: window, capacity: capacity} }
 }
 
-// NewHandlers returns the boot routes for the service at fqdn. Only clients in
-// subnet are served. files holds the iPXE binaries by the names /tftp serves
-// them under, such as "amd64/snp.efi".
-func NewHandlers(repo *fleet.Repository, fqdn string, subnet netip.Prefix, files map[string][]byte, opts ...Option) (*Handlers, error) {
+// WithErrorHandler sets the function that is told of failures a request
+// survives, such as ErrBootNextRace and ErrUtilityMissing; the default does
+// nothing. The package never logs, so the caller decides what these are worth.
+func WithErrorHandler(fn func(context.Context, error)) Option {
+	return func(h *Handlers) { h.onError = fn }
+}
+
+// NewHandlers returns the boot routes for the service described by cfg.
+func NewHandlers(cfg Config, opts ...Option) (*Handlers, error) {
 	h := &Handlers{
-		repo: repo, fqdn: fqdn, subnet: subnet, files: files,
+		repo: cfg.Repo, content: cfg.Store, catalog: cfg.Catalog,
+		fqdn: cfg.FQDN, address: cfg.Address, subnet: cfg.Subnet, files: cfg.Files,
 		now: time.Now, meter: noop.NewMeterProvider().Meter(""),
-		limit: limiterConfig{limit: discoverPerSource, window: discoverWindow, capacity: limiterCapacity},
+		onError: func(context.Context, error) {},
+		limit:   limiterConfig{limit: discoverPerSource, window: discoverWindow, capacity: limiterCapacity},
 	}
 	for _, opt := range opts {
 		opt(h)
@@ -121,6 +161,11 @@ func NewHandlers(repo *fleet.Repository, fqdn string, subnet netip.Prefix, files
 		metric.WithDescription("Inventory reports received on /discover, by outcome."))
 	if err != nil {
 		return nil, fmt.Errorf("boot: discovery reports counter: %w", err)
+	}
+	h.boots, err = h.meter.Int64Counter("hephaestus.utility.boots",
+		metric.WithDescription("Utility OS boots served, by catalog entry."))
+	if err != nil {
+		return nil, fmt.Errorf("boot: utility boots counter: %w", err)
 	}
 	return h, nil
 }
@@ -162,7 +207,7 @@ func (h *Handlers) start(w http.ResponseWriter, r *http.Request) {
 // chain answers /boot on the plain-HTTP listener: it only chains to TLS,
 // without parsing the query or touching the database.
 func (h *Handlers) chain(w http.ResponseWriter, r *http.Request) {
-	h.serve(w, r, Decide(Input{}))
+	h.serve(w, r, Decide(Input{}), catalog.Entry{})
 }
 
 // boot answers /boot on a TLS listener: it decides, records and renders.
@@ -185,33 +230,99 @@ func (h *Handlers) boot(w http.ResponseWriter, r *http.Request) {
 		h.internalError(w, r, err)
 		return
 	}
-	// The one-shot utility target and the M2 and M3 readiness facts are not
-	// known yet: Decide gets BootNext "" and the three flags false. M2 reads the
-	// target here, for a recorded machine only.
-	d := m1Fallback(Decide(Input{TLS: true, Known: found, Machine: m, Request: req, UnknownAction: unknown}))
-
-	rec := fleet.BootRecord{
-		Identity: id, Arch: req.Arch, MachineID: m.ID, Trigger: d.Trigger, Conflict: d.Row == 2, MarkJunk: d.MarkJunk,
-		Event: fleet.BootEvent{Row: d.Row, Action: string(d.Action), Reason: d.Reason}, At: h.now(),
-	}
-	stored, err := h.repo.RecordBoot(ctx, rec)
-	if err == nil {
-		m = stored
-		telemetry.AddAttrs(ctx, slog.String("state", string(m.State)))
-	}
-	if m.ID != "" {
-		telemetry.AddAttrs(ctx, slog.String("machine_id", m.ID))
-	}
-	// A full fleet and an unidentifiable machine are not failures: the machine
-	// still gets its script, it just is not recorded.
-	if err = noteUnrecorded(ctx, err); err != nil {
+	out, err := h.decideAndRecord(ctx, id, req, bootState{m: m, found: found, unknown: unknown})
+	if err != nil {
 		h.internalError(w, r, err)
 		return
 	}
-	if d.Alert {
+	if req.Platform != "" {
+		telemetry.AddAttrs(ctx, slog.String("platform", string(req.Platform)))
+	}
+	if out.in.BootNext != "" {
+		telemetry.AddAttrs(ctx, slog.String("boot_next", out.in.BootNext))
+	}
+	if out.d.BootNextClear != "" {
+		telemetry.AddAttrs(ctx, slog.String("boot_next_clear", string(out.d.BootNextClear)))
+	}
+	if out.d.Alert {
 		h.countAlert(ctx)
 	}
-	h.serve(w, r, d)
+	h.serve(w, r, out.d, out.entry)
+}
+
+// bootAttempts is how many times /boot decides a request whose machine's
+// boot-next another process keeps changing; the last decision leaves it alone.
+const bootAttempts = 3
+
+// bootState is what /boot knows of the machine before it decides: the recorded
+// machine, when there is one, and the unknown_action setting.
+type bootState struct {
+	m       fleet.Machine
+	found   bool
+	unknown fleet.UnknownAction
+}
+
+// bootOutcome is the decision /boot stored: the input of the last attempt, the
+// decision and the utility entry for the machine's architecture, when one was
+// read.
+type bootOutcome struct {
+	in    Input
+	d     Decision
+	entry catalog.Entry
+}
+
+// decideAndRecord decides the request and stores the boot. The boot-next
+// compare-and-clear is part of the stored boot, so when another process has
+// changed the flag since it was read the request is decided again from the
+// fresh machine, once; a second change is reported as ErrBootNextRace and the
+// third decision leaves the flag out.
+func (h *Handlers) decideAndRecord(ctx context.Context, id fleet.Identity, req Request, s bootState) (bootOutcome, error) {
+	for attempt := 0; ; attempt++ {
+		now := h.now() // one read per attempt: the decision and the record agree on it
+		var out bootOutcome
+		out.in = Input{TLS: true, Known: s.found, Machine: s.m, Request: req, UnknownAction: s.unknown, Now: now}
+		if s.found && s.m.BootNext != "" && attempt < bootAttempts-1 {
+			var err error
+			out.in.BootNext, out.in.BootNextSetAt, out.in.PlatformKnown = s.m.BootNext, s.m.BootNextSetAt, req.Platform != ""
+			out.in.Utility, out.entry, err = h.utilityFacts(ctx, s.m.BootNext, req.Arch, req.Platform, now)
+			if err != nil {
+				return bootOutcome{}, err
+			}
+		}
+		out.d = fallback(Decide(out.in))
+
+		rec := fleet.BootRecord{
+			Identity: id, Arch: req.Arch, MachineID: s.m.ID, Trigger: out.d.Trigger, Conflict: out.d.Row == 2, MarkJunk: out.d.MarkJunk,
+			Event: fleet.BootEvent{Row: out.d.Row, Action: string(out.d.Action), Reason: out.d.Reason}, At: now,
+		}
+		if out.d.BootNextClear != "" {
+			rec.ClearBootNext = &fleet.BootNextClear{Entry: s.m.BootNext, SetAt: s.m.BootNextSetAt, Reason: out.d.BootNextClear}
+		}
+		if out.d.WantUtility && out.entry.Entry != "" {
+			rec.WantFetch = &fleet.FetchWant{Key: fleet.CacheKey{Entry: s.m.BootNext, Arch: req.Arch}, Pin: out.entry.Pin.ID}
+		}
+
+		stored, err := h.repo.RecordBoot(ctx, rec)
+		if errors.Is(err, fleet.ErrBootNextChanged) {
+			if attempt == bootAttempts-2 {
+				h.onError(ctx, ErrBootNextRace)
+			}
+			if s.m, s.found, err = h.repo.Lookup(ctx, id); err != nil {
+				return bootOutcome{}, err
+			}
+			continue
+		}
+		if err == nil {
+			s.m = stored
+			telemetry.AddAttrs(ctx, slog.String("state", string(s.m.State)))
+		}
+		if s.m.ID != "" {
+			telemetry.AddAttrs(ctx, slog.String("machine_id", s.m.ID))
+		}
+		// A full fleet and an unidentifiable machine are not failures: the machine
+		// still gets its script, it just is not recorded.
+		return out, noteUnrecorded(ctx, err)
+	}
 }
 
 // countAlert counts one raised uuid_conflict alert.
@@ -234,17 +345,28 @@ func noteUnrecorded(ctx context.Context, err error) error {
 	return err
 }
 
-// serve renders d, counts it and answers with the script.
-func (h *Handlers) serve(w http.ResponseWriter, r *http.Request, d Decision) {
-	script, err := Render(d, h.fqdn)
-	if err != nil {
-		h.internalError(w, r, err)
-		return
+// serve renders d, counts it and answers with the script. A utility decision
+// answers with the recipe of utility, the catalog entry it names.
+func (h *Handlers) serve(w http.ResponseWriter, r *http.Request, d Decision, utility catalog.Entry) {
+	var script string
+	if d.Action == ActionUtility {
+		script = utility.Script(h.address)
+	} else {
+		var err error
+		if script, err = Render(d, h.fqdn); err != nil {
+			h.internalError(w, r, err)
+			return
+		}
 	}
 	ctx := r.Context()
 	attrs := []slog.Attr{slog.Int("decision_row", d.Row), slog.String("action", string(d.Action))}
-	if d.Action == ActionHold {
+	switch d.Action {
+	case ActionHold:
 		attrs = append(attrs, slog.String("hold_reason", d.Reason))
+	case ActionUtility:
+		attrs = append(attrs, slog.String("utility", d.Utility))
+		h.boots.Add(ctx, 1, metric.WithAttributes(attribute.String("entry", d.Utility)))
+	case ActionChainTLS, ActionExit, ActionInstall:
 	}
 	telemetry.AddAttrs(ctx, attrs...)
 	h.decisions.Add(ctx, 1, metric.WithAttributes(attribute.Int("decision_row", d.Row), attribute.String("action", string(d.Action))))
@@ -298,7 +420,7 @@ func setWriteDeadline(w http.ResponseWriter, d time.Duration) error {
 type idleWriter struct{ http.ResponseWriter }
 
 func (w idleWriter) Write(b []byte) (int, error) {
-	if err := setWriteDeadline(w.ResponseWriter, tftpIdle); err != nil {
+	if err := setWriteDeadline(w.ResponseWriter, idleWrite); err != nil {
 		return 0, err
 	}
 	return w.ResponseWriter.Write(b)
@@ -307,24 +429,22 @@ func (w idleWriter) Write(b []byte) (int, error) {
 // Unwrap lets http.ResponseController reach the connection.
 func (w idleWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
-// m1Fallback turns the decisions M1 cannot carry out into holds: install needs
-// a config ticket (M3) and utility needs a cached utility OS (M2).
-func m1Fallback(d Decision) Decision {
-	switch {
-	case d.NeedsTicket:
-		return Decision{Row: d.Row, Action: ActionHold, Reason: reasonNoTicket}
-	case d.Action == ActionUtility:
-		return Decision{Row: d.Row, Action: ActionHold, Reason: reasonNoUtility}
+// fallback turns the decision that cannot be carried out yet into a hold:
+// install needs a config ticket (M3). Every other field of d is kept.
+func fallback(d Decision) Decision {
+	if d.NeedsTicket {
+		d.Action, d.Reason = ActionHold, reasonNoTicket
 	}
 	return d
 }
 
 // parseBootQuery reads the /boot query into a Request. UUID and MAC are
 // normalized, and "" when malformed; Serial and Product are text with NUL bytes
-// and invalid UTF-8 removed, since a database text column rejects both. A value
-// over maxValueBytes is errValueTooLong.
+// and invalid UTF-8 removed, since a database text column rejects both; Platform
+// is "" unless it names a firmware the catalog knows. A value over
+// maxValueBytes is errValueTooLong.
 func parseBootQuery(q url.Values) (Request, error) {
-	for _, key := range []string{"uuid", "mac", "serial", "product", "arch"} {
+	for _, key := range []string{"uuid", "mac", "serial", "product", "arch", "platform"} {
 		if len(q.Get(key)) > maxValueBytes {
 			return Request{}, fmt.Errorf("%w: %s", errValueTooLong, key)
 		}
@@ -333,12 +453,14 @@ func parseBootQuery(q url.Values) (Request, error) {
 	if err != nil {
 		mac = "" // a malformed MAC is an absent one
 	}
+	platform, _ := catalog.ParsePlatform(q.Get("platform")) // an unrecognised platform is an absent one
 	return Request{
-		UUID:    fleet.NormalizeUUID(q.Get("uuid")),
-		MAC:     mac,
-		Serial:  cleanText(q.Get("serial")),
-		Product: cleanText(q.Get("product")),
-		Arch:    fleet.ArchFromBuildArch(q.Get("arch")),
+		UUID:     fleet.NormalizeUUID(q.Get("uuid")),
+		MAC:      mac,
+		Serial:   cleanText(q.Get("serial")),
+		Product:  cleanText(q.Get("product")),
+		Arch:     fleet.ArchFromBuildArch(q.Get("arch")),
+		Platform: platform,
 	}, nil
 }
 

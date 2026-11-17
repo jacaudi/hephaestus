@@ -10,7 +10,7 @@ const testFQDN = "hephaestus.example.test"
 
 func TestStartScript(t *testing.T) {
 	want := "#!ipxe\nchain https://hephaestus.example.test/boot?uuid=${uuid}&mac=${net${idx}/mac:hexhyp}" +
-		"&arch=${buildarch}&serial=${serial:uristring}&product=${product:uristring}\n"
+		"&arch=${buildarch}&platform=${platform}&serial=${serial:uristring}&product=${product:uristring}\n"
 	if got := StartScript(testFQDN); got != want {
 		t.Errorf("StartScript() = %q, want %q", got, want)
 	}
@@ -18,7 +18,8 @@ func TestStartScript(t *testing.T) {
 
 func TestHoldScript(t *testing.T) {
 	want := "#!ipxe\necho hephaestus: holding: awaiting approval\nsleep 30\n" +
-		"chain --replace https://hephaestus.example.test/boot?" + bootQuery + "\n"
+		"chain --replace https://hephaestus.example.test/boot?uuid=${uuid}&mac=${net${idx}/mac:hexhyp}" +
+		"&arch=${buildarch}&platform=${platform}&serial=${serial:uristring}&product=${product:uristring}\n"
 	if got := HoldScript(testFQDN, "awaiting approval"); got != want {
 		t.Errorf("HoldScript() = %q, want %q", got, want)
 	}
@@ -107,12 +108,16 @@ func TestRender(t *testing.T) {
 	}
 
 	for _, d := range []Decision{
-		{Row: 3, Action: ActionUtility, Utility: "memtest"},
+		{Row: 3, Action: ActionUtility, Utility: "tshell"},
 		{Row: 10, Action: ActionInstall, NeedsTicket: true},
 	} {
 		t.Run("unsupported "+string(d.Action), func(t *testing.T) {
-			if _, err := Render(d, testFQDN); !errors.Is(err, ErrUnsupportedAction) {
-				t.Errorf("Render() error = %v, want ErrUnsupportedAction", err)
+			_, err := Render(d, testFQDN)
+			if !errors.Is(err, ErrUnsupportedAction) {
+				t.Fatalf("Render() error = %v, want ErrUnsupportedAction", err)
+			}
+			if got, want := err.Error(), "boot: Render does not render this action"; got != want {
+				t.Errorf("Render() error text = %q, want %q", got, want)
 			}
 		})
 	}
