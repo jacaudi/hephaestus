@@ -188,6 +188,7 @@ func TestOpenMember_UnsafeMembers(t *testing.T) {
 		{"iso missing", catalog.ContainerISO, iso, "boot/missing", ErrMemberNotFound},
 		{"iso missing directory", catalog.ContainerISO, iso, "nosuch/vmlinuz", ErrMemberNotFound},
 		{"iso missing nested directory", catalog.ContainerISO, iso, "boot/nosuch/deeper/vmlinuz", ErrMemberNotFound},
+		{"iso path through a file", catalog.ContainerISO, iso, "boot/vmlinuz/x", ErrMemberNotFound},
 		{"garbage zip", catalog.ContainerZip, garbageZip(), "live/vmlinuz", ErrMalformed},
 		{"garbage iso", catalog.ContainerISO, garbageISO(), "boot/vmlinuz", ErrMalformed},
 		{"empty iso", catalog.ContainerISO, nil, "boot/vmlinuz", ErrMalformed},
@@ -211,21 +212,13 @@ func TestOpenMember_UnknownContainer(t *testing.T) {
 	}
 }
 
-func TestOpenMember_ISOTruncatedMetadata(t *testing.T) {
-	r, _, err := open(catalog.ContainerISO, truncatedMetadataISO(t), "boot/vmlinuz")
-	if !errors.Is(err, ErrMalformed) {
-		t.Fatalf("error %v, want ErrMalformed", err)
-	}
-	if r != nil {
-		t.Error("returned a reader alongside the error")
-	}
-}
-
 // Each image is rr.iso with one header field bent. go-diskfs v1.9.4 panics on
 // the first two (found by fuzzing: a slice out of range in parsePathTable,
-// pathtable.go:196, and in parseTimestamps, rockridge.go:905), spins forever
-// on the third (a SUSP continuation entry that points at itself), allocates
-// the size a path table claims on the next two, and wraps the failure to read
+// pathtable.go:196, and in parseTimestamps, rockridge.go:905), follows SUSP
+// continuation entries forever on the next two (an entry that points at
+// itself, and an area that loops back to its start, growing the record each
+// pass), allocates the size a path table claims on the next two, and wraps
+// the failure to read
 // an oversized directory in a *fs.PathError on the last. OpenMember must
 // return ErrMalformed, promptly, and never a local-disk error.
 func TestOpenMember_ISOCraftedMetadata(t *testing.T) {
@@ -268,6 +261,24 @@ func TestOpenMember_ISOPathTableSizeIsNotAllocated(t *testing.T) {
 	}
 }
 
+// A continuation area that loops back to its start makes go-diskfs append the
+// area's entries to the record on every pass, so a budget of read calls alone
+// lets the record grow to gigabytes before it runs out.
+func TestOpenMember_ISOContinuationLoopIsBounded(t *testing.T) {
+	const limit = 256 << 20
+	data := loopingContinuationISO(t)
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	_, _, err := openWithin(t, catalog.ContainerISO, data, "boot/vmlinuz")
+	runtime.ReadMemStats(&after)
+	if !errors.Is(err, ErrMalformed) {
+		t.Errorf("error %v, want ErrMalformed", err)
+	}
+	if grew := after.TotalAlloc - before.TotalAlloc; grew > limit {
+		t.Errorf("allocated %d bytes for a %d-byte image", grew, len(data))
+	}
+}
+
 // go-diskfs's File.Read invents the tail of a file cut short, so OpenMember
 // must refuse a member whose declared bytes are not all in the image.
 func TestOpenMember_ISOTruncatedData(t *testing.T) {
@@ -297,6 +308,46 @@ func TestOpenMember_ReadFailureKeepsPathError(t *testing.T) {
 			}
 			if !errors.Is(err, pathErr) {
 				t.Errorf("error %v lost the *fs.PathError", err)
+			}
+		})
+	}
+}
+
+// failRangeReaderAt reads from ra, but fails with err any read that touches
+// the bytes [from, to).
+type failRangeReaderAt struct {
+	ra       io.ReaderAt
+	from, to int64
+	err      error
+}
+
+func (f failRangeReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	if off < f.to && off+int64(len(p)) > f.from {
+		return 0, f.err
+	}
+	return f.ra.ReadAt(p, off)
+}
+
+// The ancestor walk reads directories the parse itself does not, so a local
+// read failure there must keep its *fs.PathError and never become
+// ErrMemberNotFound.
+func TestOpenMember_ISOWalkReadFailureKeepsPathError(t *testing.T) {
+	data := readFixture(t)
+	rec := isoBootRecord(t, data)
+	from := int64(binary.LittleEndian.Uint32(data[rec+2:])) * isoBlockSize
+	pathErr := &fs.PathError{Op: "read", Path: "/var/cache/x.iso", Err: errors.New("input/output error")}
+	ra := failRangeReaderAt{ra: bytes.NewReader(data), from: from, to: from + int64(binary.LittleEndian.Uint32(data[rec+10:])), err: pathErr}
+	size := int64(len(data))
+	// Opening boot/ itself reads only the root directory, so a failure below
+	// comes from walking into boot/.
+	if _, _, err := OpenMember(catalog.ContainerISO, ra, size, "boot"); !errors.Is(err, ErrUnsafeMember) {
+		t.Fatalf("open boot: error %v, want ErrUnsafeMember (the parse read the boot directory)", err)
+	}
+	for _, name := range []string{"boot/vmlinuz/x", "boot/nosuch/x"} {
+		t.Run(name, func(t *testing.T) {
+			_, _, err := OpenMember(catalog.ContainerISO, ra, size, name)
+			if !errors.Is(err, pathErr) || errors.Is(err, ErrMemberNotFound) {
+				t.Errorf("error %v, want the *fs.PathError and not ErrMemberNotFound", err)
 			}
 		})
 	}
@@ -364,6 +415,18 @@ func isoRootDir(tb testing.TB, data []byte) (off, size int) {
 	return int(binary.LittleEndian.Uint32(data[record+2:])) * isoBlockSize, int(binary.LittleEndian.Uint32(data[record+10:]))
 }
 
+// isoBootRecord returns the offset of the BOOT directory's record in the root
+// directory: its extent's block is at +2 and its size at +10.
+func isoBootRecord(tb testing.TB, data []byte) int {
+	tb.Helper()
+	root, size := isoRootDir(tb, data)
+	i := bytes.Index(data[root:root+size], []byte{4, 'B', 'O', 'O', 'T'}) // the name length, then the name
+	if i < 32 {
+		tb.Fatal("no BOOT record in the root directory")
+	}
+	return root + i - 32
+}
+
 // hugePathTableISO claims a 0xFFFFFF00-byte path table in the descriptor of
 // type typ.
 func hugePathTableISO(tb testing.TB, typ byte) []byte {
@@ -372,6 +435,48 @@ func hugePathTableISO(tb testing.TB, typ byte) []byte {
 		tb.Helper()
 		putBoth32(data[isoDescriptor(tb, data, typ)+isoPathTableSize:], 0xFFFFFF00)
 	})
+}
+
+// ceBlock is the block of rr.iso's SUSP continuation area, which its root
+// "." record points at; ceLen is the size of a CE entry.
+const (
+	ceBlock = 20
+	ceLen   = 28
+)
+
+// ceEntry is a SUSP continuation entry for length bytes at block and offset.
+func ceEntry(block, offset, length uint32) []byte {
+	e := make([]byte, ceLen)
+	copy(e, []byte{'C', 'E', ceLen, 1})
+	putBoth32(e[4:], block)
+	putBoth32(e[12:], offset)
+	putBoth32(e[20:], length)
+	return e
+}
+
+// continuationISO is rr.iso with area as the root "." record's continuation
+// area, at the start of ceBlock.
+func continuationISO(tb testing.TB, area []byte) []byte {
+	tb.Helper()
+	return corruptISO(tb, func(tb testing.TB, data []byte) {
+		tb.Helper()
+		root, _ := isoRootDir(tb, data)
+		i := bytes.Index(data[root:root+int(data[root])], []byte{'C', 'E', ceLen, 1})
+		if i < 0 {
+			tb.Fatal("no CE entry in the root record")
+		}
+		copy(data[root+i:], ceEntry(ceBlock, 0, uint32(len(area))))
+		copy(data[ceBlock*isoBlockSize:], area)
+	})
+}
+
+// loopingContinuationISO has a block-sized continuation area of 4-byte SUSP
+// padding entries that ends in a CE back to its own start. go-diskfs appends
+// every pass's entries to the record, so each pass retains more memory.
+func loopingContinuationISO(tb testing.TB) []byte {
+	tb.Helper()
+	pad := bytes.Repeat([]byte{'P', 'D', 4, 1}, (isoBlockSize-ceLen)/4)
+	return continuationISO(tb, append(pad, ceEntry(ceBlock, 0, isoBlockSize)...))
 }
 
 // craftedISOs are the malformed images of TestOpenMember_ISOCraftedMetadata.
@@ -400,32 +505,13 @@ func craftedISOs(tb testing.TB) []namedImage {
 				tb.Fatal("no TF entry in the fixture")
 			}
 		})},
-		{"continuation entry points at itself", corruptISO(tb, func(tb testing.TB, data []byte) {
-			tb.Helper()
-			root, _ := isoRootDir(tb, data)
-			ce := []byte{'C', 'E', 28, 1}
-			i := bytes.Index(data[root:root+int(data[root])], ce) // in the root's "." record
-			if i < 0 {
-				tb.Fatal("no CE entry in the root record")
-			}
-			const block = 20
-			for _, at := range []int{root + i, block * isoBlockSize} {
-				copy(data[at:], ce)
-				putBoth32(data[at+4:], block) // block 20, offset 0, 28 bytes: the entry itself
-				putBoth32(data[at+12:], 0)
-				putBoth32(data[at+20:], 28)
-			}
-		})},
+		{"continuation entry points at itself", continuationISO(tb, ceEntry(ceBlock, 0, ceLen))},
+		{"continuation area loops back to its start", loopingContinuationISO(tb)},
 		{"primary path table larger than the image", hugePathTableISO(tb, isoPrimary)},
 		{"supplementary path table larger than the image", hugePathTableISO(tb, isoSupplementary)},
 		{"directory larger than the image", corruptISO(tb, func(tb testing.TB, data []byte) {
 			tb.Helper()
-			root, size := isoRootDir(tb, data)
-			i := bytes.Index(data[root:root+size], []byte{4, 'B', 'O', 'O', 'T'}) // the name length, then the name
-			if i < 32 {
-				tb.Fatal("no BOOT record in the root directory")
-			}
-			putBoth32(data[root+i-32+10:], 1<<20) // the record's data length
+			putBoth32(data[isoBootRecord(tb, data)+10:], 1<<20) // the record's data length
 		})},
 		{"truncated metadata", truncatedMetadataISO(tb)},
 		{"garbage", garbageISO()},

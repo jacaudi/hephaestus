@@ -20,8 +20,9 @@ import (
 // of a member's Location.
 const isoBlockSize = 2048
 
-// Why OpenMember refused a member. The errors it returns match these with
-// errors.Is and carry the cause as text; the sentinels themselves wrap nothing.
+// Why OpenMember refused a member. A refusal matches one of these with
+// errors.Is and carries its cause as text; the sentinels themselves wrap
+// nothing. A read error from the object matches none of them.
 var (
 	// ErrMemberNotFound means the object has no member of that name.
 	ErrMemberNotFound = errors.New("toolcache: member not found")
@@ -152,12 +153,16 @@ func openISO(ra io.ReaderAt, size int64, name string) (r io.Reader, n int64, err
 	if err != nil {
 		return nil, 0, rec.parseError(err)
 	}
+	switch dir, err := missingAncestor(fsys, name); {
+	case err != nil:
+		return nil, 0, rec.parseError(err)
+	case dir != "":
+		return nil, 0, fmt.Errorf("%w: %q is not a directory in the image", ErrMemberNotFound, dir)
+	}
 	f, err := fsys.Open(name)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
 		return nil, 0, fmt.Errorf("%w: %q is not in the image", ErrMemberNotFound, name)
-	case err != nil && rec.err == nil && missingDirectory(fsys, name):
-		return nil, 0, fmt.Errorf("%w: a directory above %q is not in the image", ErrMemberNotFound, name)
 	case err != nil:
 		return nil, 0, rec.parseError(err)
 	}
@@ -219,15 +224,30 @@ func readDescriptor(storage *isoStorage, off int64) ([]byte, bool) {
 	return desc, err == nil && n == len(desc) && string(desc[1:6]) == "CD001"
 }
 
-// missingDirectory reports whether a directory above name is absent from the
-// image. go-diskfs says so in plain text, but opening each ancestor in turn
-// gives fs.ErrNotExist from the last one that is readable.
-func missingDirectory(fsys *iso9660.FileSystem, name string) bool {
-	parts := strings.Split(path.Dir(name), "/")
-	for i := range parts {
-		if _, err := fsys.Open(strings.Join(parts[:i+1], "/")); err != nil {
-			return errors.Is(err, fs.ErrNotExist)
+// missingAncestor returns the first directory above name that the image does
+// not hold as a directory, or "" when it holds them all. Opening name itself
+// would say "could not find directory" in plain text for an absent ancestor,
+// and parse a file's bytes as a directory for a file ancestor, so each
+// ancestor is opened and checked in turn first. An ancestor that fails to
+// open for any other reason is returned as the error.
+func missingAncestor(fsys *iso9660.FileSystem, name string) (string, error) {
+	dir := ""
+	for part := range strings.SplitSeq(path.Dir(name), "/") {
+		dir = path.Join(dir, part)
+		f, err := fsys.Open(dir)
+		if errors.Is(err, fs.ErrNotExist) {
+			return dir, nil
+		}
+		if err != nil {
+			return "", err
+		}
+		info, err := f.Stat()
+		if err != nil {
+			return "", err
+		}
+		if !info.IsDir() {
+			return dir, nil
 		}
 	}
-	return false
+	return "", nil
 }
