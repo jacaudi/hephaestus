@@ -1,10 +1,11 @@
 #!/bin/sh
 # QEMU end-to-end test (design §7 criterion 6). Run it as `task e2e`; it needs a reachable Docker daemon
 # (colima: set DOCKER_HOST) and nothing else on the host (see test/e2e/README.md). Boots amd64 UEFI, amd64 BIOS
-# and arm64 UEFI VMs through hephaestus in file mode, then amd64 UEFI again with hephaestus behind Caddy.
+# and arm64 UEFI VMs through hephaestus in file mode, then the M2 utility phase against a local TLS 1.3 fake upstream
+# (three cases on the same firmwares), then amd64 UEFI again with hephaestus behind Caddy.
 # Prints a PASS or FAIL line per check and writes every log to build/e2e/<UTC timestamp>/. On any exit it
-# removes the heph-e2e-* containers, network and volume, and the temporary source copy, certificates and
-# test-CA build outputs that this run created. The names, network and subnet are fixed: one run at a time.
+# removes the heph-e2e-* containers, network and volume, and the temporary source copy, fake-upstream files, certificates
+# and test-CA build outputs that this run created. The names, network and subnet are fixed: one run at a time.
 set -eu
 
 root=$(cd "$(dirname "$0")/../.." && pwd -P)
@@ -18,6 +19,8 @@ fi
 # Caddy is pinned by the digest of its multi-arch index (caddy:2 on 2026-11-15); the toolbox pins its own base.
 CADDY_IMAGE=docker.io/library/caddy:2@sha256:4e2425f6009577e7c651010f16679c28f7d12df3e7b1914f941a7a3370746b3c
 TOOLS=hephaestus-e2e-qemu:local
+FIXTURE=hephaestus-e2e-fixture:local # test/e2e/fixture: the files the fake upstream serves
+PIN_IMAGE=hephaestus-catalogpin:e2e
 IMAGE=hephaestus:e2e
 # The Docker daemon's own architecture, so images run natively. Only colima on arm64 has been tested; `task
 # ipxe:build:testca` still builds iPXE in a linux/arm64 builder (taskfile.yml).
@@ -35,17 +38,23 @@ GATEWAY=10.99.0.1
 DNS_IP=10.99.0.2
 HEPH_IP=10.99.0.10
 CADDY_IP=10.99.0.11
+UPSTREAM_IP=10.99.0.12
 QEMU_IP=10.99.0.20
 FQDN=hephaestus.e2e.test
+UPSTREAM_FQDN=upstream.e2e.test
 BOOT_TIMEOUT=120 # seconds per boot
+# A utility boot runs a TCG VM through a kernel and, for e2e-live, a second-stage fetch: a fail line takes up to about
+# 2 minutes on its own (30 s for the interface, 30 s for DHCP, 60 s for the fetch).
+UTILITY_TIMEOUT=300
 TASK=${TASK_EXE:-task}
 
 ts=$(date -u +%Y%m%dT%H%M%SZ)
 out=build/e2e/$ts
 certs=build/e2e/run/certs
+tree=build/e2e/run/tree         # the temporary copy of the tracked tree; the pin container bind-mounts it
+upstream=build/e2e/run/upstream # the fixture files the fake upstream serves
 testca_pem=build/ipxe/out/e2e-ca.pem
 testca_dir=build/ipxe/out/testca
-src=
 own_pem=no # whether this run created the test-CA files under build/ipxe/out, which it then removes
 own_testca=no
 heph_mode='file'
@@ -87,11 +96,43 @@ hold_count() {
 }
 # rose <before> <after>: both counters were read and the second is at least one higher.
 rose() { [ -n "$1" ] && [ -n "$2" ] && [ "$(($2 - $1))" -ge 1 ]; }
+# one_more <before> <after>: both were read and the second is exactly one higher.
+one_more() { [ -n "$1" ] && [ -n "$2" ] && [ "$(($2 - $1))" -eq 1 ]; }
+# The admin CLI inside the hephaestus container. heph_to <file> <args...> keeps its output in a file.
+heph() { docker exec heph-e2e-hephaestus /hephaestus "$@"; }
+heph_to() {
+	f=$1
+	shift
+	heph "$@" >"$f" 2>&1
+}
+# boots_count <entry> prints the utility boots counter for the entry, or nothing and fails when the metrics cannot be read.
+boots_count() {
+	m=$(sidecar curl -fsS http://127.0.0.1:9090/metrics) || return 1
+	printf '%s\n' "$m" |
+		awk -v entry="entry=\"$1\"" '/^hephaestus_utility_boots_total\{/ && index($0, entry) {s += $NF} END {print s + 0}'
+}
+# flag_cleared <mac>: the machine's boot_next is NULL (a missing machine prints nothing, so it fails).
+flag_cleared() {
+	[ "$(sqlite_q "SELECT m.boot_next IS NULL FROM machines m JOIN machine_macs mm ON mm.machine_id = m.id WHERE lower(mm.mac) = lower('$1')")" = 1 ]
+}
+# audit_count <mac> <reason> prints how many boot_next.cleared audit events with that reason the machine has.
+audit_count() {
+	sqlite_q "SELECT count(DISTINCT a.id) FROM audit_events a JOIN machine_macs mm ON mm.machine_id = a.machine_id WHERE lower(mm.mac) = lower('$1') AND a.action = 'boot_next.cleared' AND json_extract(a.detail, '\$.reason') = '$2'"
+}
+# lease_re <dnsmasq log> <mac> prints an anchored regex of every address dnsmasq acked to the MAC (the first stage and a
+# second stage may hold different leases), or nothing when there is none.
+lease_re() {
+	grep "DHCPACK" "$1" | grep -i " $2" |
+		awk '{for (i = 1; i <= NF; i++) if ($i ~ /^10\.99\.0\./) a[$i] = 1} END {for (k in a) s = s (s == "" ? "" : "|") k; if (s != "") print "^(" s ")$"}' |
+		sed 's/\./\\./g'
+}
+# utility_rows_ready: `utility list --json` shows all four e2e rows ready.
+utility_rows_ready() { heph utility list --json | box jq -e 'length == 4 and all(.[]; .state == "ready")'; }
 mark() { docker logs "$1" 2>&1 | wc -l | tr -d ' '; }
 since() { docker logs "$1" 2>&1 | tail -n +$(($2 + 1)); }
 
 save_logs() {
-	for c in dnsmasq hephaestus caddy qemu; do
+	for c in dnsmasq hephaestus caddy upstream qemu; do
 		if docker inspect "heph-e2e-$c" >/dev/null 2>&1; then
 			case $c in hephaestus | dnsmasq) label=$c-$heph_mode ;; *) label=$c ;; esac
 			docker logs "heph-e2e-$c" >"$out/$label.log" 2>&1 || true
@@ -107,7 +148,7 @@ cleanup() {
 	for c in $(docker ps -aq --filter 'name=^heph-e2e-'); do docker rm -f "$c" >/dev/null 2>&1; done
 	docker network rm "$NET" >/dev/null 2>&1
 	docker volume rm "$VOL" >/dev/null 2>&1
-	[ -n "$src" ] && rm -rf "${src:?}"
+	rm -rf "${tree:?}" "${upstream:?}"
 	rm -rf "${certs:?}"
 	[ "$own_pem" = yes ] && rm -f "${testca_pem:?}"
 	[ "$own_testca" = yes ] && rm -rf "${testca_dir:?}"
@@ -137,12 +178,13 @@ start_hephaestus() { # file | proxy
 	heph_mode=$1
 	set -- -d --name heph-e2e-hephaestus --network "$NET" --ip "$HEPH_IP" --user 65532:65532 \
 		--cap-drop ALL --cap-add NET_BIND_SERVICE --sysctl net.ipv4.ip_unprivileged_port_start=1024 \
-		-v "$VOL":/var/lib/hephaestus \
+		-v "$VOL":/var/lib/hephaestus -v "$root/$certs:/certs:ro" \
+		--add-host "$UPSTREAM_FQDN:$UPSTREAM_IP" -e SSL_CERT_FILE=/certs/ca.pem \
 		-e HEPHAESTUS_FQDN="$FQDN" -e HEPHAESTUS_PROVISIONING_INTERFACE=eth0 \
 		-e HEPHAESTUS_PROVISIONING_ADDRESS="$HEPH_IP" -e HEPHAESTUS_PROVISIONING_SUBNET=10.99.0.0/24 \
 		-e HEPHAESTUS_TLS_MODE="$heph_mode" -e HEPHAESTUS_LOG_LEVEL=debug
 	case $heph_mode in
-	file) set -- "$@" -v "$root/$certs:/certs:ro" -e HEPHAESTUS_TLS_CERT_FILE=/certs/fullchain.pem -e HEPHAESTUS_TLS_KEY_FILE=/certs/privkey.pem ;;
+	file) set -- "$@" -e HEPHAESTUS_TLS_CERT_FILE=/certs/fullchain.pem -e HEPHAESTUS_TLS_KEY_FILE=/certs/privkey.pem ;;
 	proxy) set -- "$@" -e HEPHAESTUS_PROXY_ADDRESS="$HEPH_IP:8443" -e HEPHAESTUS_PROXY_TRUSTED="$CADDY_IP/32" ;;
 	esac
 	docker run "$@" "$IMAGE" >/dev/null
@@ -317,9 +359,150 @@ boot() {
 	check "$name: hephaestus_boot_decisions_total{action=\"hold\",decision_row=\"7\"} rose (${hold0:-unread} -> ${hold1:-unread})" rose "$hold0" "$hold1"
 }
 
+# --- the utility phase (M2, design 5.9) ---
+# utility_setup: asks serve to fetch both e2e entries from the fake upstream and waits for the four rows to be ready.
+utility_setup() {
+	um=$(mark heph-e2e-hephaestus)
+	check "utility fetch e2e-shell exits 0" heph_to "$out/utility-fetch-e2e-shell.txt" utility fetch e2e-shell
+	check "utility fetch e2e-live exits 0" heph_to "$out/utility-fetch-e2e-live.txt" utility fetch e2e-live
+	check "utility list --json shows all four e2e rows ready within 120 s" wait_for 'the four e2e rows ready' 120 utility_rows_ready
+	heph utility list --json >"$out/utility-list.json" 2>&1 || true
+	since heph-e2e-hephaestus "$um" >"$out/utility-setup.hephaestus.log"
+	n=$(jn "$out/utility-setup.hephaestus.log" 'fromjson? | select(.msg=="utility fetch" and .to=="ready")')
+	check "hephaestus logged four utility fetch lines with to=ready (found ${n:-0})" test "${n:-0}" -eq 4
+}
+
+# utility_boot <name> <firmware> <mac> <arch> <entry> <kind> [<file>...]: sets boot-next <entry> on <mac>, boots the VM
+# once and judges the outcome. <file>... are the /u/ paths the boot must fetch from the entry, the last being the second
+# stage of a live boot. Kinds:
+#   shell        a UEFI VM chains the entry's EFI binary; the serial console shows the UEFI Shell.
+#   live         a kernel and initrd boot and the initrd fetches the squashfs, printing a marker on the serial console
+#                (UEFI) or leaving the squashfs request in the server log (BIOS has no serial output).
+#   unsupported  the entry has no build for the VM's firmware: row 3 clears the flag with `unsupported` and the VM holds.
+# Gate-2 BL-2 reads the outcomes: a shell 200 with no UEFI Shell on serial, or a live boot with no kernel and initrd 200,
+# is a mechanism failure of chain or of kernel+initrd+boot; a `fail <reason>` marker means the kernel and initrd ran.
+utility_boot() {
+	name=$1 fw=$2 mac=$3 arch=$4 entry=$5 kind=$6
+	shift 6
+	uuid=e2e00000-0000-4000-8000-$(printf '%s' "$mac" | tr -d :)
+	serial=$out/$name.serial.log
+	st=$out/$name.serial.txt # the serial log without the carriage returns the UART adds
+	uefi=yes
+	[ "$fw" = seabios ] && uefi=no
+	base=/u/$entry/$arch/1
+	macdash=$(printf '%s' "$mac" | tr : -)
+	reason=served
+	[ "$kind" = unsupported ] && reason=unsupported
+	step "utility boot $name ($fw, $arch, $entry, $kind)"
+
+	cleared0=$(audit_count "$mac" "$reason") || cleared0=
+	boots0=$(boots_count "$entry") || boots0=
+	hold0=$(hold_count) || hold0=
+	if heph_to "$out/$name.boot-next.txt" boot-next set "$mac" "$entry"; then
+		pass "$name: boot-next set $mac $entry exits 0"
+	else
+		fail "$name: boot-next set $mac $entry did not exit 0"
+		sed 's/^/    boot-next| /' "$out/$name.boot-next.txt"
+		return 0
+	fi
+
+	hm=$(mark heph-e2e-hephaestus)
+	: >"$serial"
+	: >"$st"
+	docker exec heph-e2e-qemu /e2e/run-vm.sh "$name" "$fw" "$mac" "$uuid" "$((UTILITY_TIMEOUT + 10))" >"$out/$name.vm.log" 2>&1 &
+	vm=$!
+
+	started=$(date +%s)
+	result=timeout
+	while [ "$(($(date +%s) - started))" -lt "$UTILITY_TIMEOUT" ]; do
+		tr -d '\r' <"$serial" >"$st"
+		since heph-e2e-hephaestus "$hm" >"$out/$name.poll.log"
+		case $kind-$uefi in
+		shell-yes) grep -qF 'UEFI Interactive Shell' "$st" && { result=reached; break; } ;;
+		live-yes) grep -qF 'HEPHAESTUS-E2E-SECOND-STAGE' "$st" && { result=reached; break; } ;;
+		live-no) # the last <file> is the second stage: its request in the server log is the BIOS evidence
+			for second; do :; done
+			ge "$(jn "$out/$name.poll.log" --arg p "$base/$second" 'fromjson? | select(.msg=="request" and .path==$p and .status==200)')" 1 && { result=reached; break; } ;;
+		unsupported-*)
+			ge "$(jn "$out/$name.poll.log" 'fromjson? | select(.msg=="request" and .path=="/boot" and .boot_next_clear=="unsupported")')" 1 && { result=reached; break; } ;;
+		esac
+		if [ "$uefi" = yes ] && grep -qE 'Could not boot|giving up' "$st"; then result=failed; break; fi
+		kill -0 "$vm" 2>/dev/null || { result=exited; break; }
+		sleep 2
+	done
+	elapsed=$(($(date +%s) - started))
+	docker exec heph-e2e-qemu pkill -f qemu-system >/dev/null 2>&1 || true
+	wait "$vm" || true
+	rm -f "$out/$name.poll.log"
+	tr -d '\r' <"$serial" >"$st"
+
+	since heph-e2e-hephaestus "$hm" >"$out/$name.hephaestus.log"
+	docker logs heph-e2e-dnsmasq >"$out/dnsmasq-$heph_mode.log" 2>&1 || true
+	hlog=$out/$name.hephaestus.log
+
+	case $kind-$uefi in
+	shell-*) what='the UEFI Shell on serial' ;;
+	live-yes) what='a second-stage marker on serial' ;;
+	live-no) what='the second-stage request in the server log' ;;
+	unsupported-*) what='the unsupported clear in the server log' ;;
+	esac
+	if [ "$result" = reached ]; then
+		pass "$name: reached $what after ${elapsed}s"
+	else
+		fail "$name: $result after ${elapsed}s (no $what within ${UTILITY_TIMEOUT}s)"
+		tail -n 15 "$st" | sed 's/^/    serial| /'
+	fi
+
+	re=$(lease_re "$out/dnsmasq-$heph_mode.log" "$mac")
+	check "$name: dnsmasq leased an address to $mac" test -n "$re"
+	[ -n "$re" ] || re='^no-lease$' # an empty pattern would match every address
+	check "$name: $(basename "$hlog") is not empty" test -s "$hlog"
+
+	case $kind in
+	unsupported)
+		n=$(jn "$hlog" --arg ip "$re" 'fromjson? | select(.msg=="request" and .path=="/boot" and .status==200 and .decision_row==7 and .action=="hold" and .boot_next_clear=="unsupported" and (.remote_ip|test($ip)))')
+		check "$name: /boot 200 row 7 hold with boot_next_clear unsupported" ge "$n" 1
+		n=$(jn "$hlog" 'fromjson? | select(.msg=="request" and (.path|startswith("/u/")))')
+		check "$name: no /u/ request, so nothing was served (found ${n:-unread})" test "${n:-unread}" = 0
+		hold1=$(hold_count) || hold1=
+		check "$name: hephaestus_boot_decisions_total{action=\"hold\",decision_row=\"7\"} rose (${hold0:-unread} -> ${hold1:-unread})" rose "$hold0" "$hold1"
+		boots1=$(boots_count "$entry") || boots1=
+		check "$name: hephaestus_utility_boots_total{entry=\"$entry\"} did not move (${boots0:-unread} -> ${boots1:-unread})" sh -c '[ -n "$1" ] && [ "$1" = "$2" ]' _ "$boots0" "$boots1"
+		;;
+	*)
+		n=$(jn "$hlog" --arg ip "$re" --arg e "$entry" 'fromjson? | select(.msg=="request" and .path=="/boot" and .status==200 and .decision_row==3 and .action=="utility" and .utility==$e and .boot_next_clear=="served" and (.remote_ip|test($ip)))')
+		check "$name: /boot 200 row 3, action utility, utility $entry, boot_next_clear served" ge "$n" 1
+		for f in "$@"; do
+			n=$(jn "$hlog" --arg ip "$re" --arg p "$base/$f" 'fromjson? | select(.msg=="request" and .path==$p and .status==200 and .tls==false and (.remote_ip|test($ip)))')
+			check "$name: GET $base/$f 200 from the VM over plain HTTP" ge "$n" 1
+		done
+		if [ "$uefi" = yes ]; then
+			case $kind in
+			shell) check "$name: serial: UEFI Interactive Shell" sh -c '[ -s "$1" ] && grep -qF "UEFI Interactive Shell" "$1"' _ "$st" ;;
+			live)
+				sum=$(tr -d ' \t\r\n' <"$root/$upstream/squashfs.sha256")
+				check "$name: the fixture's squashfs.sha256 is one 64-digit hash" sh -c 'printf "%s" "$1" | grep -Eq "^[0-9a-f]{64}\$"' _ "$sum"
+				check "$name: serial: HEPHAESTUS-E2E-SECOND-STAGE ok bootif=01-$macdash sha256=<squashfs.sha256>" \
+					sh -c '[ -s "$1" ] && grep -qF "$2" "$1"' _ "$st" "HEPHAESTUS-E2E-SECOND-STAGE ok bootif=01-$macdash sha256=$sum"
+				;;
+			esac
+		else
+			printf 'NOTE %s: serial not asserted (SeaBIOS writes to VGA only); the server log above is the evidence\n' "$name"
+		fi
+		boots1=$(boots_count "$entry") || boots1=
+		check "$name: hephaestus_utility_boots_total{entry=\"$entry\"} rose (${boots0:-unread} -> ${boots1:-unread})" rose "$boots0" "$boots1"
+		;;
+	esac
+
+	check "$name: boot_next is NULL for $mac" flag_cleared "$mac"
+	cleared1=$(audit_count "$mac" "$reason") || cleared1=
+	check "$name: one boot_next.cleared audit with reason $reason (${cleared0:-unread} -> ${cleared1:-unread})" one_more "$cleared0" "$cleared1"
+}
+
 # --- main ---
 step "clean up anything a killed run left behind"
 remove_all
+rm -rf "${tree:?}" "${upstream:?}"
 mkdir -p "$out" "$certs" build/ipxe/out
 
 step "toolbox image"
@@ -337,25 +520,54 @@ for f in undionly.kpxe snp-amd64.efi snp-arm64.efi roots.pem; do
 	[ -s "$testca_dir/$f" ] || { echo "e2e: $testca_dir/$f missing after the testca build" >&2; exit 1; }
 done
 
-step "hephaestus:e2e from a temporary copy of the tracked tree, with the test-CA binaries overlaid"
-# The repository tree and the production Dockerfile never hold test-CA binaries: the overlay lives only in this copy.
-# sh has no pipefail, so the archive goes through a file and each tar's status is checked (set -e): a tracked file that
-# is missing from the working tree fails the run instead of building an image without it.
-src=$(mktemp -d "${TMPDIR:-/tmp}/heph-e2e-src.XXXXXX")
-mkdir "$src/tree"
-git ls-files -z >"$src/files"
-tar --null -T "$src/files" -cf "$src/tree.tar"
-tar -xf "$src/tree.tar" -C "$src/tree"
-cp "$testca_dir"/* "$src/tree/internal/boot/ipxe/bin/"
-docker buildx build --platform "$PLATFORM" --load -q \
-	--build-arg VERSION=e2e --build-arg COMMIT="$(git rev-parse --short HEAD)" --build-arg DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-	-t "$IMAGE" "$src/tree" >"$out/image-build.log" 2>&1 || { tail -n 30 "$out/image-build.log"; exit 1; }
-rm -rf "${src:?}"
-src=
-
-step "network, dnsmasq, hephaestus (file mode)"
+step "network"
 docker network create --driver bridge --subnet 10.99.0.0/24 --gateway "$GATEWAY" "$NET" >/dev/null
 docker volume create "$VOL" >/dev/null
+
+step "fixture image and the TLS 1.3 fake upstream at $UPSTREAM_IP"
+docker build --platform "$PLATFORM" -q -t "$FIXTURE" test/e2e/fixture >"$out/fixture-build.log" 2>&1 || { tail -n 30 "$out/fixture-build.log"; exit 1; }
+mkdir "$upstream"
+docker run --rm --user "$(id -u):$(id -g)" -v "$root/$upstream:/out" "$FIXTURE" cp -r /fixture/. /out/
+docker run -d --name heph-e2e-upstream --network "$NET" --ip "$UPSTREAM_IP" \
+	-v "$root/test/e2e:/caddy:ro" -v "$root/$certs:/certs:ro" -v "$root/$upstream:/srv:ro" \
+	"$CADDY_IMAGE" caddy run --config /caddy/upstream.json >/dev/null
+wait_for "the upstream listening" 30 sh -c 'docker logs heph-e2e-upstream 2>&1 | grep -q "serving initial configuration"'
+
+step "temporary copy of the tracked tree, with the e2e catalog overlay and the test-CA binaries"
+# The repository tree and the production Dockerfile never hold the overlay or test-CA binaries: they live only in this
+# copy. sh has no pipefail, so the archive goes through a file and each tar's status is checked (set -e): a tracked file
+# that is missing from the working tree fails the run instead of building an image without it. The overlay is copied from
+# the working tree, which the archive does not hold until it is committed.
+mkdir "$tree"
+git ls-files -z >"$out/tree.files"
+tar --null -T "$out/tree.files" -cf "$out/tree.tar"
+tar -xf "$out/tree.tar" -C "$tree"
+rm -f "$out/tree.files" "$out/tree.tar"
+cp "$root/test/e2e/overlay/catalog.go.in" "$tree/internal/catalog/catalog.go"
+cp "$testca_dir"/* "$tree/internal/boot/ipxe/bin/"
+
+step "pin the e2e catalog against the fake upstream with the real pin tool"
+docker build --platform "$PLATFORM" -q -f "$tree/cmd/catalogpin/Dockerfile" --build-arg VERSION=e2e -t "$PIN_IMAGE" "$tree" >"$out/pin-image-build.log" 2>&1 ||
+	{ tail -n 30 "$out/pin-image-build.log"; exit 1; }
+mkdir -p "$tree/build/e2e/run" # the pin tool writes its report there, inside the bind-mounted tree
+# The pin container reaches the upstream by name, so SNI matches, and trusts only the e2e CA, over TLS 1.3 like hephaestus.
+docker run --rm --name heph-e2e-pin --network "$NET" --user "$(id -u):$(id -g)" -w /src \
+	--add-host "$UPSTREAM_FQDN:$UPSTREAM_IP" -e SSL_CERT_FILE=/certs/ca.pem \
+	-v "$root/$certs:/certs:ro" -v "$root/$tree:/src" "$PIN_IMAGE" \
+	-out internal/catalog/catalog_pins.go -keys internal/catalog/keys -provenance internal/catalog/keys/PROVENANCE.md \
+	-work /work -report build/e2e/run/pin-report.txt >"$out/pin.out" 2>"$out/pin.err" || { cat "$out/pin.err"; exit 1; }
+cp "$tree/build/e2e/run/pin-report.txt" "$out/pin-report.txt"
+cp "$tree/internal/catalog/catalog_pins.go" "$out/catalog_pins.go.txt" # not .go: golangci-lint typechecks Go files under build/
+check "pin: the catalogpin summary says PINNED 4 ABSENT 0" grep -qx 'PINNED 4 ABSENT 0' "$out/pin.out"
+[ "$fails" -eq 0 ] || { cat "$out/pin-report.txt"; exit 1; }
+
+step "hephaestus:e2e from that copy"
+docker buildx build --platform "$PLATFORM" --load -q \
+	--build-arg VERSION=e2e --build-arg COMMIT="$(git rev-parse --short HEAD)" --build-arg DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+	-t "$IMAGE" "$tree" >"$out/image-build.log" 2>&1 || { tail -n 30 "$out/image-build.log"; exit 1; }
+rm -rf "${tree:?}"
+
+step "dnsmasq, hephaestus (file mode)"
 docker run -d --name heph-e2e-qemu --network "$NET" --ip "$QEMU_IP" --cap-add NET_ADMIN --device /dev/net/tun \
 	-v "$root/test/e2e/qemu:/e2e:ro" -v "$root/$out:/out" "$TOOLS" sleep infinity >/dev/null
 start_dnsmasq "$HEPH_IP"
@@ -369,6 +581,22 @@ capability_checks
 boot ovmf ovmf 52:54:00:e2:e0:03 amd64 snp.efi snp.efi file
 boot seabios seabios 52:54:00:e2:e0:04 amd64 tftp://$HEPH_IP/undionly.kpxe undionly.kpxe file
 boot aarch64 aarch64 52:54:00:e2:e0:05 arm64 snp-arm64.efi snp-arm64.efi file
+
+# The three M1 machines are known now, which boot-next set needs. Each case boots one of them once more.
+step "utility phase (design 5.9): fetch the e2e entries from the fake upstream"
+utility_setup
+
+step "case 1: EFI chain (e2e-shell, a zip) on amd64 UEFI and arm64 UEFI"
+utility_boot shell-ovmf ovmf 52:54:00:e2:e0:03 amd64 e2e-shell shell ShellBinPkg/UefiShell/X64/Shell.efi
+utility_boot shell-aarch64 aarch64 52:54:00:e2:e0:05 arm64 e2e-shell shell ShellBinPkg/UefiShell/AArch64/Shell.efi
+
+step "case 2: kernel, initrd and squashfs (e2e-live: an ISO on amd64, a zip on arm64) on amd64 UEFI, amd64 BIOS and arm64 UEFI"
+utility_boot live-ovmf ovmf 52:54:00:e2:e0:03 amd64 e2e-live live boot/vmlinuz boot/initrd.img live/filesystem.squashfs
+utility_boot live-seabios seabios 52:54:00:e2:e0:04 amd64 e2e-live live boot/vmlinuz boot/initrd.img live/filesystem.squashfs
+utility_boot live-aarch64 aarch64 52:54:00:e2:e0:05 arm64 e2e-live live live/vmlinuz live/initrd.img live/filesystem.squashfs
+
+step "case 3: a UEFI-only entry set on the BIOS VM is cleared as unsupported and the VM holds at row 7"
+utility_boot unsupported-seabios seabios 52:54:00:e2:e0:04 amd64 e2e-shell unsupported
 
 step "proxy mode: Caddy at $CADDY_IP terminates TLS, hephaestus serves plain HTTP behind it"
 save_logs

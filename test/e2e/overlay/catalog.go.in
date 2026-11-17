@@ -1,0 +1,64 @@
+package catalog
+
+// The e2e catalog: test/e2e/run.sh copies this file over internal/catalog/catalog.go in its temporary copy of the
+// tracked tree, then runs the pin tool there to generate catalog_pins.go for it. It is not compiled in the repository
+// and holds only the specs: every object is served by the harness's TLS 1.3 fake upstream, upstream.e2e.test, from the
+// fixture image (test/e2e/fixture). Every entry is version 1 and trust on first use; the pin tool records the hashes.
+//
+// Boot roles (design 5.9):
+//
+//	e2e-shell  chain: the UEFI Shell, delivered in a zip; boots on UEFI only.
+//	e2e-live   live-boot: a kernel, an initrd and a squashfs, delivered as an ISO on amd64 and a zip on arm64. Its
+//	           initrd fetches the squashfs over plain HTTP and prints a marker on the serial console.
+var specs = []Spec{ //nolint:gochecknoglobals // compiled-in catalog data (design §5.2)
+	{
+		Entry: "e2e-shell", Arch: "amd64", Version: "1",
+		Recipe:    RecipeChain,
+		Platforms: []Platform{PlatformEFI},
+		Objects: []ObjectSpec{{
+			URL:       "https://upstream.e2e.test/ShellBinPkg.zip",
+			Container: ContainerZip,
+			Signature: Signature{TOFU: true},
+			Files:     []string{"ShellBinPkg/UefiShell/X64/Shell.efi"},
+		}},
+		Boot: Boot{Kernel: "ShellBinPkg/UefiShell/X64/Shell.efi"},
+	},
+	{
+		Entry: "e2e-shell", Arch: "arm64", Version: "1",
+		Recipe:    RecipeChain,
+		Platforms: []Platform{PlatformEFI},
+		Objects: []ObjectSpec{{
+			URL:       "https://upstream.e2e.test/ShellBinPkg.zip",
+			Container: ContainerZip,
+			Signature: Signature{TOFU: true},
+			Files:     []string{"ShellBinPkg/UefiShell/AArch64/Shell.efi"},
+		}},
+		Boot: Boot{Kernel: "ShellBinPkg/UefiShell/AArch64/Shell.efi"},
+	},
+	{
+		Entry: "e2e-live", Arch: "amd64", Version: "1",
+		Recipe:    RecipeLiveBoot,
+		Platforms: []Platform{PlatformEFI, PlatformPCBIOS},
+		Objects: []ObjectSpec{{
+			URL:       "https://upstream.e2e.test/e2e-live-amd64.iso",
+			Container: ContainerISO,
+			Signature: Signature{TOFU: true},
+			Files:     []string{"boot/vmlinuz", "boot/initrd.img", "live/filesystem.squashfs"},
+		}},
+		Boot: Boot{Kernel: "boot/vmlinuz", Initrds: []string{"boot/initrd.img"}, Second: "live/filesystem.squashfs"},
+		Args: "boot=live",
+	},
+	{
+		Entry: "e2e-live", Arch: "arm64", Version: "1",
+		Recipe:    RecipeLiveBoot,
+		Platforms: []Platform{PlatformEFI},
+		Objects: []ObjectSpec{{
+			URL:       "https://upstream.e2e.test/e2e-live-arm64.zip",
+			Container: ContainerZip,
+			Signature: Signature{TOFU: true},
+			Files:     []string{"live/vmlinuz", "live/initrd.img", "live/filesystem.squashfs"},
+		}},
+		Boot: Boot{Kernel: "live/vmlinuz", Initrds: []string{"live/initrd.img"}, Second: "live/filesystem.squashfs"},
+		Args: "boot=live",
+	},
+}
