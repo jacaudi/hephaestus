@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -109,8 +110,8 @@ func WithEvents(fn func(context.Context, FetchEvent)) FetcherOption {
 
 // WithErrorHandler sets the function called with every error the fetcher
 // cannot settle on a row: an unrecorded repository error, a progress record
-// that failed, or a spool file or the spool directory it could not remove or
-// close.
+// that failed, a row it could not read back after resetting it, or a spool file
+// or the spool directory it could not remove or close.
 func WithErrorHandler(fn func(context.Context, error)) FetcherOption {
 	return func(f *Fetcher) { f.onError = fn }
 }
@@ -302,7 +303,7 @@ func (f *Fetcher) record(ctx context.Context, o outcome) error {
 	}
 	row, err := f.cfg.Repo.RecordFetchFailure(ctx, o.fail)
 	if err != nil {
-		return fmt.Errorf("%w (the fetch failed: %v)", err, o.ev.Err) //nolint:errorlint // the cause is text for the handler; a second %w would make a repository error match *IntegrityError
+		return fmt.Errorf("%w (the fetch failed: %s)", err, o.fail.Cause)
 	}
 	if row.Pin == o.ev.Pin && (row.State == fleet.CacheFailed || row.State == fleet.CacheBroken) {
 		o.ev.To, o.ev.Attempts = row.State, row.Attempts
@@ -328,18 +329,34 @@ func (f *Fetcher) retryHeld(ctx context.Context) (bool, error) {
 		}
 		h.retried, h.cause = true, err
 	}
-	if _, err := f.cfg.Repo.ResetFetching(ctx, f.now()); err != nil {
+	moved, err := f.cfg.Repo.ResetFetching(ctx, f.now())
+	if err != nil {
 		if ctx.Err() != nil {
 			return true, ctx.Err()
 		}
 		return true, errors.Join(h.cause, err)
 	}
 	f.held = nil
-	f.events(ctx, FetchEvent{Key: h.ev.Key, Pin: h.ev.Pin, From: fleet.CacheFetching, To: fleet.CacheWanted, Err: h.cause})
+	if moved > 0 {
+		f.resetEvent(ctx, h)
+	}
 	if !firstRetry {
 		return true, nil // the error was returned when the retry failed
 	}
 	return true, fmt.Errorf("the outcome of %s/%s could not be stored twice and the row went back to wanted: %w", h.ev.Key.Entry, h.ev.Key.Arch, h.cause)
+}
+
+// resetEvent emits fetching -> wanted for h's row when a reset left it wanted at
+// h's pin. The reset moves every fetching row, and the row may have been
+// repinned since it was claimed, so the count alone does not say it was this one.
+func (f *Fetcher) resetEvent(ctx context.Context, h *heldOutcome) {
+	row, ok, err := f.cfg.Repo.CacheRow(ctx, h.ev.Key)
+	switch {
+	case err != nil:
+		f.onError(ctx, fmt.Errorf("read %s/%s back after resetting it: %w", h.ev.Key.Entry, h.ev.Key.Arch, err))
+	case ok && row.Pin == h.ev.Pin && row.State == fleet.CacheWanted:
+		f.events(ctx, FetchEvent{Key: h.ev.Key, Pin: h.ev.Pin, From: fleet.CacheFetching, To: fleet.CacheWanted, Err: h.cause})
+	}
 }
 
 // fetchJob is the work on one claimed row.
@@ -528,6 +545,10 @@ func (j *fetchJob) checkSpace(size int64) error {
 	if err != nil {
 		return fmt.Errorf("free space on the spool volume: %w", err)
 	}
+	// Past this, the need below does not fit in a uint64; no volume holds it.
+	if size > (math.MaxUint64-spaceReserve)/2 {
+		return fmt.Errorf("free space on the spool volume cannot hold a %d byte object", size)
+	}
 	need := 2*uint64(max(size, 0)) + spaceReserve
 	if free < need {
 		return fmt.Errorf("free space on the spool volume is %d bytes, a %d byte object needs %d", free, size, need)
@@ -566,7 +587,7 @@ func (j *fetchJob) transfer(ctx context.Context, n int, have int64, etag string)
 
 // accept checks the response to object n's request against the pin and returns
 // the spool offset its body continues at. A 206 is checked in this order: the
-// Content-Range start, then its total, then the Content-Length.
+// Content-Range start, then its total, then its end, then the Content-Length.
 func (j *fetchJob) accept(resp *http.Response, n int, have int64) (int64, error) {
 	size := j.entry.Pin.Objects[n].Size
 	switch resp.StatusCode {
@@ -584,13 +605,14 @@ func (j *fetchJob) accept(resp *http.Response, n int, have int64) (int64, error)
 		if total != size {
 			return 0, integrityf("Content-Range %q says the object is %d bytes, pinned at %d", header, total, size)
 		}
-		if resp.ContentLength >= 0 && resp.ContentLength != size-have {
-			return 0, integrityf("the upstream sent %d bytes for the %d the range asked for", resp.ContentLength, size-have)
-		}
 		// Only the total is a fact about the object (minor-16): a range that
-		// stops short is a misbehaving server, which a retry may not meet.
+		// stops short is a misbehaving server, which a retry may not meet. It is
+		// checked before the Content-Length, which a short range also disagrees with.
 		if end != size-1 {
 			return 0, fmt.Errorf("a 206 with Content-Range %q ends at byte %d, not at the last byte %d", header, end, size-1)
+		}
+		if resp.ContentLength >= 0 && resp.ContentLength != size-have {
+			return 0, integrityf("the upstream sent %d bytes for the %d the range asked for", resp.ContentLength, size-have)
 		}
 		return have, nil
 	default:

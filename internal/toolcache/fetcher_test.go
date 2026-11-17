@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -820,6 +821,25 @@ func TestFetcher_TransientFailures(t *testing.T) {
 			sc.seed = seedHalf(sc.object)
 			return sc
 		}},
+		{name: "content-range end with a matching length", want: "Content-Range", mk: func(t *testing.T, base string) scenario {
+			t.Helper()
+			sc := liveOf(t, base, func(object []byte) http.Handler {
+				half := len(object) / 2
+				return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", half, len(object)-2, len(object)))
+					w.Header().Set("Content-Length", strconv.Itoa(len(object)-half-1))
+					w.WriteHeader(http.StatusPartialContent)
+					send(t, w, object[half:len(object)-1])
+				})
+			})
+			sc.seed = seedHalf(sc.object)
+			return sc
+		}, check: func(t *testing.T, h *harness, e catalog.Entry) {
+			t.Helper()
+			if got, half := h.spoolSize(SpoolName(e.Pin.ID, 0)), e.Pin.Objects[0].Size/2; got != half {
+				t.Errorf("spool size = %d, want %d: the spool is kept", got, half)
+			}
+		}},
 		{name: "weak etag drops the sidecar", mk: func(t *testing.T, base string) scenario {
 			t.Helper()
 			return droppedSidecar(t, base, `ETag: W/"v2"`+"\r\n")
@@ -1069,6 +1089,72 @@ func TestFetcher_BookkeepingFailsTwiceResetsRow(t *testing.T) {
 	}
 	if ev := r.lastEvent(); ev.Err == nil || !strings.Contains(ev.Err.Error(), "injected") || ev.Class != "" {
 		t.Errorf("last event = %+v, want the held cause as Err and no Class", ev)
+	}
+}
+
+// TestFetcher_ResetOfAMovedRowIsSilent moves the held row before the poll that
+// resets it: the reset did not move that row at that pin, so no event says it did.
+func TestFetcher_ResetOfAMovedRowIsSilent(t *testing.T) {
+	const newPin = "repinned"
+	repin := func(t *testing.T, r *run) {
+		t.Helper()
+		if moved, err := r.repo.Repin(t.Context(), tliveAMD64(), r.e.Pin.ID, newPin, fetchT0()); err != nil || !moved {
+			t.Fatalf("Repin = %v, %v; want true, nil", moved, err)
+		}
+	}
+	tests := []struct {
+		name    string
+		move    func(t *testing.T, r *run)
+		wantPin func(r *run) string
+	}{
+		{"another reset moved the row first", func(t *testing.T, r *run) {
+			t.Helper()
+			if n, err := r.repo.ResetFetching(t.Context(), fetchT0()); err != nil || n != 1 {
+				t.Fatalf("ResetFetching = %d, %v; want 1, nil", n, err)
+			}
+		}, func(r *run) string { return r.e.Pin.ID }},
+		{"the row was repinned", repin, func(*run) string { return newPin }},
+		{"the row was repinned and claimed again", func(t *testing.T, r *run) {
+			t.Helper()
+			repin(t, r)
+			// As another process's claim would; the reset then moves a row, at another pin.
+			if _, ok, err := r.repo.ClaimFetch(t.Context(), fetchT0()); err != nil || !ok {
+				t.Fatalf("ClaimFetch = %v, %v; want true, nil", ok, err)
+			}
+		}, func(*run) string { return newPin }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := runScenario(t, func(t *testing.T, base string) scenario {
+				t.Helper()
+				return liveOf(t, base, serveObject)
+			})
+			// MarkReady and the reset both fail, so the outcome stays held with its retry spent.
+			trigger := `CREATE TRIGGER inject BEFORE UPDATE OF state ON utility_cache WHEN NEW.state IN ('ready', 'wanted') BEGIN SELECT RAISE(ABORT, 'injected'); END`
+			if _, err := r.d.Bun().ExecContext(t.Context(), trigger); err != nil {
+				t.Fatalf("create trigger: %v", err)
+			}
+			for i := range 2 {
+				if _, err := r.once(); err == nil {
+					t.Fatalf("runOnce %d succeeded, want the injected error", i+1)
+				}
+			}
+			if _, err := r.d.Bun().ExecContext(t.Context(), dropTrigger); err != nil {
+				t.Fatalf("drop trigger: %v", err)
+			}
+			tt.move(t, r)
+
+			if _, err := r.once(); err != nil {
+				t.Fatalf("runOnce = %v, want nil", err)
+			}
+
+			if row, want := r.wantRow(tliveAMD64(), fleet.CacheWanted, 0), tt.wantPin(r); row.Pin != want {
+				t.Errorf("row pin = %q, want %q", row.Pin, want)
+			}
+			if got, want := r.transitions(), []string{"wanted>fetching"}; !slices.Equal(got, want) {
+				t.Errorf("events = %v, want %v", got, want)
+			}
+		})
 	}
 }
 
@@ -1414,18 +1500,28 @@ func TestFetcher_FreeSpaceBoundary(t *testing.T) {
 	tests := []struct {
 		name      string
 		short     uint64 // how far below the need the volume is
+		size      int64  // the pinned size when not 0, on a volume reporting the most free space it can
 		wantReady bool
 	}{
-		{"one byte short fails", 1, false},
-		{"exactly enough passes", 0, true},
+		{"one byte short fails", 1, 0, false},
+		{"exactly enough passes", 0, 0, true},
+		// Twice this plus the reserve is 2^64, which wraps to 0 in uint64.
+		{"a size whose need overflows fails", 0, math.MaxInt64 - spaceReserve/2 + 1, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			r := runScenario(t, func(t *testing.T, base string) scenario {
 				t.Helper()
 				sc := fixtureOf(t, base, tshellAMD64(), serveObject)
-				need := 2*uint64(len(sc.object)) + spaceReserve
-				sc.tune = func(f *Fetcher) { f.statfs = func(string) (uint64, error) { return need - tt.short, nil } }
+				free := 2*uint64(len(sc.object)) + spaceReserve - tt.short
+				if tt.size != 0 {
+					e, _ := sc.cat.Lookup("tshell", "amd64")
+					e.Pin.Objects[0].Size = tt.size
+					e.Pin.ID = catalog.PinID(e.Pin.Objects)
+					sc.cat = singleCatalog(t, e.Spec, e.Pin)
+					free = math.MaxUint64
+				}
+				sc.tune = func(f *Fetcher) { f.statfs = func(string) (uint64, error) { return free, nil } }
 				return sc
 			})
 			r.fetchOnce()
