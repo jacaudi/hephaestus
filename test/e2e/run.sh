@@ -365,7 +365,7 @@ utility_setup() {
 	um=$(mark heph-e2e-hephaestus)
 	check "utility fetch e2e-shell exits 0" heph_to "$out/utility-fetch-e2e-shell.txt" utility fetch e2e-shell
 	check "utility fetch e2e-live exits 0" heph_to "$out/utility-fetch-e2e-live.txt" utility fetch e2e-live
-	check "utility list --json shows all four e2e rows ready within 120 s" wait_for 'the four e2e rows ready' 120 utility_rows_ready
+	check "utility list --json shows all four e2e rows ready within 120 polls" wait_for 'the four e2e rows ready' 120 utility_rows_ready
 	heph utility list --json >"$out/utility-list.json" 2>&1 || true
 	since heph-e2e-hephaestus "$um" >"$out/utility-setup.hephaestus.log"
 	n=$(jn "$out/utility-setup.hephaestus.log" 'fromjson? | select(.msg=="utility fetch" and .to=="ready")')
@@ -379,8 +379,9 @@ utility_setup() {
 #   live         a kernel and initrd boot and the initrd fetches the squashfs, printing a marker on the serial console
 #                (UEFI) or leaving the squashfs request in the server log (BIOS has no serial output).
 #   unsupported  the entry has no build for the VM's firmware: row 3 clears the flag with `unsupported` and the VM holds.
-# Gate-2 BL-2 reads the outcomes: a shell 200 with no UEFI Shell on serial, or a live boot with no kernel and initrd 200,
-# is a mechanism failure of chain or of kernel+initrd+boot; a `fail <reason>` marker means the kernel and initrd ran.
+# Gate-2 BL-2 reads the outcomes. A shell /u/ 200 with no UEFI Shell on serial is a failure of the chain mechanism. A live
+# boot whose kernel and initrd return 200 but that leaves no second-stage request and no marker is a failure of the
+# kernel+initrd+boot mechanism. A `fail <reason>` marker means the kernel and initrd ran: a fixture or harness failure.
 utility_boot() {
 	name=$1 fw=$2 mac=$3 arch=$4 entry=$5 kind=$6
 	shift 6
@@ -423,8 +424,10 @@ utility_boot() {
 		live-no) # the last <file> is the second stage: its request in the server log is the BIOS evidence
 			for second; do :; done
 			ge "$(jn "$out/$name.poll.log" --arg p "$base/$second" 'fromjson? | select(.msg=="request" and .path==$p and .status==200)')" 1 && { result=reached; break; } ;;
-		unsupported-*)
-			ge "$(jn "$out/$name.poll.log" 'fromjson? | select(.msg=="request" and .path=="/boot" and .boot_next_clear=="unsupported")')" 1 && { result=reached; break; } ;;
+		unsupported-*) # held means a /boot hold plus the hold script's POST /discover, as in boot()
+			b=$(jn "$out/$name.poll.log" 'fromjson? | select(.msg=="request" and .path=="/boot" and .boot_next_clear=="unsupported")')
+			d=$(jn "$out/$name.poll.log" 'fromjson? | select(.msg=="request" and .path=="/discover" and .method=="POST" and .status==200)')
+			ge "$b" 1 && ge "$d" 1 && { result=reached; break; } ;;
 		esac
 		if [ "$uefi" = yes ] && grep -qE 'Could not boot|giving up' "$st"; then result=failed; break; fi
 		kill -0 "$vm" 2>/dev/null || { result=exited; break; }
@@ -444,7 +447,7 @@ utility_boot() {
 	shell-*) what='the UEFI Shell on serial' ;;
 	live-yes) what='a second-stage marker on serial' ;;
 	live-no) what='the second-stage request in the server log' ;;
-	unsupported-*) what='the unsupported clear in the server log' ;;
+	unsupported-*) what='the unsupported clear and the hold'"'"'s POST /discover in the server log' ;;
 	esac
 	if [ "$result" = reached ]; then
 		pass "$name: reached $what after ${elapsed}s"
@@ -462,8 +465,10 @@ utility_boot() {
 	unsupported)
 		n=$(jn "$hlog" --arg ip "$re" 'fromjson? | select(.msg=="request" and .path=="/boot" and .status==200 and .decision_row==7 and .action=="hold" and .boot_next_clear=="unsupported" and (.remote_ip|test($ip)))')
 		check "$name: /boot 200 row 7 hold with boot_next_clear unsupported" ge "$n" 1
+		n=$(jn "$hlog" --arg ip "$re" 'fromjson? | select(.msg=="request" and .path=="/discover" and .method=="POST" and .status==200 and (.remote_ip|test($ip)))')
+		check "$name: POST /discover 200 (the hold script ran)" ge "$n" 1
 		n=$(jn "$hlog" 'fromjson? | select(.msg=="request" and (.path|startswith("/u/")))')
-		check "$name: no /u/ request, so nothing was served (found ${n:-unread})" test "${n:-unread}" = 0
+		check "$name: no /u/ request, so nothing was served (found ${n:-unread})" sh -c '[ -s "$1" ] && [ "$2" = 0 ]' _ "$hlog" "$n"
 		hold1=$(hold_count) || hold1=
 		check "$name: hephaestus_boot_decisions_total{action=\"hold\",decision_row=\"7\"} rose (${hold0:-unread} -> ${hold1:-unread})" rose "$hold0" "$hold1"
 		boots1=$(boots_count "$entry") || boots1=
@@ -487,7 +492,7 @@ utility_boot() {
 				;;
 			esac
 		else
-			printf 'NOTE %s: serial not asserted (SeaBIOS writes to VGA only); the server log above is the evidence\n' "$name"
+			printf 'NOTE %s: serial not asserted (the poll stops the VM at the squashfs request); the server log above is the evidence\n' "$name"
 		fi
 		boots1=$(boots_count "$entry") || boots1=
 		check "$name: hephaestus_utility_boots_total{entry=\"$entry\"} rose (${boots0:-unread} -> ${boots1:-unread})" rose "$boots0" "$boots1"
@@ -544,7 +549,6 @@ tar --null -T "$out/tree.files" -cf "$out/tree.tar"
 tar -xf "$out/tree.tar" -C "$tree"
 rm -f "$out/tree.files" "$out/tree.tar"
 cp "$root/test/e2e/overlay/catalog.go.in" "$tree/internal/catalog/catalog.go"
-cp "$testca_dir"/* "$tree/internal/boot/ipxe/bin/"
 
 step "pin the e2e catalog against the fake upstream with the real pin tool"
 docker build --platform "$PLATFORM" -q -f "$tree/cmd/catalogpin/Dockerfile" --build-arg VERSION=e2e -t "$PIN_IMAGE" "$tree" >"$out/pin-image-build.log" 2>&1 ||
@@ -561,9 +565,14 @@ cp "$tree/internal/catalog/catalog_pins.go" "$out/catalog_pins.go.txt" # not .go
 check "pin: the catalogpin summary says PINNED 4 ABSENT 0" grep -qx 'PINNED 4 ABSENT 0' "$out/pin.out"
 [ "$fails" -eq 0 ] || { cat "$out/pin-report.txt"; exit 1; }
 
-step "hephaestus:e2e from that copy"
+step "hephaestus:e2e from that copy, with the test-CA binaries overlaid"
+# The test-CA binaries go in only now: the pin image does not need them, and changing its build context every run (the test
+# CA is new every run) would rerun its go build. DATE is the HEAD commit's, so a per-run value does not invalidate the
+# build cache from the first RUN after ARG DATE on.
+cp "$testca_dir"/* "$tree/internal/boot/ipxe/bin/"
 docker buildx build --platform "$PLATFORM" --load -q \
-	--build-arg VERSION=e2e --build-arg COMMIT="$(git rev-parse --short HEAD)" --build-arg DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+	--build-arg VERSION=e2e --build-arg COMMIT="$(git rev-parse --short HEAD)" \
+	--build-arg DATE="$(TZ=UTC git log -1 --date=format-local:%Y-%m-%dT%H:%M:%SZ --format=%cd)" \
 	-t "$IMAGE" "$tree" >"$out/image-build.log" 2>&1 || { tail -n 30 "$out/image-build.log"; exit 1; }
 rm -rf "${tree:?}"
 

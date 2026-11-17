@@ -14,11 +14,12 @@ the script says so and names colima's socket. The harness has been run on colima
 `linux/amd64` from the daemon's architecture, but amd64 hosts are untested.
 
 It needs `task`, `docker` and `git` on the host and nothing else: openssl, sqlite, dnsmasq, QEMU, curl and jq run in containers.
-It takes about 6 minutes with the BuildKit layer cache warm (measured with the M2 utility phase: 369 s; the M1 phase alone took 150 to
-154 s). The test CA is new every run, so iPXE, the pin tool's image and the `hephaestus:e2e` image are rebuilt every run, and a warm
-run is no faster. A first-ever run on a fresh daemon downloads more (the Debian snapshot, the fixture's kernel packages and the Go
-toolchain image) and is untimed. It is not part of `task ci`. VMs run under TCG, with no KVM. The Docker daemon needs room for the
-images and build cache: a run grew colima's disk use by about 2 GB.
+It takes about 5 to 6 minutes with the BuildKit layer cache warm (measured with the M2 utility phase: 290 to 369 s; the M1 phase alone took
+150 to 154 s). The test CA is new every run, so iPXE and the final `hephaestus:e2e` image build are rerun every run, and a warm run is
+no faster. The pin tool's image and `go mod download` come from the cache: the test-CA binaries enter the tree only after the pin image
+is built, and the image's build date is the HEAD commit's, not the run's. A first-ever run on a fresh daemon downloads more (the Debian
+snapshot, the fixture's kernel packages and the Go toolchain image) and is untimed. It is not part of `task ci`. VMs run under TCG, with
+no KVM. The Docker daemon needs room for the images and build cache (see `docker buildx du`).
 
 The container names, the `heph-e2e` network, its `10.99.0.0/24` subnet and the `heph-e2e-data` volume are fixed, so two runs at
 the same time on one daemon conflict (the second removes the first's containers). Run one at a time.
@@ -47,11 +48,11 @@ the same time on one daemon conflict (the second removes the first's containers)
 7. Sets `unknown_action` to `hold` in the SQLite database (M1 has no UI), then boots, one at a time, each with a 120 s
    timeout, stopping at the first hold: `ovmf` (amd64 UEFI), `seabios` (amd64 BIOS), `aarch64` (arm64 UEFI), all in file mode.
 8. The utility phase (M2) uses those three machines, which hephaestus has now seen. It asks `serve` to fetch both entries with
-   `docker exec heph-e2e-hephaestus /hephaestus utility fetch`, waits up to 120 s for `utility list --json` to show four `ready`
+   `docker exec heph-e2e-hephaestus /hephaestus utility fetch`, polls up to 120 times for `utility list --json` to show four `ready`
    rows, then runs three cases, each VM with `boot-next set` first and a 300 s timeout (`UTILITY_TIMEOUT`):
    1. EFI chain: `e2e-shell` on `ovmf` and `aarch64`.
    2. Kernel, initrd and squashfs: `e2e-live` on `ovmf`, `seabios` and `aarch64`.
-   3. Unsupported: `e2e-shell` set on the `seabios` VM, which has no build of it.
+   3. Unsupported: `e2e-shell` set on the `seabios` VM. The entry has an amd64 build, so the CLI accepts it, but it lacks `pcbios`.
 9. Boots `ovmf` again in proxy mode. Each VM has its own MAC and `-uuid`.
 
 ## Checks
@@ -65,7 +66,7 @@ write to VGA only, so the BIOS boot is judged from the server log. In proxy mode
 request as TLS 1.3, and hephaestus sees the client in `client_ip`.
 
 Utility setup: the pin tool's summary is `PINNED 4 ABSENT 0` (the run stops there otherwise); `utility fetch e2e-shell` and
-`utility fetch e2e-live` exit 0; within 120 s all four rows are `ready`; the hephaestus log has four `utility fetch` lines with
+`utility fetch e2e-live` exit 0; within 120 polls all four rows are `ready`; the hephaestus log has four `utility fetch` lines with
 `"to":"ready"`.
 
 Per utility boot: `boot-next set` exits 0; the evidence below was reached; `/boot` was 200 with decision row 3, action `utility`,
@@ -76,10 +77,11 @@ can show:
 - Case 1 (`chain`) needs `UEFI Interactive Shell` on the serial console.
 - Case 2 (`kernel`, `initrd`, `boot`): on UEFI, the serial line `HEPHAESTUS-E2E-SECOND-STAGE ok bootif=01-<MAC with hyphens>
   sha256=<hash>`, where the hash is `fixture/squashfs.sha256` (the initrd fetched the squashfs by hephaestus's IP, using the
-  `BOOTIF` iPXE expanded, and hashed it). On BIOS, which has no serial output from the firmware, the second-stage request in the
-  server log is the evidence.
-- Case 3: `/boot` was 200 with decision row 7, action `hold` and `boot_next_clear` `unsupported`; no `/u/` request was made; the hold
-  counter rose and the utility boots counter did not; the audit `reason` is `unsupported`.
+  `BOOTIF` iPXE expanded, and hashed it). On BIOS the firmware writes to VGA only and the poll stops the VM at the squashfs
+  request, so that request in the server log is the evidence.
+- Case 3: the VM held, as in M1's BIOS boot: `/boot` was 200 with decision row 7, action `hold` and `boot_next_clear`
+  `unsupported`, and the hold script's `POST /discover` was 200 (any outcome); no `/u/` request was made; the hold counter rose and the
+  utility boots counter did not; the audit `reason` is `unsupported`.
 
 Serial lines end in `\r\n`, so the harness strips `\r` and matches each marker as a substring (kernel messages can share the UART).
 A `HEPHAESTUS-E2E-SECOND-STAGE fail <reason>` line means the kernel and initrd ran, so it is a fixture or harness failure and
