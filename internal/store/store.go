@@ -258,7 +258,9 @@ func notFound(op, ref string, err error) error {
 }
 
 // Layers returns the layers of the manifest ref is tagged to, in manifest
-// order. The manifest is read with its size and digest verified.
+// order. The manifest is read with its size and digest verified. It returns an
+// error matching ErrNotFound for an unknown ref, and ErrLayerMissing when the
+// tag is known but the manifest's own blob is gone.
 func (s *Store) Layers(ctx context.Context, ref string) ([]ocispec.Descriptor, error) {
 	desc, err := s.Resolve(ctx, ref)
 	if err != nil {
@@ -266,6 +268,10 @@ func (s *Store) Layers(ctx context.Context, ref string) ([]ocispec.Descriptor, e
 	}
 	raw, err := content.FetchAll(ctx, s.oci, desc)
 	if err != nil {
+		if errors.Is(err, errdef.ErrNotFound) {
+			// the tag resolved, so it is the manifest blob that is missing
+			return nil, fmt.Errorf("read manifest of %q: %w: %w", ref, ErrLayerMissing, err)
+		}
 		return nil, fmt.Errorf("read manifest of %q: %w", ref, err)
 	}
 	var m ocispec.Manifest

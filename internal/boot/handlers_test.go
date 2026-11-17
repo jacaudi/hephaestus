@@ -255,10 +255,17 @@ func (g *rig) setState(s fleet.State) {
 	g.exec("UPDATE machines SET state = ? WHERE smbios_uuid = ?", string(s), bootUUID)
 }
 
+// maxBodyShown is how much of a response body a failed wantStatus prints.
+const maxBodyShown = 256
+
 func wantStatus(t *testing.T, rec *httptest.ResponseRecorder, want int) {
 	t.Helper()
 	if rec.Code != want {
-		t.Fatalf("status = %d, want %d (body %q)", rec.Code, want, rec.Body.String())
+		body := rec.Body.String()
+		if len(body) > maxBodyShown {
+			body = body[:maxBodyShown] + "..."
+		}
+		t.Fatalf("status = %d, want %d (body %q, %d bytes in all)", rec.Code, want, body, rec.Body.Len())
 	}
 }
 
@@ -931,7 +938,7 @@ func TestNewHandlers_RejectsMissingDependencies(t *testing.T) {
 			h, err := NewHandlers(cfg, tc.opts...)
 
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
-				t.Errorf("NewHandlers = %v, %v; want an error naming %q", h, err, tc.want)
+				t.Errorf("NewHandlers = (handlers %t), %v; want an error naming %q", h != nil, err, tc.want)
 			}
 		})
 	}

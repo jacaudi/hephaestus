@@ -712,3 +712,20 @@ func TestChecks(t *testing.T) {
 		t.Errorf("store:readable without index.json = %+v, want fail with output", got)
 	}
 }
+
+func TestLayers_MissingManifestBlob(t *testing.T) {
+	s, root := newStore(t)
+	m := tagLayers(t, s, utilityRef, pushLayer(t, s, "boot/vmlinuz", []byte("kernel")))
+	if err := os.Remove(blobFile(root, m)); err != nil {
+		t.Fatalf("remove manifest blob: %v", err)
+	}
+
+	_, err := s.Layers(t.Context(), utilityRef)
+
+	if !errors.Is(err, ErrLayerMissing) {
+		t.Fatalf("Layers() error = %v, want ErrLayerMissing", err)
+	}
+	if errors.Is(err, ErrNotFound) {
+		t.Errorf("Layers() error = %v, want the tag still known (not ErrNotFound)", err)
+	}
+}

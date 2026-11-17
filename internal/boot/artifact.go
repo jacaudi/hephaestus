@@ -1,6 +1,7 @@
 package boot
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"path"
@@ -74,7 +75,7 @@ func (h *Handlers) artifactError(w http.ResponseWriter, r *http.Request, e catal
 	row, found, rerr := h.repo.CacheRow(ctx, fleet.CacheKey{Entry: e.Entry, Arch: fleet.Arch(e.Arch)})
 	switch {
 	case rerr != nil:
-		h.onError(ctx, rerr)
+		h.onError(ctx, errors.Join(fmt.Errorf("boot: %s/%s content lost: %w", e.Entry, e.Arch, err), rerr))
 	case found && row.State == fleet.CacheReady && row.Pin == e.Pin.ID:
 		h.requeueMissing(ctx, e, err, h.now())
 	}

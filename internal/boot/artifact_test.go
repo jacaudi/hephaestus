@@ -262,7 +262,7 @@ func (g *rig) makeUnreadable(path string) {
 	}
 }
 
-// shortTimeouts is how long the server of TestArtifact_IdleWriterOutlivesWriteTimeout
+// shortTimeout is how long the server of TestArtifact_IdleWriterOutlivesWriteTimeout
 // allows reading a request and writing a response, and how long its client
 // pauses mid-download.
 const (
@@ -397,8 +397,50 @@ func TestArtifact_IdleWriterOutlivesWriteTimeout(t *testing.T) {
 
 		got, err := slowGet(t, srv.URL+liveURL)
 
-		if err == nil && len(got) == len(want) {
-			t.Errorf("control downloaded all %d bytes: the timeouts did not cut it off, so the test proves nothing", len(got))
+		if err == nil {
+			t.Error("control download ended without an error: the timeouts did not cut it off, so the test proves nothing")
+		}
+		if !bytes.HasPrefix(want, got) || len(got) >= len(want) {
+			t.Errorf("control downloaded %d of %d bytes, want a strict prefix of the file", len(got), len(want))
 		}
 	})
+}
+
+// TestArtifact_MissingManifestRequeues is a store whose manifest blob is gone
+// while its tag is not: lost content, like a missing layer.
+func TestArtifact_MissingManifestRequeues(t *testing.T) {
+	g := newRig(t)
+	g.stockLive()
+	desc, err := g.st.Resolve(t.Context(), g.live().Tag())
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if err := os.Remove(filepath.Join(g.storeRoot, "blobs", "sha256", desc.Digest.Encoded())); err != nil {
+		t.Fatalf("remove manifest blob: %v", err)
+	}
+
+	rec := g.plain(liveURL)
+
+	wantStatus(t, rec, http.StatusNotFound)
+	g.wantRequeued()
+}
+
+// TestArtifact_LostContentReportsWhenTheRowCannotBeRead pins that the store's
+// error is not dropped when the cache row it would requeue cannot be read.
+func TestArtifact_LostContentReportsWhenTheRowCannotBeRead(t *testing.T) {
+	g := newRig(t)
+	g.stockLive()
+	if err := os.Remove(g.liveBlob()); err != nil {
+		t.Fatalf("remove blob: %v", err)
+	}
+	if err := g.d.Close(); err != nil { // dbtest closes it again; database/sql allows that
+		t.Fatalf("close database: %v", err)
+	}
+
+	rec := g.plain(liveURL)
+
+	wantStatus(t, rec, http.StatusNotFound)
+	if len(g.errs) != 1 || !errors.Is(g.errs[0], store.ErrLayerMissing) {
+		t.Errorf("reported errors = %v, want one that wraps the store's ErrLayerMissing", g.errs)
+	}
 }
