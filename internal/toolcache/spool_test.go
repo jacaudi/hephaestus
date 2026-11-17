@@ -46,6 +46,8 @@ var contentRangeCases = []struct {
 	wantErr           bool
 }{
 	{name: "whole", in: "bytes 0-9/10", start: 0, end: 9, total: 10},
+	{name: "capitalised unit", in: "Bytes 0-9/10", start: 0, end: 9, total: 10},
+	{name: "upper-case unit", in: "BYTES 5-9/10", start: 5, end: 9, total: 10},
 	{name: "tail", in: "bytes 5-9/10", start: 5, end: 9, total: 10},
 	{name: "one byte", in: "bytes 9-9/10", start: 9, end: 9, total: 10},
 	{name: "unknown total", in: "bytes 5-9/*", wantErr: true},

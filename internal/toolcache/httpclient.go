@@ -32,6 +32,10 @@ func (t *userAgentTransport) RoundTrip(req *http.Request) (*http.Response, error
 	return t.base.RoundTrip(req)
 }
 
+// CloseIdleConnections lets http.Client.CloseIdleConnections reach the real
+// transport, whose pooled connections the wrapper would otherwise hide.
+func (t *userAgentTransport) CloseIdleConnections() { t.base.CloseIdleConnections() }
+
 // NewHTTPClient returns the client for every upstream fetch: TLS 1.3 at
 // least, trusting roots (the system roots when nil), no total timeout (the
 // objects are large; the fetcher applies an idle deadline), no transparent
@@ -39,13 +43,12 @@ func (t *userAgentTransport) RoundTrip(req *http.Request) (*http.Response, error
 // from the environment. It sends userAgent, follows at most MaxRedirects
 // redirects, and follows only https ones. Go adds a Referer on a redirect;
 // the client removes it, because SourceForge answers a request carrying one
-// with an HTML interstitial and status 200.
+// with an HTML interstitial and status 200. It panics if http.DefaultTransport
+// has been replaced by something other than an *http.Transport.
 func NewHTTPClient(userAgent string, roots *x509.CertPool) *http.Client {
-	// ponytail: a replaced http.DefaultTransport falls back to a bare
-	// transport; the cloned defaults (dialer, timeouts, HTTP/2) are lost.
 	base, ok := http.DefaultTransport.(*http.Transport)
 	if !ok {
-		base = &http.Transport{ForceAttemptHTTP2: true}
+		panic("toolcache: http.DefaultTransport is not *http.Transport")
 	}
 	tr := base.Clone()
 	tr.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS13, RootCAs: roots}

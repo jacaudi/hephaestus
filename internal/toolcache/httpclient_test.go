@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -120,7 +122,12 @@ func TestHTTPClient_Redirects(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var srv *httptest.Server
+			var mu sync.Mutex
+			var seen []string
 			srv = startTLS(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				seen = append(seen, r.URL.Path)
+				mu.Unlock()
 				var n int
 				if _, err := fmt.Sscanf(r.URL.Path, "/hop/%d", &n); err != nil {
 					http.Error(w, err.Error(), http.StatusBadRequest)
@@ -140,6 +147,14 @@ func TestHTTPClient_Redirects(t *testing.T) {
 				}
 				if _, ok := errors.AsType[*IntegrityError](err); ok {
 					t.Errorf("too many redirects is an ordinary error, got IntegrityError: %v", err)
+				}
+				if !strings.Contains(err.Error(), "too many redirects") {
+					t.Errorf("error = %v, want it to say too many redirects", err)
+				}
+				mu.Lock()
+				defer mu.Unlock()
+				if refused := fmt.Sprintf("/hop/%d", MaxRedirects+1); slices.Contains(seen, refused) {
+					t.Errorf("the refused redirect target %s was requested; saw %v", refused, seen)
 				}
 				return
 			}
@@ -193,8 +208,11 @@ func TestHTTPClient_NoTotalTimeout(t *testing.T) {
 }
 
 func TestHTTPClient_UserAgentOnEveryRequest(t *testing.T) {
+	var mu sync.Mutex
 	var got string
 	srv := startTLS(t, http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
 		got = r.Header.Get("User-Agent")
 	}), false)
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL, http.NoBody)
@@ -210,11 +228,67 @@ func TestHTTPClient_UserAgentOnEveryRequest(t *testing.T) {
 	if err := resp.Body.Close(); err != nil {
 		t.Fatalf("close body: %v", err)
 	}
+	mu.Lock()
+	defer mu.Unlock()
 	if got != testUserAgent {
 		t.Errorf("server saw User-Agent %q, want %q", got, testUserAgent)
 	}
 	if h := req.Header.Get("User-Agent"); h != "caller/1" {
 		t.Errorf("caller's request was mutated: User-Agent = %q", h)
+	}
+}
+
+func TestNewHTTPClient_PanicsWithoutDefaultTransport(t *testing.T) {
+	orig := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = orig })
+	http.DefaultTransport = roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("unused")
+	})
+
+	defer func() {
+		if recover() == nil {
+			t.Error("NewHTTPClient did not panic when http.DefaultTransport is not an *http.Transport")
+		}
+	}()
+	NewHTTPClient(testUserAgent, nil)
+}
+
+// roundTripperFunc adapts a function to http.RoundTripper.
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+func TestHTTPClient_CloseIdleConnections(t *testing.T) {
+	srv := startTLS(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}), false)
+	c := NewHTTPClient(testUserAgent, poolOf(srv))
+
+	// reused reports whether a GET rode an idle connection from the pool.
+	reused := func() bool {
+		var info httptrace.GotConnInfo
+		ctx := httptrace.WithClientTrace(t.Context(), &httptrace.ClientTrace{
+			GotConn: func(i httptrace.GotConnInfo) { info = i },
+		})
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, http.NoBody)
+		if err != nil {
+			t.Fatalf("NewRequest: %v", err)
+		}
+		resp, err := c.Do(req)
+		if err != nil {
+			t.Fatalf("Do: %v", err)
+		}
+		if err := resp.Body.Close(); err != nil {
+			t.Fatalf("close body: %v", err)
+		}
+		return info.Reused
+	}
+
+	reused() // dial and pool a connection
+	if !reused() {
+		t.Fatal("second request did not reuse the pooled connection; the test cannot tell")
+	}
+	c.CloseIdleConnections()
+	if reused() {
+		t.Error("a request after CloseIdleConnections reused a connection: the call did not reach the transport")
 	}
 }
 

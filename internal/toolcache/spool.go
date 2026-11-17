@@ -29,12 +29,13 @@ func strongETag(v string) bool {
 // errContentRange is the cause behind every parseContentRange failure.
 var errContentRange = errors.New("not a satisfied bytes Content-Range with a known total")
 
-// parseContentRange parses "bytes <start>-<end>/<total>" and returns
+// parseContentRange parses "bytes <start>-<end>/<total>" (the unit is
+// case-insensitive, RFC 9110 section 14.1) and returns
 // 0 <= start <= end < total. The "bytes */<total>" and "bytes a-b/*" forms
 // are refused: a resume needs the range and the total to check them.
 func parseContentRange(h string) (start, end, total int64, err error) {
-	rest, ok := strings.CutPrefix(h, "bytes ")
-	if !ok {
+	unit, rest, ok := strings.Cut(h, " ")
+	if !ok || !strings.EqualFold(unit, "bytes") {
 		return 0, 0, 0, fmt.Errorf("content-range %q: %w", h, errContentRange)
 	}
 	span, totalText, ok1 := strings.Cut(rest, "/")
