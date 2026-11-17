@@ -20,7 +20,7 @@ const (
 	CacheReady CacheState = "ready"
 	// CacheFailed failed transiently and is retried when next_attempt_at is due.
 	CacheFailed CacheState = "failed"
-	// CacheBroken failed for good; only an admin action re-arms it.
+	// CacheBroken failed for good; only an admin action or a repin re-arms it.
 	CacheBroken CacheState = "broken"
 )
 

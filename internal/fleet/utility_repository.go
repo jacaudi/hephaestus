@@ -22,7 +22,9 @@ const (
 )
 
 // errCacheChanged means a cache row moved under a transaction that expected it
-// where it loaded it; the transaction rolls back and the event is a no-op.
+// where it loaded it, and the transaction rolls back. RecordFetchFailure turns
+// it into a no-op, the failure not being the row's; RequestFetch returns it as
+// an error, which the CLI can report.
 var errCacheChanged = errors.New("cache row changed under the transaction")
 
 // cacheDetail is the detail of a utility.ready audit event.
@@ -56,7 +58,7 @@ func (c CacheRow) utc() CacheRow {
 }
 
 // RequestFetch is an admin asking for the row at key to be fetched at pin, in a
-// single transaction. No row is created wanted at priority. A failed or broken
+// single transaction. A missing row is created wanted at priority. A failed or broken
 // row at pin is re-armed: wanted, attempts reset, its priority raised to
 // priority, with the cleared last_error returned as PreviousError. A wanted,
 // fetching or ready row at pin keeps its state and has its priority raised to
@@ -100,7 +102,7 @@ func requestFetch(ctx context.Context, q bun.IDB, w FetchWant, priority int, at 
 		}
 	case CacheWanted, CacheFetching, CacheReady:
 		// Only the priority moves, so updated_at, the queue order among equals, stays.
-		_, err = updateCache(q, w.Key, w.Pin).Where("priority < ?", priority).Set("priority = ?", priority).Exec(ctx)
+		_, err = updateCache(q, w.Key, w.Pin).Where("state = ?", row.State).Where("priority < ?", priority).Set("priority = ?", priority).Exec(ctx)
 	}
 	if err != nil {
 		return FetchRequest{}, fmt.Errorf("request %s/%s: %w", w.Key.Entry, w.Key.Arch, err)
@@ -111,8 +113,8 @@ func requestFetch(ctx context.Context, q bun.IDB, w FetchWant, priority int, at 
 	return req, nil
 }
 
-// wantFetch is row 3 of the boot decision wanting the entry: no row is created
-// wanted at priority 1, and a wanted row at the pin is raised to 1. Every other
+// wantFetch is row 3 of the boot decision wanting the entry: a missing row is
+// created wanted at priority 1, and a wanted row at the pin is raised to 1. Every other
 // state is left alone, so a held machine re-chaining every 30 s never resets
 // backoff or re-arms a broken row.
 func wantFetch(ctx context.Context, q bun.IDB, w FetchWant, at time.Time) error {

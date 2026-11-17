@@ -157,6 +157,20 @@ func runUtilitySuite(t *testing.T, open func(testing.TB) *db.DB) {
 			t.Fatalf("RequestFetch = %+v; want %+v, rearmed, previous error %q", got, want, "boom")
 		}
 		wantCache(t, r, k, want)
+
+		// A re-arm never lowers the priority a boot-next gave the row.
+		high := CacheKey{Entry: "tlive", Arch: ArchARM64}
+		armed := cacheRowIn(high, CacheFailed, t0)
+		armed.Attempts, armed.LastError, armed.NextAttemptAt, armed.Priority = 2, "boom", t0.Add(2*time.Minute), 1
+		seedCache(t, d, armed)
+
+		got = mustRequest(t, r, high, pinOne, 0, t0.Add(time.Minute))
+		want = cacheRowIn(high, CacheWanted, t0.Add(time.Minute))
+		want.Priority = 1
+		if !got.Rearmed || !sameCacheRow(got.Row, want) {
+			t.Fatalf("RequestFetch of a priority 1 row at priority 0 = %+v; want %+v, rearmed", got, want)
+		}
+		wantCache(t, r, high, want)
 	})
 
 	t.Run("RequestRearmsBroken", func(t *testing.T) {
