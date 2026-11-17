@@ -97,7 +97,7 @@ func truncateBlob(t *testing.T, path string) {
 	if err != nil {
 		t.Fatalf("stat %s: %v", path, err)
 	}
-	if err := os.Chmod(path, 0o600); err != nil {
+	if err := os.Chmod(path, 0o644); err != nil {
 		t.Fatalf("chmod %s: %v", path, err)
 	}
 	if err := os.Truncate(path, info.Size()-1); err != nil {
@@ -323,6 +323,23 @@ func TestCheckLayers(t *testing.T) {
 	}
 }
 
+func TestCheckLayers_MissingManifestBlob(t *testing.T) {
+	s, root := newStore(t)
+	m := tagLayers(t, s, utilityRef, pushLayer(t, s, "boot/vmlinuz", []byte("kernel")))
+	if err := os.Remove(blobFile(root, m)); err != nil {
+		t.Fatalf("remove manifest blob: %v", err)
+	}
+
+	err := s.CheckLayers(t.Context(), utilityRef)
+
+	if !errors.Is(err, ErrLayerMissing) {
+		t.Fatalf("CheckLayers() error = %v, want ErrLayerMissing", err)
+	}
+	if errors.Is(err, ErrNotFound) {
+		t.Errorf("CheckLayers() error = %v, want the tag still known (not ErrNotFound)", err)
+	}
+}
+
 func TestOpenBlob_ReadsAndSeeks(t *testing.T) {
 	s, root := newStore(t)
 	data := []byte("kernel bytes")
@@ -400,6 +417,10 @@ func TestOpen_EmptyIndexReset(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "store")
 	s, _ := openAt(t, root)
 	desc := pushLayer(t, s, "boot/vmlinuz", []byte("kernel"))
+	tagLayers(t, s, utilityRef, desc)
+	if tags, err := s.Tags(t.Context(), "utility/"); err != nil || len(tags) != 1 {
+		t.Fatalf("Tags() before = %v, %v, want the one tag the reset must drop", tags, err)
+	}
 	writeFile(t, filepath.Join(root, "index.json"), "")
 
 	s2, moved := openAt(t, root)
@@ -437,6 +458,80 @@ func TestOpen_CorruptManifestMovedAside(t *testing.T) {
 	}
 }
 
+// TestOpen_CorruptionClassesMovedAside pins each allow-list class that no
+// other Open test reaches.
+func TestOpen_CorruptionClassesMovedAside(t *testing.T) {
+	// rewriteManifest replaces the manifest blob with data; blobs are 0444, so
+	// it unlinks the file first, as the store does.
+	rewriteManifest := func(t *testing.T, root string, m ocispec.Descriptor, data []byte) {
+		t.Helper()
+		path := blobFile(root, m)
+		if err := os.Remove(path); err != nil {
+			t.Fatalf("remove manifest blob: %v", err)
+		}
+		writeFile(t, path, string(data))
+	}
+	tests := []struct {
+		name   string
+		mutate func(t *testing.T, root string, m ocispec.Descriptor)
+	}{
+		{
+			name: "truncated manifest (io.ErrUnexpectedEOF)",
+			mutate: func(t *testing.T, root string, m ocispec.Descriptor) {
+				t.Helper()
+				full, err := os.ReadFile(blobFile(root, m))
+				if err != nil {
+					t.Fatalf("read manifest blob: %v", err)
+				}
+				rewriteManifest(t, root, m, full[:len(full)/2])
+			},
+		},
+		{
+			name: "manifest with a trailing byte (content.ErrTrailingData)",
+			mutate: func(t *testing.T, root string, m ocispec.Descriptor) {
+				t.Helper()
+				full, err := os.ReadFile(blobFile(root, m))
+				if err != nil {
+					t.Fatalf("read manifest blob: %v", err)
+				}
+				rewriteManifest(t, root, m, append(full, 'x'))
+			},
+		},
+		{
+			name: "index of the wrong JSON type (*json.UnmarshalTypeError)",
+			mutate: func(t *testing.T, root string, _ ocispec.Descriptor) {
+				t.Helper()
+				writeFile(t, filepath.Join(root, "index.json"), `{"manifests":5}`)
+			},
+		},
+		{
+			name: "index entry with a bad digest (errdef.ErrInvalidDigest)",
+			mutate: func(t *testing.T, root string, _ ocispec.Descriptor) {
+				t.Helper()
+				writeFile(t, filepath.Join(root, "index.json"),
+					`{"schemaVersion":2,"manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:zz","size":1}]}`)
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := filepath.Join(t.TempDir(), "store")
+			s, _ := openAt(t, root)
+			m := tagLayers(t, s, utilityRef, pushLayer(t, s, "boot/vmlinuz", []byte("kernel")))
+			tt.mutate(t, root, m)
+
+			s2, moved := openAt(t, root)
+
+			if moved == "" {
+				t.Fatal("moved is empty, want the corrupt store moved aside")
+			}
+			if tags, err := s2.Tags(t.Context(), ""); err != nil || len(tags) != 0 {
+				t.Errorf("Tags() = %v, %v, want none in the new store", tags, err)
+			}
+		})
+	}
+}
+
 func TestOpen_InvalidLayoutMovedAside(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "store")
 	openAt(t, root)
@@ -457,6 +552,10 @@ func TestOpen_PermissionDeniedStops(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "store")
 	openAt(t, root)
 	index := filepath.Join(root, "index.json")
+	before, err := os.Stat(index)
+	if err != nil {
+		t.Fatalf("stat index.json: %v", err)
+	}
 	if err := os.Chmod(index, 0o000); err != nil {
 		t.Fatalf("chmod index.json: %v", err)
 	}
@@ -477,8 +576,13 @@ func TestOpen_PermissionDeniedStops(t *testing.T) {
 	if moved != "" {
 		t.Errorf("moved = %q, want empty", moved)
 	}
-	if _, err := os.Stat(root); err != nil {
-		t.Errorf("store root stat error = %v, want it left in place", err)
+	after, err := os.Stat(index)
+	if err != nil || !os.SameFile(before, after) {
+		t.Errorf("index.json stat = %v, %v, want the original file left in place", after, err)
+	}
+	siblings, err := filepath.Glob(filepath.Join(filepath.Dir(root), corruptPrefix+"*"))
+	if err != nil || len(siblings) != 0 {
+		t.Errorf("store.corrupt-* siblings = %v, %v, want none", siblings, err)
 	}
 }
 

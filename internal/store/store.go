@@ -8,6 +8,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -37,30 +38,32 @@ const (
 var ErrNotFound = fmt.Errorf("store: %w", errdef.ErrNotFound)
 
 // Store is an OCI image layout on disk. Blobs are pushed with PushBlob,
-// tagged with TagArtifact and read back with OpenBlob. It is safe for
-// concurrent use.
+// tagged with TagArtifact and read back with OpenBlob. Its methods may be
+// called concurrently, except PushBlob for one digest whose blob is on disk at
+// the wrong size: two such calls race on the repair, so callers serialise them
+// (serve runs one fetch at a time).
 type Store struct {
 	root string
 	oci  *oci.Store
 }
 
-// Layer returns the descriptor of a layer holding the file at path: media type
-// LayerMediaType, digest sha256:<sha256Hex>, and path as its title annotation.
+// Layer returns the descriptor of a layer holding a file: media type
+// LayerMediaType, digest sha256:<sha256Hex>, and file (its path in the artifact) as its title annotation.
 // It returns an error for a size below zero or a digest that is not a
 // well-formed sha256.
-func Layer(path string, size int64, sha256Hex string) (ocispec.Descriptor, error) {
+func Layer(file string, size int64, sha256Hex string) (ocispec.Descriptor, error) {
 	dgst := digest.NewDigestFromEncoded(digest.SHA256, sha256Hex)
 	if err := dgst.Validate(); err != nil {
-		return ocispec.Descriptor{}, fmt.Errorf("layer %q: %w", path, err)
+		return ocispec.Descriptor{}, fmt.Errorf("layer %q: %w", file, err)
 	}
 	if size < 0 {
-		return ocispec.Descriptor{}, fmt.Errorf("layer %q: size %d is negative", path, size)
+		return ocispec.Descriptor{}, fmt.Errorf("layer %q: size %d is negative", file, size)
 	}
 	return ocispec.Descriptor{
 		MediaType:   LayerMediaType,
 		Digest:      dgst,
 		Size:        size,
-		Annotations: map[string]string{ocispec.AnnotationTitle: path},
+		Annotations: map[string]string{ocispec.AnnotationTitle: file},
 	}, nil
 }
 
@@ -161,7 +164,7 @@ func blobRel(d digest.Digest) (string, error) {
 	if err := d.Validate(); err != nil {
 		return "", fmt.Errorf("blob digest %q: %w", d, err)
 	}
-	return filepath.Join(ocispec.ImageBlobsDir, d.Algorithm().String(), d.Encoded()), nil
+	return path.Join(ocispec.ImageBlobsDir, d.Algorithm().String(), d.Encoded()), nil
 }
 
 // blobSize is the on-disk size of a blob; the error matches fs.ErrNotExist
@@ -235,7 +238,9 @@ func (s *Store) TagArtifact(ctx context.Context, ref, artifactType string, layer
 }
 
 // Resolve returns the descriptor ref is tagged to, or an error matching
-// ErrNotFound when no such tag exists.
+// ErrNotFound when no such tag exists. ref is a tag: a digest of a blob on disk
+// resolves to a raw blob descriptor, not a manifest, and callers pass only
+// tags.
 func (s *Store) Resolve(ctx context.Context, ref string) (ocispec.Descriptor, error) {
 	desc, err := s.oci.Resolve(ctx, ref)
 	if err != nil {

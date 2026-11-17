@@ -8,9 +8,11 @@ import (
 	"io"
 	"io/fs"
 	"os"
-	"path/filepath"
+	"path"
 
 	"github.com/opencontainers/go-digest"
+	"github.com/oras-project/oras-go/v3/errdef"
+
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"go.jacaudi.dev/hephaestus/internal/admin"
@@ -24,10 +26,14 @@ var ErrLayerSize = errors.New("layer blob has the wrong size")
 
 // CheckLayers verifies that every layer of the manifest ref is tagged to is on
 // disk at its descriptor's size. It returns an error matching ErrNotFound for
-// an unknown ref, then for the first bad layer ErrLayerMissing or ErrLayerSize,
-// naming its digest.
+// an unknown ref, ErrLayerMissing when the manifest's own blob is gone, then
+// for the first bad layer ErrLayerMissing or ErrLayerSize, naming its digest.
 func (s *Store) CheckLayers(ctx context.Context, ref string) error {
 	layers, err := s.Layers(ctx, ref)
+	if errors.Is(err, errdef.ErrNotFound) && !errors.Is(err, ErrNotFound) {
+		// the tag resolved, so it is the manifest blob that is missing
+		return fmt.Errorf("%w: %w", ErrLayerMissing, err)
+	}
 	if err != nil {
 		return err
 	}
@@ -140,5 +146,5 @@ func decodeIndex(r *os.Root) error {
 
 // readBlobDir lists the sha256 blob directory under r.
 func readBlobDir(r *os.Root) ([]fs.DirEntry, error) {
-	return fs.ReadDir(r.FS(), filepath.Join(ocispec.ImageBlobsDir, digest.Canonical.String()))
+	return fs.ReadDir(r.FS(), path.Join(ocispec.ImageBlobsDir, digest.Canonical.String()))
 }
