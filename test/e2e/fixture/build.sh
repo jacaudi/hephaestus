@@ -30,8 +30,11 @@ initrd_for() {
 	root=$work/$arch/root
 	rd=$work/$arch/initrd
 	mkdir -p "$root" "$rd/bin" "$rd/dev" "$rd/etc" "$rd/proc" "$rd/sys" "$rd/modules"
-	dpkg-deb -x "$(one_deb "$dl"/linux-image-*_"$arch".deb)" "$root"
-	dpkg-deb -x "$(one_deb "$dl"/busybox-static_*_"$arch".deb)" "$root"
+	# Assigned first: the exit status of a command substitution inside an argument is lost, so one_deb's exit 1 would not stop us.
+	kernel_deb=$(one_deb "$dl"/linux-image-*_"$arch".deb)
+	dpkg-deb -x "$kernel_deb" "$root"
+	busybox_deb=$(one_deb "$dl"/busybox-static_*_"$arch".deb)
+	dpkg-deb -x "$busybox_deb" "$root"
 	ln -s usr/lib "$root/lib" # depmod and modprobe look in <root>/lib/modules; Debian keeps them in /usr/lib/modules
 	set -- "$root"/usr/lib/modules/*
 	ver=${1##*/}

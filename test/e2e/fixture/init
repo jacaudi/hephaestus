@@ -4,25 +4,24 @@
 # contract that the e2e harness matches byte for byte:
 #   HEPHAESTUS-E2E-SECOND-STAGE ok bootif=<BOOTIF value> sha256=<hex of the fetched file>
 #   HEPHAESTUS-E2E-SECOND-STAGE fail <no-bootif|no-interface|no-dhcp|no-fetch>
-# Then it powers off, which ends QEMU (-no-reboot).
+# Then it powers off, which ends QEMU (-no-reboot). PID 1 never exits: a kernel panics when init does.
 /busybox mount -t proc proc /proc
 /busybox --install -s /bin # needs /proc/self/exe to find itself
 export PATH=/bin
 mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev
 
-# finish <words...>: write the contract line to every serial console that exists, then power off.
+# finish <words...>: write the contract line to every serial console that exists and to /dev/console, then power off.
+# It never returns: a failed power-off must leave PID 1 alive, not panic the kernel.
 finish() {
-	for tty in /dev/ttyS0 /dev/ttyAMA0; do
+	for tty in /dev/ttyS0 /dev/ttyAMA0 /dev/console; do
 		[ -e "$tty" ] && { printf 'HEPHAESTUS-E2E-SECOND-STAGE %s\n' "$*" >"$tty"; } 2>/dev/null
 	done
 	sleep 1 # let the UART drain; a power-off right behind the write can drop the tail of the line
 	poweroff -f
+	while :; do sleep 60; done
 }
-fail() {
-	finish "fail $1"
-	exit 1
-}
+fail() { finish "fail $1"; }
 
 # find_iface prints the interface whose MAC is $mac, if there is one yet.
 find_iface() {
@@ -66,6 +65,6 @@ done
 
 ip link set dev "$iface" up
 udhcpc -i "$iface" -n -q -t 10 -s /udhcpc.sh || fail no-dhcp
-wget -O /sq "$fetch" || fail no-fetch
+wget -T 60 -O /sq "$fetch" || fail no-fetch
 sum=$(sha256sum /sq)
 finish "ok bootif=$bootif sha256=${sum%% *}"
