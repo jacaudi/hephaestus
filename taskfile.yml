@@ -61,8 +61,10 @@ tasks:
       - docker buildx build --platform {{.PLATFORM}} --load --progress=plain --build-arg VERSION={{.VERSION}} --build-arg COMMIT={{.COMMIT}} --build-arg DATE={{.DATE}} -t hephaestus:dev .
   catalog:image:
     desc: Build the pinned catalog pin image, which holds catalogpin and gpg (needs DOCKER_HOST)
+    vars:
+      COMMIT: {sh: git rev-parse --short HEAD}
     cmds:
-      - docker build -f cmd/catalogpin/Dockerfile -t hephaestus-catalogpin:local .
+      - docker build -f cmd/catalogpin/Dockerfile --build-arg VERSION={{.COMMIT}} -t hephaestus-catalogpin:local .
   catalog:pin:
     desc: Re-pin the utility catalog into internal/catalog/catalog_pins.go and build/catalogpin/report.txt (needs DOCKER_HOST, the internet and about 6.5 GB of downloads; task catalog:pin -- -only grml re-pins one entry)
     deps: [catalog:image]

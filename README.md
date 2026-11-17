@@ -120,15 +120,15 @@ task catalog:pin                      # pin every entry
 task catalog:pin -- -only grml        # re-pin one entry; every other entry keeps its pin or absent reason
 ```
 
-`task catalog:pin` runs inside a pinned container (`task catalog:image` builds it: the `catalogpin` tool plus gpg), so the host needs no gpg. It needs `DOCKER_HOST` set for colima, the internet and about 6.5 GB of downloads. For each object it downloads it over TLS 1.3 (every redirect hop is checked), checks the size, verifies the signature against the key in `internal/catalog/keys/` before parsing anything, extracts the files the catalog boots, and records their hashes. The report, with every hop, hash, signer, the ShredOS EFI-stub finding and whether each recipe's operating system honours BOOTIF, is `build/catalogpin/report.txt`.
+`task catalog:pin` runs inside a pinned container (`task catalog:image` builds it: the `catalogpin` tool plus gpg), so the host needs no gpg. It needs `DOCKER_HOST` set for colima, the internet and about 6.5 GB of downloads. For each object it downloads it over TLS 1.3 (every redirect hop is checked), checks the size, extracts the files the catalog boots, and records their hashes. A signed entry is verified against the key in `internal/catalog/keys/` before anything is parsed; a trust-on-first-use entry is pinned on first use. The report, with every hop, hash, signer, the ShredOS EFI-stub finding and whether each recipe's operating system honours BOOTIF, is `build/catalogpin/report.txt`.
 
 An entry that cannot be pinned is not an error. It goes in the `absent` ledger of `catalog_pins.go` with a reason that starts with its class:
 
 | Class | Meaning |
 |---|---|
 | `tls13:` | a hop did not complete TLS 1.3 |
-| `network:` | DNS, connect, reset, timeout or another transfer failure (retried up to 3 times) |
-| `http-<status>:` | an unexpected HTTP status (`5xx` and `429` are retried up to 3 times) |
+| `network:` | DNS, connect, reset, timeout, another transfer failure or a local gpg failure such as no gpg (up to 3 attempts for a transfer) |
+| `http-<status>:` | an unexpected HTTP status (`5xx` and `429` get up to 3 attempts) |
 | `integrity:` | a size, hash or extraction failure |
 | `signature:` | signature verification, key fingerprint or provenance failure |
 | `checksum:` | the upstream checksum list does not name the object's digest |

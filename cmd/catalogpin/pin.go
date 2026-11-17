@@ -16,7 +16,6 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -29,7 +28,8 @@ import (
 // acts on the class: network and the retryable http classes pause the run,
 // the rest rule the entry absent.
 const (
-	// classTLS13 is a hop that did not complete TLS 1.3.
+	// classTLS13 is a hop that did not complete TLS 1.3, a redirect off https
+	// included.
 	classTLS13 = "tls13"
 	// classNetwork is DNS, connect, reset, timeout, any other transfer or
 	// handshake I/O failure, a body that ends short of its Content-Length, and
@@ -145,8 +145,10 @@ func asPinError(err error) *pinError {
 // version below it; over TCP crypto/tls returns a received alert as a
 // *net.OpError whose Err is unexported, so it is matched by its text.
 func classifyFetchError(err error) string {
+	// The only IntegrityError the client returns is a redirect off https: a hop
+	// that will not complete TLS.
 	if _, ok := errors.AsType[*toolcache.IntegrityError](err); ok { //nolint:errcheck // the match target is not a dropped error; modernize requires AsType over errors.As
-		return classIntegrity
+		return classTLS13
 	}
 	if tlsVersionRefused(err) {
 		return classTLS13
@@ -162,8 +164,13 @@ func tlsVersionRefused(err error) bool {
 		oe.Err.Error() == "tls: protocol version not supported" {
 		return true
 	}
-	// A server that answers a TLS 1.3-only hello with a lower version.
-	return strings.Contains(err.Error(), "tls: server selected unsupported protocol version")
+	// A server that answers a TLS 1.3-only hello with a lower version. Only the
+	// cause is read: the URL in a url.Error is not part of the verdict.
+	cause := err
+	if ue, ok := errors.AsType[*url.Error](err); ok && ue.Err != nil {
+		cause = ue.Err
+	}
+	return strings.Contains(cause.Error(), "tls: server selected unsupported protocol version")
 }
 
 // hopOf records the response r: its request's URL, redacted, its status and
@@ -251,7 +258,7 @@ func (p *pinner) fetchOnce(ctx context.Context, rawURL, name string, limit int64
 	if err != nil {
 		return got, err
 	}
-	defer resp.Body.Close() //nolint:errcheck // read-only body
+	defer func() { err = errors.Join(err, resp.Body.Close()) }()
 	h := hopOf(resp)
 	got.hops = append(got.hops, h)
 	if err := checkHop(h); err != nil {
@@ -347,7 +354,7 @@ func (p *pinner) pinObject(ctx context.Context, s catalog.Spec, i int) (op catal
 		return op, lines, err
 	}
 	sha := obj.sums.sum(algoSHA256)
-	lines = append(lines, fmt.Sprintf("object %s size=%d sha256=%s", o.URL, obj.size, sha))
+	lines = append(lines, fmt.Sprintf("object %s size=%d sha256=%s", toolcache.RedactURL(o.URL), obj.size, sha))
 
 	signer, authLines, err := p.authenticate(ctx, o, name, obj)
 	lines = append(lines, authLines...)
@@ -436,18 +443,28 @@ func (p *pinner) verifySignature(ctx context.Context, sig catalog.Signature, cov
 	}
 	signer, err := p.verify(ctx, keyFile, p.workPath(sigName), p.workPath(covered))
 	if err != nil {
-		return "", lines, failf(classSignature, "verify with %s: %w", sig.Key, err)
+		return "", lines, failf(gpgClass(err), "verify with %s: %w", sig.Key, err)
 	}
 	primary, err := p.keyPrimary(ctx, keyFile)
 	switch {
 	case err != nil:
-		return "", lines, failf(classSignature, "read the fingerprint of %s: %w", sig.Key, err)
+		return "", lines, failf(gpgClass(err), "read the fingerprint of %s: %w", sig.Key, err)
 	case signer != primary:
 		return "", lines, failf(classSignature, "signed by %s, but %s holds %s", signer, sig.Key, primary)
 	case !p.provenance[signer]:
 		return "", lines, failf(classSignature, "signer %s is not in PROVENANCE.md", signer)
 	}
 	return signer, lines, nil
+}
+
+// gpgClass is the class of a gpg failure: a local one says nothing about the
+// signature, so it is network (Task 15 pauses on it) and not signature (which
+// rules the entry absent).
+func gpgClass(err error) string {
+	if errors.Is(err, errGPGLocal) {
+		return classNetwork
+	}
+	return classSignature
 }
 
 // keyPath returns the path of the signer key file key, after confirming it
@@ -525,7 +542,7 @@ func (p *pinner) pinAll(ctx context.Context, run pinRun) (map[catalog.Key]catalo
 		s := &run.Specs[i]
 		k := s.Key()
 		lines = append(lines, "== "+k.Entry+"/"+k.Arch)
-		if len(run.Only) > 0 && !slices.Contains(run.Only, s.Entry) {
+		if !run.selected(s.Entry) {
 			lines = append(lines, "  "+keep(k, run, pins, absent))
 			continue
 		}

@@ -1,10 +1,11 @@
 // Command catalogpin pins the utility catalog: for every spec it downloads each
-// upstream object over TLS 1.3, checks its size and signature before parsing
-// it, extracts the files the catalog boots, and writes their sizes, hashes and
-// pin ids to internal/catalog/catalog_pins.go and a report. An entry that
-// cannot be pinned is written to the file's absent ledger with a class-prefixed
-// reason. It is the developer tool behind `task catalog:pin` and runs inside a
-// pinned container, with gpg.
+// upstream object over TLS 1.3 and checks its size. A signed entry is verified
+// before anything is parsed; a trust-on-first-use entry is pinned on first use.
+// It extracts the files the catalog boots and writes their sizes, hashes and
+// pin ids to internal/catalog/catalog_pins.go and a report. An entry that cannot
+// be pinned is written to the file's absent ledger with a class-prefixed reason.
+// It is the developer tool behind `task catalog:pin` and runs inside a pinned
+// container, with gpg.
 //
 // Exit codes: 0 once the file is written, 1 when it cannot be (or the run was
 // interrupted), 2 on a usage error.
@@ -18,6 +19,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime/debug"
@@ -28,6 +30,9 @@ import (
 	"go.jacaudi.dev/hephaestus/internal/catalog"
 	"go.jacaudi.dev/hephaestus/internal/toolcache"
 )
+
+// version is the revision `task catalog:image` stamps with -ldflags -X.
+var version = "dev"
 
 const (
 	exitOK    = 0
@@ -87,11 +92,11 @@ func parseFlags(args []string, stderr io.Writer) (config, error) {
 	return cfg, nil
 }
 
-// userAgent is "hephaestus-catalogpin/<vcs.revision>", or "dev" when the
-// binary carries no revision.
+// userAgent is "hephaestus-catalogpin/<revision>": the version the linker
+// stamped, else the build info's vcs.revision, else "dev".
 func userAgent() string {
-	rev := "dev"
-	if info, ok := debug.ReadBuildInfo(); ok {
+	rev := version
+	if info, ok := debug.ReadBuildInfo(); ok && rev == "dev" {
 		for _, s := range info.Settings {
 			if s.Key == "vcs.revision" && s.Value != "" {
 				rev = s.Value
@@ -111,6 +116,36 @@ func checkOnly(in pinRun) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// selected reports whether the run pins entry: every entry, or the ones -only names.
+func (in pinRun) selected(entry string) bool {
+	return len(in.Only) == 0 || slices.Contains(in.Only, entry)
+}
+
+// checkKept refuses a run whose kept pins no longer match their specs: a pin
+// made for other object URLs would be written back and then rejected by
+// catalog.New at startup.
+func checkKept(in pinRun) error {
+	var errs []error
+	for i := range in.Specs {
+		s := &in.Specs[i]
+		pin, ok := in.Existing[s.Key()]
+		if in.selected(s.Entry) || !ok {
+			continue
+		}
+		if !slices.EqualFunc(s.Objects, pin.Objects, func(o catalog.ObjectSpec, op catalog.ObjectPin) bool { return o.URL == op.URL }) {
+			errs = append(errs, fmt.Errorf("-only: the pin kept for %s/%s was made for other object URLs than its spec names; re-pin it with -only %s", s.Entry, s.Arch, s.Entry))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// needsGPG reports whether a selected spec has an object that is not TOFU.
+func needsGPG(in pinRun) bool {
+	return slices.ContainsFunc(in.Specs, func(s catalog.Spec) bool {
+		return in.selected(s.Entry) && slices.ContainsFunc(s.Objects, func(o catalog.ObjectSpec) bool { return !o.Signature.TOFU })
+	})
 }
 
 // readFile reads path through a root on its directory.
@@ -145,8 +180,13 @@ func writeFile(path string, data []byte) (err error) {
 // before the pinning ends: a partial result must not replace the file.
 func run(ctx context.Context, cfg config, in pinRun, client *http.Client, stdout io.Writer) (err error) {
 	in.Only = cfg.only
-	if err := checkOnly(in); err != nil {
+	if err := errors.Join(checkOnly(in), checkKept(in)); err != nil {
 		return err
+	}
+	if needsGPG(in) {
+		if _, err := exec.LookPath("gpg"); err != nil {
+			return fmt.Errorf("gpg is needed to verify the signed entries: %w", err)
+		}
 	}
 	work, err := os.OpenRoot(cfg.work)
 	if err != nil {
@@ -164,7 +204,10 @@ func run(ctx context.Context, cfg config, in pinRun, client *http.Client, stdout
 	}
 	p := &pinner{
 		client: client, work: work, keys: keys, provenance: provenanceFingerprints(md),
-		verify: gpgVerify, keyPrimary: gpgKeyPrimary, retryWait: defaultRetryWait,
+		verify: gpgVerify, retryWait: defaultRetryWait,
+		keyPrimary: func(ctx context.Context, keyFile string) (string, error) {
+			return gpgKeyPrimary(ctx, work.Name(), keyFile)
+		},
 	}
 
 	pins, absent, lines := p.pinAll(ctx, in)

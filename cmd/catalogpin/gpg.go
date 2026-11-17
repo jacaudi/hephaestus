@@ -11,6 +11,10 @@ import (
 	"strings"
 )
 
+// errGPGLocal marks a gpg failure that says nothing about the signature: no
+// gpg, no room for its home, a committed key that will not import.
+var errGPGLocal = errors.New("local gpg failure")
+
 const (
 	// statusPrefix starts every line gpg writes to --status-fd.
 	statusPrefix = "[GNUPG:] "
@@ -116,13 +120,16 @@ func runGPG(ctx context.Context, home string, args ...string) ([]byte, error) {
 func gpgVerify(ctx context.Context, keyFile, sigFile, dataFile string) (fpr string, err error) {
 	home, err := os.MkdirTemp(filepath.Dir(dataFile), "gnupg-")
 	if err != nil {
-		return "", fmt.Errorf("make a gpg home: %w", err)
+		return "", fmt.Errorf("%w: make a gpg home: %w", errGPGLocal, err)
 	}
 	defer func() { err = errors.Join(err, os.RemoveAll(home)) }()
 	if _, err := runGPG(ctx, home, "--import", keyFile); err != nil {
-		return "", fmt.Errorf("import %s: %w", filepath.Base(keyFile), err)
+		return "", fmt.Errorf("%w: import %s: %w", errGPGLocal, filepath.Base(keyFile), err)
 	}
 	status, err := runGPG(ctx, home, "--status-fd", "1", "--verify", sigFile, dataFile)
+	if _, exited := errors.AsType[*exec.ExitError](err); err != nil && !exited { //nolint:errcheck // the match target is not a dropped error; modernize requires AsType over errors.As
+		return "", fmt.Errorf("%w: verify %s: %w", errGPGLocal, filepath.Base(dataFile), err)
+	}
 	if err != nil {
 		return "", fmt.Errorf("verify %s: %w", filepath.Base(dataFile), err)
 	}
@@ -133,16 +140,23 @@ func gpgVerify(ctx context.Context, keyFile, sigFile, dataFile string) (fpr stri
 	return fpr, nil
 }
 
-// gpgKeyPrimary returns the primary fingerprint of the first key in keyFile.
-func gpgKeyPrimary(ctx context.Context, keyFile string) (fpr string, err error) {
-	home, err := os.MkdirTemp("", "gnupg-")
+// gpgKeyPrimary returns the primary fingerprint of the first key in keyFile,
+// using a fresh gpg home made in workDir. Every failure is local (errGPGLocal):
+// the key file is the repository's own, so a failure to read it is not a verdict
+// on any signature.
+func gpgKeyPrimary(ctx context.Context, workDir, keyFile string) (fpr string, err error) {
+	home, err := os.MkdirTemp(workDir, "gnupg-")
 	if err != nil {
-		return "", fmt.Errorf("make a gpg home: %w", err)
+		return "", fmt.Errorf("%w: make a gpg home: %w", errGPGLocal, err)
 	}
 	defer func() { err = errors.Join(err, os.RemoveAll(home)) }()
 	colons, err := runGPG(ctx, home, "--with-colons", "--show-keys", keyFile)
 	if err != nil {
-		return "", fmt.Errorf("list %s: %w", filepath.Base(keyFile), err)
+		return "", fmt.Errorf("%w: list %s: %w", errGPGLocal, filepath.Base(keyFile), err)
 	}
-	return keyFingerprint(colons)
+	fpr, err = keyFingerprint(colons)
+	if err != nil {
+		return "", fmt.Errorf("%w: read %s: %w", errGPGLocal, filepath.Base(keyFile), err)
+	}
+	return fpr, nil
 }

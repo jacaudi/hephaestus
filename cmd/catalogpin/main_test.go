@@ -73,6 +73,16 @@ func TestUserAgent(t *testing.T) {
 	}
 }
 
+func TestUserAgent_LinkerVersion(t *testing.T) {
+	old := version
+	t.Cleanup(func() { version = old })
+	version = "abc1234"
+
+	if got, want := userAgent(), "hephaestus-catalogpin/abc1234"; got != want {
+		t.Errorf("userAgent = %q, want %q", got, want)
+	}
+}
+
 // runConfig returns a config over fresh directories, with a PROVENANCE.md
 // that lists testFPR.
 func runConfig(t *testing.T) config {
@@ -210,5 +220,98 @@ func TestRun_UnwritableOutputFails(t *testing.T) {
 
 	if err == nil {
 		t.Fatal("run succeeded with an output directory that does not exist")
+	}
+}
+
+// signedSpec is a spec whose object needs gpg to be pinned.
+func signedSpec(entry, objURL string) catalog.Spec {
+	s := zipSpec(entry, objURL, "f.bin")
+	s.Objects[0].Signature = catalog.Signature{SigURL: objURL + ".sig", Key: "test.asc"}
+	return s
+}
+
+func TestRun_NeedsGPGOnlyForSignedSpecs(t *testing.T) {
+	t.Setenv("PATH", t.TempDir()) // no gpg anywhere
+	cfg := runConfig(t)
+
+	err := run(t.Context(), cfg, pinRun{Specs: []catalog.Spec{signedSpec("signed", "https://upstream.example.test/s.zip")}}, nil, io.Discard)
+
+	if err == nil || !strings.Contains(err.Error(), "gpg") {
+		t.Fatalf("run error = %v, want one saying gpg is not installed", err)
+	}
+	if _, statErr := os.Stat(cfg.out); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Errorf("the pins file was written without gpg (stat: %v)", statErr)
+	}
+
+	good := makeZip(t, member{"f.bin", []byte("payload")})
+	srv := startServer(t, serveBytes(good), false)
+	tofu := pinRun{Specs: []catalog.Spec{zipSpec("tofu", srv.URL+"/t.zip", "f.bin")}}
+	if err := run(t.Context(), cfg, tofu, testClient(t, srv), io.Discard); err != nil {
+		t.Errorf("run with only TOFU specs and no gpg: %v", err)
+	}
+}
+
+func TestRun_NeedsGPGIgnoresUnselectedSpecs(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	good := makeZip(t, member{"f.bin", []byte("payload")})
+	srv := startServer(t, serveBytes(good), false)
+	cfg := runConfig(t)
+	cfg.only = []string{"tofu"}
+	in := pinRun{Specs: []catalog.Spec{
+		zipSpec("tofu", srv.URL+"/t.zip", "f.bin"),
+		signedSpec("signed", srv.URL+"/s.zip"),
+	}}
+
+	if err := run(t.Context(), cfg, in, testClient(t, srv), io.Discard); err != nil {
+		t.Errorf("run: %v", err)
+	}
+}
+
+func TestRun_RefusesKeptPinWithOtherURL(t *testing.T) {
+	cfg := runConfig(t)
+	cfg.only = []string{"ok"}
+	stale := catalog.Pin{ID: "old", Objects: []catalog.ObjectPin{{URL: "https://old.example.test/held.zip"}}}
+	in := pinRun{
+		Specs: []catalog.Spec{
+			zipSpec("ok", "https://upstream.example.test/ok.zip", "f.bin"),
+			zipSpec("held", "https://upstream.example.test/held.zip", "f.bin"),
+		},
+		Existing: map[catalog.Key]catalog.Pin{{Entry: "held", Arch: "amd64"}: stale},
+	}
+
+	err := run(t.Context(), cfg, in, nil, io.Discard)
+
+	if err == nil || !strings.Contains(err.Error(), "held/amd64") || !strings.Contains(err.Error(), "re-pin") {
+		t.Fatalf("run error = %v, want one naming held/amd64 and saying to re-pin it", err)
+	}
+	if _, statErr := os.Stat(cfg.out); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Errorf("the pins file was written for a refused run (stat: %v)", statErr)
+	}
+}
+
+func TestRun_KeepsPinWithMatchingURLs(t *testing.T) {
+	good := makeZip(t, member{"f.bin", []byte("payload")})
+	srv := startServer(t, serveBytes(good), false)
+	cfg := runConfig(t)
+	cfg.only = []string{"ok"}
+	kept := catalog.Pin{ID: "keptpin", Objects: []catalog.ObjectPin{{URL: "https://upstream.example.test/held.zip"}}}
+	in := pinRun{
+		Specs: []catalog.Spec{
+			zipSpec("ok", srv.URL+"/ok.zip", "f.bin"),
+			zipSpec("held", "https://upstream.example.test/held.zip", "f.bin"),
+		},
+		Existing: map[catalog.Key]catalog.Pin{{Entry: "held", Arch: "amd64"}: kept},
+	}
+
+	if err := run(t.Context(), cfg, in, testClient(t, srv), io.Discard); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	out, err := os.ReadFile(cfg.out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), "keptpin") {
+		t.Errorf("the kept pin is not in the pins file:\n%s", out)
 	}
 }

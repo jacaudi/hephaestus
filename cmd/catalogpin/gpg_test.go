@@ -1,6 +1,8 @@
 package main
 
 import (
+	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -93,5 +95,32 @@ func TestKeyFingerprint(t *testing.T) {
 				t.Errorf("keyFingerprint = %q, %v, want %q, error %t", got, err, tt.want, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestGPG_MissingGPGIsLocal(t *testing.T) {
+	t.Setenv("PATH", t.TempDir()) // no gpg anywhere
+	dir := t.TempDir()
+
+	_, verifyErr := gpgVerify(t.Context(), "key.asc", "data.sig", filepath.Join(dir, "data"))
+	_, primaryErr := gpgKeyPrimary(t.Context(), dir, "key.asc")
+
+	for name, err := range map[string]error{"gpgVerify": verifyErr, "gpgKeyPrimary": primaryErr} {
+		if !errors.Is(err, errGPGLocal) {
+			t.Errorf("%s with no gpg = %v, want errGPGLocal", name, err)
+		}
+	}
+}
+
+func TestGPG_UnwritableHomeIsLocal(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "no-such-dir")
+
+	_, verifyErr := gpgVerify(t.Context(), "key.asc", "data.sig", filepath.Join(missing, "data"))
+	_, primaryErr := gpgKeyPrimary(t.Context(), missing, "key.asc")
+
+	for name, err := range map[string]error{"gpgVerify": verifyErr, "gpgKeyPrimary": primaryErr} {
+		if !errors.Is(err, errGPGLocal) {
+			t.Errorf("%s with no room for a home = %v, want errGPGLocal", name, err)
+		}
 	}
 }

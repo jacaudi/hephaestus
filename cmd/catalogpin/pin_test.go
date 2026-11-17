@@ -376,7 +376,9 @@ func TestClassifyFetchError(t *testing.T) {
 		{"another received alert", &net.OpError{Op: "remote error", Err: errors.New("tls: handshake failure")}, "network"},
 		{"another tls.AlertError", tls.AlertError(40), "network"},
 		{"connection refused", errors.New("dial tcp: connect: connection refused"), "network"},
-		{"redirect off https", &toolcache.IntegrityError{Err: errors.New("redirect to http")}, "integrity"},
+		{"redirect off https", &toolcache.IntegrityError{Err: errors.New("redirect to http")}, "tls13"},
+		{"the phrase only in the URL", &url.Error{Op: "Get", URL: "https://h/tls: server selected unsupported protocol version", Err: errors.New("connection refused")}, "network"},
+		{"the phrase in the cause of a url.Error", &url.Error{Op: "Get", URL: "https://h/", Err: errors.New("tls: server selected unsupported protocol version 303")}, "tls13"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -450,7 +452,7 @@ func TestPin_AbsentReasonClasses(t *testing.T) {
 		},
 		{name: "redirect off https", serve: func(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, "http://127.0.0.1:1/obj.zip", http.StatusFound)
-		}, spec: plain, want: "integrity: ", reqs: 1},
+		}, spec: plain, want: "tls13: ", reqs: 1},
 		{
 			name: "missing member", serve: serveBytes(good), want: "integrity: ", reqs: 1,
 			spec: func(base string) catalog.Spec { return zipSpec("tool", base+"/obj.zip", "missing.bin") },
@@ -468,6 +470,14 @@ func TestPin_AbsentReasonClasses(t *testing.T) {
 		{
 			name: "key file holds another primary", serve: serveObjectAndSig, spec: signed("test.asc"),
 			gpg: fakeGPG{signer: testFPR, primary: otherFPR}, prov: trusted, want: "signature: ",
+		},
+		{
+			name: "gpg fails locally while verifying", serve: serveObjectAndSig, spec: signed("test.asc"),
+			gpg: fakeGPG{verifyErr: fmt.Errorf("make a gpg home: %w", errGPGLocal)}, prov: trusted, want: "network: ",
+		},
+		{
+			name: "gpg fails locally reading the key", serve: serveObjectAndSig, spec: signed("test.asc"),
+			gpg: fakeGPG{signer: testFPR, primaryErr: fmt.Errorf("list the key: %w", errGPGLocal)}, prov: trusted, want: "network: ",
 		},
 		{
 			name: "key file missing", serve: serveObjectAndSig, spec: signed("absent.asc"),
@@ -652,7 +662,7 @@ func TestPin_RedactsQueryStrings(t *testing.T) {
 			t.Helper()
 			return startServer(t, serveBytes(good), true).URL + "/f?sig=s3cret"
 		}, "tls13: "},
-		{"target is plain http", func(*testing.T) string { return "http://127.0.0.1:1/f?sig=s3cret" }, "integrity: "},
+		{"target is plain http", func(*testing.T) string { return "http://127.0.0.1:1/f?sig=s3cret" }, "tls13: "},
 		{"target is a closed port", func(t *testing.T) string {
 			t.Helper()
 			s := startServer(t, serveBytes(good), false)
@@ -837,5 +847,19 @@ func TestPinAll_StopsOnCancelledContext(t *testing.T) {
 
 	if len(pins) != 0 || len(absent) != 0 || reqs.Load() != 0 {
 		t.Errorf("pins = %v, absent = %v, requests = %d, want nothing done", pins, absent, reqs.Load())
+	}
+}
+
+func TestPin_ReportRedactsSpecURL(t *testing.T) {
+	srv := startServer(t, serveBytes(makeZip(t, member{"f.bin", []byte("payload")})), false)
+	p := newPinner(t, testClient(t, srv), &fakeGPG{})
+
+	_, lines, err := p.pinSpec(t.Context(), zipSpec("tool", srv.URL+"/obj.zip?token=s3cret", "f.bin"))
+	if err != nil {
+		t.Fatalf("pinSpec: %v", err)
+	}
+
+	if report := strings.Join(lines, "\n"); strings.Contains(report, "s3cret") {
+		t.Errorf("the spec URL's query leaked into the report:\n%s", report)
 	}
 }

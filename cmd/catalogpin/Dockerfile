@@ -2,11 +2,12 @@
 # The catalog pin tool (task catalog:pin): the catalogpin binary with gpg, so the macOS host needs no gpg.
 # Debian packages come from the same dated snapshot as the e2e toolbox (test/e2e/qemu/Dockerfile).
 FROM golang:1.27.4-trixie@sha256:b54b2639de8c1bfe538ec5ffc45f29b1932235ac5f6d63c059853646677112d9 AS build
+ARG VERSION=dev
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -o /out/catalogpin ./cmd/catalogpin
+RUN CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=${VERSION}" -o /out/catalogpin ./cmd/catalogpin
 
 FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
 ENV DEBIAN_SNAPSHOT=20261104T212339Z
