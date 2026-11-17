@@ -1,0 +1,14 @@
+{
+  "admin": {"disabled": true},
+  "apps": {
+    "http": {"servers": {"upstream": {
+      "listen": [":443"],
+      "automatic_https": {"disable": true},
+      "tls_connection_policies": [{"protocol_min": "tls1.3"}],
+      "routes": [{"handle": [{"handler": "file_server", "root": "/srv"}]}]
+    }}},
+    "tls": {
+      "certificates": {"load_files": [{"certificate": "/certs/upstream-fullchain.pem", "key": "/certs/upstream-privkey.pem"}]}
+    }
+  }
+}

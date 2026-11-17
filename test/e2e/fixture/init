@@ -1,0 +1,71 @@
+#!/busybox sh
+# PID 1 of the e2e live initrd. It is the "second stage" a booted machine would run: bring up the network, fetch the
+# squashfs named by fetch= on the kernel command line, and report on the serial console. The serial lines are a
+# contract that the e2e harness matches byte for byte:
+#   HEPHAESTUS-E2E-SECOND-STAGE ok bootif=<BOOTIF value> sha256=<hex of the fetched file>
+#   HEPHAESTUS-E2E-SECOND-STAGE fail <no-bootif|no-interface|no-dhcp|no-fetch>
+# Then it powers off, which ends QEMU (-no-reboot).
+/busybox mount -t proc proc /proc
+/busybox --install -s /bin # needs /proc/self/exe to find itself
+export PATH=/bin
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+
+# finish <words...>: write the contract line to every serial console that exists, then power off.
+finish() {
+	for tty in /dev/ttyS0 /dev/ttyAMA0; do
+		[ -e "$tty" ] && { printf 'HEPHAESTUS-E2E-SECOND-STAGE %s\n' "$*" >"$tty"; } 2>/dev/null
+	done
+	sleep 1 # let the UART drain; a power-off right behind the write can drop the tail of the line
+	poweroff -f
+}
+fail() {
+	finish "fail $1"
+	exit 1
+}
+
+# find_iface prints the interface whose MAC is $mac, if there is one yet.
+find_iface() {
+	for dev in /sys/class/net/*; do
+		read -r addr <"$dev/address" 2>/dev/null || continue
+		if [ "$addr" = "$mac" ]; then
+			echo "${dev##*/}"
+			return
+		fi
+	done
+}
+
+# /modules.order lists the virtio_pci and virtio_net modules with their dependencies first.
+while read -r mod; do
+	insmod "$mod" || echo "init: insmod $mod failed"
+done </modules.order
+
+bootif=
+fetch=
+read -r cmdline </proc/cmdline
+set -f # the command line is split into words below and must not be globbed
+for word in $cmdline; do
+	case $word in
+	BOOTIF=*) bootif=${word#BOOTIF=} ;;
+	fetch=*) fetch=${word#fetch=} ;;
+	esac
+done
+set +f
+[ -n "$bootif" ] || fail no-bootif
+
+# BOOTIF is 01-aa-bb-cc-dd-ee-ff: the ARP type, then the MAC with hyphens.
+mac=$(echo "${bootif#01-}" | tr - :)
+n=0
+iface=$(find_iface)
+while [ -z "$iface" ] && [ "$n" -lt 30 ]; do
+	sleep 1
+	n=$((n + 1))
+	iface=$(find_iface)
+done
+[ -n "$iface" ] || fail no-interface
+
+ip link set dev "$iface" up
+udhcpc -i "$iface" -n -q -t 10 -s /udhcpc.sh || fail no-dhcp
+wget -O /sq "$fetch" || fail no-fetch
+sum=$(sha256sum /sq)
+finish "ok bootif=$bootif sha256=${sum%% *}"
