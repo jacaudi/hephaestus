@@ -13,9 +13,6 @@ const (
 	awaitingReason = "awaiting approval"
 )
 
-// decideNow is the Now of the row 3 cases.
-var decideNow = time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
-
 // readyFacts are a catalog entry that is supported, cached and intact.
 var readyFacts = UtilityFacts{InCatalog: true, Supported: true, Ready: true}
 
@@ -45,11 +42,11 @@ func withAssetsReady(in *Input) { in.AssetsReady = true }
 func withDrift(in *Input)       { in.Drift = true }
 func withHold(in *Input)        { in.UnknownAction = fleet.UnknownActionHold }
 
-// armed is known(s) with a boot-next "tshell" set an hour before decideNow, a
+// armed is known(s) with a boot-next "tshell" set an hour before testNow, a
 // recognised platform and a ready utility, which mods then change.
 func armed(s fleet.State, mods ...func(*Input)) Input {
 	base := func(in *Input) {
-		in.Now, in.BootNext, in.BootNextSetAt = decideNow, "tshell", decideNow.Add(-time.Hour)
+		in.Now, in.BootNext, in.BootNextSetAt = testNow(), "tshell", testNow().Add(-time.Hour)
 		in.PlatformKnown, in.Utility = true, readyFacts
 	}
 	return known(s, append([]func(*Input){base}, mods...)...)
@@ -57,7 +54,7 @@ func armed(s fleet.State, mods ...func(*Input)) Input {
 
 func withFacts(f UtilityFacts) func(*Input) { return func(in *Input) { in.Utility = f } }
 func withSetAgo(d time.Duration) func(*Input) {
-	return func(in *Input) { in.BootNextSetAt = decideNow.Add(-d) }
+	return func(in *Input) { in.BootNextSetAt = testNow().Add(-d) }
 }
 func withUnknownPlatform(in *Input) { in.PlatformKnown = false }
 func withUnknownMachine(in *Input)  { in.Known = false }

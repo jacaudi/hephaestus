@@ -227,10 +227,12 @@ func runServe(ctx context.Context, cfg serveConfig, logger *slog.Logger, deps se
 		return err
 	}
 
-	// ponytail: the moved-aside path is dropped here; it is logged, with its own test, by the store-open handling task.
-	content, _, err := store.Open(ctx, filepath.Join(cfg.DataDir, "store"), time.Now)
+	content, moved, err := store.Open(ctx, filepath.Join(cfg.DataDir, "store"), time.Now)
 	if err != nil {
 		return err
+	}
+	if moved != "" {
+		logger.ErrorContext(ctx, "store was unusable; moved aside", "path", moved)
 	}
 
 	repo := fleet.NewRepository(dbh)

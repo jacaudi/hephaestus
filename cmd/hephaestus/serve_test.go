@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -769,5 +770,55 @@ func TestRunServe_ComponentFailureStopsEverything(t *testing.T) {
 	err := waitDone(t, done, 10*time.Second)
 	if err == nil || !strings.Contains(err.Error(), "boot http server") {
 		t.Errorf("runServe = %v, want an error from the boot http server", err)
+	}
+}
+
+// TestRunServe_CorruptStoreIndexMovedAside pins that a store whose index.json
+// cannot be decoded does not stop serve: the layout is set aside, one Error
+// line says where, and the service starts with an empty store and drains.
+func TestRunServe_CorruptStoreIndexMovedAside(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	var logs bytes.Buffer
+	cfg, root := testServeConfig(t)
+	storeDir := filepath.Join(cfg.DataDir, "store")
+	if err := os.MkdirAll(storeDir, 0o700); err != nil {
+		t.Fatalf("create store dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(storeDir, "index.json"), []byte("{"), 0o600); err != nil {
+		t.Fatalf("write corrupt index: %v", err)
+	}
+	deps := testDeps(t, root)
+	stop, done := startServe(t, cfg, slog.New(slog.NewJSONHandler(&logs, nil)), deps)
+	waitStatus(t, deps.adminURL()+"/readyz", done)
+
+	stop()
+	if err := waitDone(t, done, 10*time.Second); err != nil {
+		t.Fatalf("runServe after cancel = %v, want nil", err)
+	}
+
+	moved, err := filepath.Glob(filepath.Join(cfg.DataDir, "store.corrupt-*"))
+	if err != nil || len(moved) != 1 {
+		t.Fatalf("set-aside directories = %v, %v; want exactly one store.corrupt-*", moved, err)
+	}
+	// runServe has returned, so nothing writes to logs any more.
+	var lines []map[string]any
+	for line := range bytes.SplitSeq(logs.Bytes(), []byte("\n")) {
+		var rec map[string]any
+		if json.Unmarshal(line, &rec) != nil {
+			continue
+		}
+		if rec["msg"] == "store was unusable; moved aside" {
+			lines = append(lines, rec)
+		}
+	}
+	if len(lines) != 1 {
+		t.Fatalf("%d \"store was unusable; moved aside\" lines, want 1\n%s", len(lines), logs.String())
+	}
+	if got := lines[0]["level"]; got != "ERROR" {
+		t.Errorf("level = %v, want ERROR", got)
+	}
+	if got := lines[0]["path"]; got != moved[0] {
+		t.Errorf("path = %v, want %v", got, moved[0])
 	}
 }

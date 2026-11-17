@@ -909,3 +909,30 @@ func TestStart_WriteDeadline(t *testing.T) {
 		t.Errorf("deadline %v is not 10s from now (between %v and %v)", d, before, after)
 	}
 }
+
+func TestNewHandlers_RejectsMissingDependencies(t *testing.T) {
+	cases := []struct {
+		name string
+		mod  func(*Config)
+		opts []Option
+		want string
+	}{
+		{"nil Repo", func(c *Config) { c.Repo = nil }, nil, "Repo"},
+		{"nil Store", func(c *Config) { c.Store = nil }, nil, "Store"},
+		{"nil Catalog", func(c *Config) { c.Catalog = nil }, nil, "Catalog"},
+		{"nil error handler", func(*Config) {}, []Option{WithErrorHandler(nil)}, "error handler"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := newRig(t)
+			cfg, _ := testConfig(t, g.repo, t.TempDir())
+			tc.mod(&cfg)
+
+			h, err := NewHandlers(cfg, tc.opts...)
+
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("NewHandlers = %v, %v; want an error naming %q", h, err, tc.want)
+			}
+		})
+	}
+}

@@ -347,3 +347,27 @@ func TestBoot_Row3CLIChangeTwiceFallsThrough(t *testing.T) {
 		t.Errorf("reported errors = %v, want one ErrBootNextRace", g.errs)
 	}
 }
+
+// TestBoot_Row3UnreadableLayerIsReportedNotRequeued pins that a layer the store
+// cannot read, as opposed to one it lacks, leaves the ready row alone: the
+// utility is not served this time, and the failure is reported as it is.
+func TestBoot_Row3UnreadableLayerIsReportedNotRequeued(t *testing.T) {
+	g := newRig(t)
+	g.armed()
+	g.stock()
+	file := g.shell().Pin.Objects[0].Files[0]
+	g.makeUnreadable(filepath.Join(g.storeRoot, "blobs", "sha256", file.SHA256))
+
+	body := g.boot(efiQ)
+
+	wantReportExit(t, body)
+	if got := g.machine().BootNext; got != entryName {
+		t.Errorf("boot-next = %q, want the flag kept", got)
+	}
+	if row := g.cacheRow(); row.State != fleet.CacheReady {
+		t.Errorf("cache row = %q, want it left ready", row.State)
+	}
+	if len(g.errs) != 1 || errors.Is(g.errs[0], ErrUtilityMissing) {
+		t.Errorf("reported errors = %v, want one that is not ErrUtilityMissing", g.errs)
+	}
+}

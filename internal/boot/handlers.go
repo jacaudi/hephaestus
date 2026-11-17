@@ -133,7 +133,10 @@ func WithErrorHandler(fn func(context.Context, error)) Option {
 	return func(h *Handlers) { h.onError = fn }
 }
 
-// NewHandlers returns the boot routes for the service described by cfg.
+// NewHandlers returns the boot routes for the service described by cfg. It
+// returns an error for a nil Repo, Store or Catalog and for a nil error
+// handler, so that a misconfiguration stops startup instead of panicking on the
+// first boot that needs one.
 func NewHandlers(cfg Config, opts ...Option) (*Handlers, error) {
 	h := &Handlers{
 		repo: cfg.Repo, content: cfg.Store, catalog: cfg.Catalog,
@@ -144,6 +147,9 @@ func NewHandlers(cfg Config, opts ...Option) (*Handlers, error) {
 	}
 	for _, opt := range opts {
 		opt(h)
+	}
+	if err := h.validate(); err != nil {
+		return nil, err
 	}
 	h.limiter = newWindowLimiter(h.limit.limit, h.limit.window, h.limit.capacity, h.now)
 	var err error
@@ -170,13 +176,34 @@ func NewHandlers(cfg Config, opts ...Option) (*Handlers, error) {
 	return h, nil
 }
 
+// validate reports every dependency h lacks.
+func (h *Handlers) validate() error {
+	var errs []error
+	for _, d := range []struct {
+		name    string
+		missing bool
+	}{
+		{"Config.Repo", h.repo == nil},
+		{"Config.Store", h.content == nil},
+		{"Config.Catalog", h.catalog == nil},
+		{"the error handler (WithErrorHandler)", h.onError == nil},
+	} {
+		if d.missing {
+			errs = append(errs, fmt.Errorf("boot: %s is nil", d.name))
+		}
+	}
+	return errors.Join(errs...)
+}
+
 // PlainHTTP returns the handler for the plain-HTTP listener: /start, /boot
-// (which only chains to TLS) and /tftp, behind the subnet guard.
+// (which only chains to TLS), /tftp and the utility artifacts under /u/,
+// behind the subnet guard.
 func (h *Handlers) PlainHTTP() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /start", h.start)
 	mux.HandleFunc("GET /boot", h.chain)
 	mux.HandleFunc("GET /tftp/{arch}/snp.efi", h.tftp)
+	mux.HandleFunc("GET /u/{entry}/{arch}/{version}/{path...}", h.artifact)
 	return RequireSubnet(h.subnet, mux)
 }
 
