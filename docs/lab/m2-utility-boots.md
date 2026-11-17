@@ -20,7 +20,7 @@ Time: about 3 hours once hephaestus runs and the machines are discovered. The fi
 | 0.3 | An arm64 UEFI machine, discovered (the MS-R1) | M1 step 8 | `arch` `arm64`, MAC `<arm-mac>` |
 | 0.4 | A machine with two NICs on the provisioning VLAN, discovered from its second NIC | M1 step 7 | two rows in `machine_macs` for one machine; `<nic2-mac>` is the second NIC's MAC. It may be the amd64 UEFI machine in 0.1 |
 | 0.5 | Enough RAM for the live images | `utility list` (step 1), minimum RAM column | each machine has at least the minimum RAM of every entry you boot on it: live-boot copies the whole squashfs into RAM |
-| 0.6 | Free space on the data volume | `df -h <data-dir>` | at least 4 GB: a fetch needs twice the object plus 1 GiB, and the largest object (SystemRescue's ISO) is 1.4 GB |
+| 0.6 | Free space on the data volume | `df -h <data-dir>` | at least 8 GB: the extracted files of all ten pins stay in the store (about 5.2 GB), and each fetch also needs twice its object plus 1 GiB free at that moment (SystemRescue's 1.4 GB ISO needs about 3.9 GB) |
 | 0.7 | Internet egress for hephaestus | the VLAN gateway | open for the fetches in step 1. After step 1 you may block it again: a `ready` entry boots with no upstream |
 | 0.8 | An amd64 UEFI machine with no disk you care about, for ShredOS | the machine | ShredOS erases disks. Disconnect every disk you want to keep, or use a machine with none |
 | 0.9 | A local checkout of this repository on the Mac | `git status --short` | clean; step 8 edits `catalog.go` temporarily |
@@ -32,7 +32,7 @@ Boot order on each machine: network first, for the length of the test. Console: 
 `boot-next set` fetches its own entry, but a first fetch takes minutes. Fetch all of them first, from the container:
 
 ```sh
-docker exec <container> /hephaestus utility fetch
+for e in memtest86plus systemrescue clonezilla gparted shredos grml uefishell; do docker exec <container> /hephaestus utility fetch "$e"; done
 docker exec <container> /hephaestus utility list
 ```
 
@@ -42,21 +42,21 @@ Repeat `utility list` until every row's state is `ready`. Expected: ten rows (me
 docker logs -f <container> 2>&1 | jq -c 'select(.msg=="utility fetch") | {time,entry,arch,from,to,attempts,class,error,bytes,duration_ms}'
 ```
 
-Expected: a `wanted` → `fetching` → `ready` line for each row. A `failed` or `broken` row names its error: record it, then `utility fetch <entry>` re-arms it. Then record the free space again (`df -h <data-dir>`), and the store size: `curl -s http://127.0.0.1:9090/health | jq '.checks'` shows `store:readable` pass and `store:bytes`.
+Expected: two lines for each row: `wanted` → `fetching`, then `fetching` → `ready`. A `failed` or `broken` row names its error: record it, then `utility fetch <entry>` re-arms it. Then record the free space again (`df -h <data-dir>`), and the store size: `curl -s http://127.0.0.1:9090/health | jq '.checks'` shows `store:readable` pass and `store:bytes`.
 
 ## 2. How to read one utility boot
 
 For each boot below, in one terminal keep this running:
 
 ```sh
-docker logs -f <container> 2>&1 | jq -c 'select(.msg=="request") | {time,path,status,remote_ip,tls,decision_row,action,utility,boot_next_clear,error}'
+docker logs -f <container> 2>&1 | jq -c 'select(.msg=="request") | {time,path,status,remote_ip,tls,platform,decision_row,action,utility,boot_next,boot_next_clear,error}'
 ```
 
 The steps for one boot:
 
 1. Arm it: `docker exec <container> /hephaestus boot-next set <mac> <entry>`. Expected output: the machine, `entry`, `arch`, `expires` (24 hours ahead) and `utility: ready`. For `shredos` it first prints a `WARNING:` naming the machine.
 2. Network-boot the machine (UEFI: its network boot entry; BIOS: PXE).
-3. The log shows, in order: `/start` (200, `tls:false`), then `/boot` (200, `tls:true`) with `decision_row:3`, `action:utility`, `utility:<entry>` and `boot_next_clear:served`, then one `/u/<entry>/<arch>/<version>/<path>` request (plain HTTP, `tls:false`, status 200 or 206) for each file listed in step 3 for that entry. No `/u/` request returns 404.
+3. The log shows, in order: `/start` (200, `tls:false`), then `/boot` (200, `tls:true`) with `decision_row:3`, `action:utility`, `utility:<entry>` and `boot_next_clear:served`, then one `/u/<entry>/<arch>/<version>/<path>` request (plain HTTP, `tls:false`, status 200 or 206) for each file listed in step 3 for that entry. No `/u/` request returns 404. For `systemrescue`, record any 404 instead of failing on it: archiso may probe files this checklist does not list.
 4. The console shows what step 3 lists for the entry.
 5. Reset or power off the machine. `docker exec <container> /hephaestus boot-next list` shows no flag for it: the flag was cleared as `served` when the script went out. The next boot is an ordinary one.
 
@@ -66,10 +66,11 @@ If the boot did not happen, the `/boot` line says why:
 
 | `/boot` line | Meaning |
 |---|---|
-| `decision_row:3`, `action:utility` missing, `boot_next_clear` empty | the utility was not ready: row 3 kept the flag and the machine went on to the later rows. Check `utility list` |
+| `decision_row` 4 to 10 (not 3), `boot_next:<entry>` present, no `utility` and no `boot_next_clear` | the utility was not ready: row 3 kept the flag and the later rows decided the boot. Check `utility list` |
 | `boot_next_clear:unsupported` | the machine's firmware platform (`efi` or `pcbios`) is not in the entry's platform list |
 | `boot_next_clear:expired` | the flag was more than 24 hours old; arm it again |
-| `boot_next_clear:broken` | the fetch hit an integrity failure; `utility list` shows the error |
+| `boot_next_clear:unknown_entry` | the entry is not in this build's catalog (for example after a binary upgrade) |
+| no `boot_next` on the `/boot` line, and `boot-next list` no longer shows the flag | the fetch went broken and cleared the flag; `utility list` shows the error |
 | no `/boot` request at all | the machine did not network-boot: a firmware setting, not hephaestus |
 
 ## 3. The entries: command, requests, console
@@ -157,7 +158,7 @@ Use the machine from 0.8. The catalog lists ShredOS on UEFI because the pin step
 The catalog lists memtest86+ for amd64 on `efi` only. Per M2 design §5.2, its BIOS recipe (`kernel` then `boot` on the unified binary) is added only after a real BIOS boot proves it.
 
 1. Check the guard first. On the BIOS machine: `boot-next set <bios-mac> memtest86plus`, then network-boot it. Expected: `/boot` shows `boot_next_clear:unsupported`, no `/u/` request, and the machine goes on to its ordinary row (hold or local disk). `boot-next set` accepts it, because it judges architecture only.
-2. Try the BIOS boot with a temporary local image. In `internal/catalog/catalog.go`, in the `memtest86plus` `amd64` spec, change `Recipe: RecipeChain` to `Recipe: RecipeKernel` and `Platforms: []Platform{PlatformEFI}` to `Platforms: []Platform{PlatformEFI, PlatformPCBIOS}`. The pin id covers URLs, sizes, hashes and files, not the recipe, so no re-pin is needed. This makes the EFI boot use `kernel` too: an EFI machine is not part of this test. Build and run that image in place of the real one:
+2. Try the BIOS boot with a temporary local image. In `internal/catalog/catalog.go`, in the `memtest86plus` `amd64` spec, change the `Recipe:` line to `Recipe: RecipeKernel` and `Platforms: []Platform{PlatformEFI}` to `Platforms: []Platform{PlatformEFI, PlatformPCBIOS}`. The pin id covers URLs, sizes, hashes and files, not the recipe, so no re-pin is needed. This makes the EFI boot use `kernel` too: an EFI machine is not part of this test. Build and run that image in place of the real one:
 
    ```sh
    export DOCKER_HOST=unix://$HOME/.colima/default/docker.sock
@@ -167,7 +168,7 @@ The catalog lists memtest86+ for amd64 on `efi` only. Per M2 design §5.2, its B
 
 3. Arm and boot: `boot-next set <bios-mac> memtest86plus`. Expected: `/u/memtest86plus/amd64/9.00/mt86p_900_x86_64` returns 200, and the Memtest86+ screen starts testing on the display. Let one full pass finish if you can.
 4. Revert the edit (`git checkout -- internal/catalog/catalog.go`), rebuild, and reload the real image.
-5. Outcome. **Pass:** a later change adds `pcbios` to the amd64 spec with a `kernel` recipe for it (the EFI boot stays `chain`); this checklist's result row records the pass. **Fail:** record the last console lines and leave it unsupported.
+5. Outcome. **Pass:** a later change adds `pcbios` to the amd64 spec with a `kernel` recipe for it (the EFI boot stays `chain`; a `Spec` has a single `Recipe` today, so that change also needs per-platform recipes); this checklist's result row records the pass. **Fail:** record the last console lines and leave it unsupported.
 
 ## 9. grml signer key: expires 2028-04-21
 
@@ -219,4 +220,4 @@ Expected: `var absent = map[Key]string{}`. If an entry is listed after a later r
 | 8 memtest86+ BIOS: boots with the `kernel` recipe | | |
 | 9 grml key expiry read from `grml.asc` | | |
 | 10 `absent` ledger empty (else entry and class) | | |
-| Every `/u/` request 200 or 206, none 404 | | |
+| Every `/u/` request 200 or 206, none 404 (systemrescue: list any 404) | | |

@@ -168,7 +168,7 @@ They are written on state changes only. The CLI's actor is `cli`. `served` means
 
 **Fetching.**
 - **Polling.** The fetcher polls every 10 s. One fetch runs at a time, and armed boot-nexts go first.
-- **Free space.** Before a fetch: free space on the spool volume must be at least twice the object size plus a fixed 1 GiB reserve. A 10%-of-the-filesystem reserve blocked every fetch on a nearly full volume (ruled during Task 7); the fixed reserve still leaves the SQLite database room for its journal and growth.
+- **Free space.** Before a fetch: free space on the spool volume must be at least twice the object size plus a fixed 1 GiB reserve. A 10%-of-the-filesystem reserve blocked every fetch on a large volume (99 GB on a 994 GB disk; terabytes on TrueNAS); ruled during Task 7. The fixed reserve still leaves the SQLite database room for its journal and growth.
 - **Spool.** Each object downloads to `<data>/spool/<pin>-<n>`, a name parsed back by an expected-name set.
 - **Size cap.** Bytes beyond the pinned size are refused.
 - **Already complete.** A spool already at the pinned size goes straight to verification, with no request.
@@ -223,7 +223,7 @@ The CLI loads the same bootstrap config as `serve` and opens the same database. 
 The listeners are bound first. That is M1's order, and a second `serve` therefore fails to bind before it can touch the database or the store.
 
 1. **Open the store.**
-   - A corruption on the store's allow-list: an undecodable or mistyped `index.json`, an unsupported `oci-layout` version, a malformed digest, a manifest whose bytes do not match its digest, or a truncated read. Move `<data>/store` aside to `store.corrupt-<UTC>`, log an Error, start an empty store, and continue. Only the newest `store.corrupt-*` is kept; older ones are deleted.
+   - A corruption on the store's allow-list: an undecodable or mistyped `index.json`, an unsupported `oci-layout` version, a malformed digest, a manifest whose bytes do not match its digest, trailing data after a manifest, or a truncated read. Move `<data>/store` aside to `store.corrupt-<UTC>`, log an Error, start an empty store, and continue. Only the newest `store.corrupt-*` is kept; older ones are deleted.
    - Every other open error, a permission or I/O failure included, stops `serve` with that error and moves nothing, so a store that is merely unreadable is never discarded.
    - An empty `index.json`, which oras-go silently resets, needs no special case: step 3 handles the missing tags.
 2. **Interrupted fetches.** Rows in `fetching` become `wanted`.
