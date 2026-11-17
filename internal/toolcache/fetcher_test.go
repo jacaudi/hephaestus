@@ -1269,6 +1269,26 @@ func TestFetcher_RunStops(t *testing.T) {
 	}
 }
 
+func TestRedactURL(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"userinfo, query and fragment", "https://u:p@h/x?" + secretQuery + "#frag", "https://h/x"},
+		{"a bare question mark", "https://h/x?", "https://h/x"},
+		{"nothing to strip", "https://h/x", "https://h/x"},
+		{"unparsable", "https://h/%zz?" + secretQuery, "<unparsable>"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := RedactURL(tt.in); got != tt.want {
+				t.Errorf("RedactURL(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestRedactURLError(t *testing.T) {
 	tests := []struct {
 		name string
@@ -1283,20 +1303,20 @@ func TestRedactURLError(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := redactURLError(tt.in).Error(); got != tt.want {
-				t.Errorf("redactURLError = %q, want %q", got, tt.want)
+			if got := RedactURLError(tt.in).Error(); got != tt.want {
+				t.Errorf("RedactURLError = %q, want %q", got, tt.want)
 			}
 		})
 	}
 
 	t.Run("keeps the cause", func(t *testing.T) {
 		in := &url.Error{Op: "Get", URL: "https://h/?" + secretQuery, Err: &IntegrityError{Err: io.EOF}}
-		got := redactURLError(in)
+		got := RedactURLError(in)
 		if _, ok := errors.AsType[*IntegrityError](got); !ok {
-			t.Errorf("redactURLError(%v) lost the *IntegrityError", in)
+			t.Errorf("RedactURLError(%v) lost the *IntegrityError", in)
 		}
 		if !errors.Is(got, io.EOF) {
-			t.Errorf("redactURLError(%v) lost io.EOF", in)
+			t.Errorf("RedactURLError(%v) lost io.EOF", in)
 		}
 	})
 }

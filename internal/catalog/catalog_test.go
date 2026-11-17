@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"go/format"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -524,6 +525,63 @@ func TestSpec_Supports(t *testing.T) {
 		}
 		if got := e.Supports(tt.platform); got != tt.want {
 			t.Errorf("tlive %s Supports(%q) = %t, want %t", tt.arch, tt.platform, got, tt.want)
+		}
+	}
+}
+
+func TestKeys_Present(t *testing.T) {
+	for _, s := range catalog.Specs() {
+		for _, o := range s.Objects {
+			key := o.Signature.Key
+			if key == "" {
+				continue
+			}
+			if _, err := os.Stat(filepath.Join("keys", key)); err != nil {
+				t.Errorf("%v: signer key %q: %v", s.Key(), key, err)
+			}
+		}
+	}
+}
+
+func TestPins_SignersInProvenance(t *testing.T) {
+	provenance, err := os.ReadFile(filepath.Join("keys", "PROVENANCE.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pins := catalog.Pins()
+	if len(pins) == 0 {
+		t.Skip("no pins yet: run task catalog:pin")
+	}
+	for k, p := range pins {
+		for _, o := range p.Objects {
+			if o.Signer != "" && !bytes.Contains(provenance, []byte(o.Signer)) {
+				t.Errorf("%v: signer %s is not in keys/PROVENANCE.md", k, o.Signer)
+			}
+		}
+	}
+}
+
+func TestPins_AMD64EFIKernelsHaveStub(t *testing.T) {
+	if _, err := os.Stat("catalog_pins.go"); err != nil {
+		t.Fatal(err)
+	}
+	if len(catalog.Pins()) == 0 {
+		t.Skip("no pins yet: run task catalog:pin")
+	}
+	c, err := catalog.Default()
+	if err != nil {
+		t.Fatalf("Default: %v", err)
+	}
+	for _, e := range c.Entries() {
+		if e.Arch != "amd64" || !e.Supports(catalog.PlatformEFI) {
+			continue
+		}
+		f, ok := e.File(e.Boot.Kernel)
+		switch {
+		case !ok:
+			t.Errorf("%s/%s: kernel %q is not among the pinned files", e.Entry, e.Arch, e.Boot.Kernel)
+		case !f.EFIStub:
+			t.Errorf("%s/%s: kernel %q has no EFI stub, but the entry lists efi", e.Entry, e.Arch, e.Boot.Kernel)
 		}
 	}
 }

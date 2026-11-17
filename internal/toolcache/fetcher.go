@@ -564,7 +564,7 @@ func (j *fetchJob) transfer(ctx context.Context, n int, have int64, etag string)
 	defer cancel(nil)
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, obj.URL, http.NoBody)
 	if err != nil {
-		return fmt.Errorf("build the request for object %d: %w", n, redactURLError(err))
+		return fmt.Errorf("build the request for object %d: %w", n, RedactURLError(err))
 	}
 	if etag != "" {
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", have))
@@ -572,7 +572,7 @@ func (j *fetchJob) transfer(ctx context.Context, n int, have int64, etag string)
 	}
 	resp, err := j.f.cfg.Client.Do(req)
 	if err != nil {
-		return fmt.Errorf("get object %d: %w", n, redactURLError(err))
+		return fmt.Errorf("get object %d: %w", n, RedactURLError(err))
 	}
 	defer func() { err = errors.Join(err, resp.Body.Close()) }()
 
@@ -809,26 +809,33 @@ func classOf(err error) string {
 	return classOther
 }
 
-// redactURLError returns err with the URL of any *url.Error in its chain
-// stripped of userinfo, query and fragment, since a mirror's redirect target
-// often carries a signed token. An unparsable URL becomes "<unparsable>". The
-// cause is kept, so errors.AsType[*IntegrityError] still finds it. err is
-// returned as it is when no *url.Error is in its chain. net/http also builds
-// "failed to parse Location header %q" around the raw Location, which is a
-// redirect target too, so that cause is replaced by a fixed message.
-func redactURLError(err error) error {
+// RedactURL returns raw without its userinfo, query and fragment, since a
+// mirror's redirect target often carries a signed token. An unparsable URL
+// becomes "<unparsable>". It is for any text that reaches a log, a report or a
+// stored error.
+func RedactURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "<unparsable>"
+	}
+	u.User, u.RawQuery, u.ForceQuery, u.Fragment, u.RawFragment = nil, "", false, "", ""
+	return u.String()
+}
+
+// RedactURLError returns err with the URL of any *url.Error in its chain
+// redacted as RedactURL does. The cause is kept, so
+// errors.AsType[*IntegrityError] still finds it. err is returned as it is
+// when no *url.Error is in its chain. net/http also builds "failed to parse
+// Location header %q" around the raw Location, which is a redirect target
+// too, so that cause is replaced by a fixed message.
+func RedactURLError(err error) error {
 	ue, ok := errors.AsType[*url.Error](err)
 	if !ok {
 		return err
-	}
-	redacted := "<unparsable>"
-	if u, perr := url.Parse(ue.URL); perr == nil {
-		u.User, u.RawQuery, u.ForceQuery, u.Fragment, u.RawFragment = nil, "", false, "", ""
-		redacted = u.String()
 	}
 	cause := ue.Err
 	if cause != nil && strings.HasPrefix(cause.Error(), locationParseFailure) {
 		cause = errUnparsableLocation
 	}
-	return &url.Error{Op: ue.Op, URL: redacted, Err: cause}
+	return &url.Error{Op: ue.Op, URL: RedactURL(ue.URL), Err: cause}
 }
