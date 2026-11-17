@@ -31,6 +31,11 @@ const (
 	settingUnknownKey = "unknown_action"
 )
 
+// ErrBootNextChanged is returned by RecordBoot when its ClearBootNext no longer
+// names the stored flag: another process set it again or cleared it since the
+// caller read it. Nothing was stored; the caller reads the machine again.
+var ErrBootNextChanged = errors.New("boot-next changed since it was read")
+
 // ErrIdentityConflict is returned by Observe when the stored serial or product
 // of the machine holding the reported UUID differs from the report's.
 var ErrIdentityConflict = errors.New("identity conflict: stored serial/product differ from the report")
@@ -143,7 +148,10 @@ func (r *Repository) Get(ctx context.Context, id string) (Machine, error) {
 // TriggerFirstContact); otherwise it records the boot against that machine. A
 // Conflict boot touches nothing but the machine's junk flag and the audit log.
 // The boot event is stored too, except a hold identical to the machine's last
-// one within the hour, and the machine's boot events and MACs stay bounded.
+// one within the hour, and the machine's boot events and MACs stay bounded. On
+// a known boot that is not a Conflict, ClearBootNext and then WantFetch run
+// before the boot event is stored; either one on any other boot is
+// ErrInvalidTransition.
 func (r *Repository) RecordBoot(ctx context.Context, rec BootRecord) (Machine, error) {
 	var out Machine
 	err := r.bdb.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
@@ -481,7 +489,7 @@ func loadMachine(ctx context.Context, q bun.IDB, id string) (Machine, error) {
 
 // hydrate fills the MACs a machine row does not carry and puts its times in UTC.
 func hydrate(ctx context.Context, q bun.IDB, m *Machine) error {
-	m.CreatedAt, m.LastSeenAt = m.CreatedAt.UTC(), m.LastSeenAt.UTC()
+	m.CreatedAt, m.LastSeenAt, m.BootNextSetAt = m.CreatedAt.UTC(), m.LastSeenAt.UTC(), m.BootNextSetAt.UTC()
 	err := q.NewSelect().Model((*machineMAC)(nil)).Column("mac").Where("machine_id = ?", m.ID).Order("mac").Scan(ctx, &m.MACs)
 	if err != nil {
 		return fmt.Errorf("load MACs of %s: %w", m.ID, err)
@@ -490,6 +498,9 @@ func hydrate(ctx context.Context, q bun.IDB, m *Machine) error {
 }
 
 func recordBoot(ctx context.Context, tx bun.IDB, rec BootRecord) (Machine, error) {
+	if (rec.ClearBootNext != nil || rec.WantFetch != nil) && (rec.MachineID == "" || rec.Conflict) {
+		return Machine{}, fmt.Errorf("%w: clearing boot-next or wanting a fetch needs a known boot that is not a conflict", ErrInvalidTransition)
+	}
 	var (
 		from State
 		m    Machine
@@ -503,6 +514,9 @@ func recordBoot(ctx context.Context, tx bun.IDB, rec BootRecord) (Machine, error
 	if err != nil {
 		return Machine{}, err
 	}
+	if err := applyBootNext(ctx, tx, m.ID, rec); err != nil {
+		return Machine{}, err
+	}
 	row := bootEventRow{
 		MachineID: m.ID, At: rec.At.UTC(), DecisionRow: rec.Event.Row, Action: rec.Event.Action, Reason: rec.Event.Reason,
 	}
@@ -513,6 +527,25 @@ func recordBoot(ctx context.Context, tx bun.IDB, rec BootRecord) (Machine, error
 		return Machine{}, err
 	}
 	return loadMachine(ctx, tx, m.ID)
+}
+
+// applyBootNext runs the boot-next fields of rec against the machine, which
+// recordKnownBoot has already written: machines are locked before utility_cache.
+func applyBootNext(ctx context.Context, tx bun.IDB, machineID string, rec BootRecord) error {
+	if c := rec.ClearBootNext; c != nil {
+		req := ClearBootNextRequest{MachineID: machineID, Entry: c.Entry, SetAt: c.SetAt, Reason: c.Reason, Actor: actorSystem, At: rec.At}
+		cleared, err := clearBootNext(ctx, tx, req)
+		if err != nil {
+			return err
+		}
+		if !cleared {
+			return ErrBootNextChanged
+		}
+	}
+	if rec.WantFetch != nil {
+		return wantFetch(ctx, tx, *rec.WantFetch, rec.At)
+	}
+	return nil
 }
 
 // createMachine inserts the machine and its MAC and returns the machine.

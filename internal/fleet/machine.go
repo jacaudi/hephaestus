@@ -74,6 +74,14 @@ type BootEvent struct {
 	Action, Reason string
 }
 
+// BootNextClear is the boot-next flag a boot found unusable or served: the
+// entry and the time it was set at, so only that flag is cleared, and why.
+type BootNextClear struct {
+	Entry  string
+	SetAt  time.Time
+	Reason ClearReason
+}
+
 // BootRecord is one observed boot for RecordBoot.
 type BootRecord struct {
 	Identity Identity
@@ -91,5 +99,13 @@ type BootRecord struct {
 	// only the first conflict does.
 	MarkJunk bool
 	Event    BootEvent
-	At       time.Time
+	// ClearBootNext compare-and-clears the machine's boot-next, as actor
+	// "system" at At, before the boot event is stored; RecordBoot returns
+	// ErrBootNextChanged, storing nothing, when the flag is no longer that one.
+	// Only a known, non-conflict boot may carry it.
+	ClearBootNext *BootNextClear
+	// WantFetch asks for the row it names to be wanted, as wantFetch does. Only
+	// a known, non-conflict boot may carry it.
+	WantFetch *FetchWant
+	At        time.Time
 }
