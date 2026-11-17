@@ -72,7 +72,7 @@ The goals above are built in four milestones. This section says what each contai
   tool renews, or from a TLS-terminating reverse proxy (§5.10), and no data key yet; the container image. Known limitations: EFI iPXE reports `${memsize}` as 0 (stored and shown as unknown), and CPUID facts
   may be absent on BIOS builds.
 - **M2: utility boots.** The content store, the pinned utility catalog (D7's verifiable 7) and utility-OS boots, driven
-  by an admin CLI (§5.6), with the `store`, `catalog` and `utility` packages. Design:
+  by an admin CLI (§5.6), with the `store`, `catalog` and `toolcache` packages. Design:
   `docs/designs/2026-11-16-hephaestus-m2-utility-boot-design.md`.
 - **M3: clusters.** Clusters, render, secrets, `/config` and tickets (§5.4–5.6, §6); Talos prefetch, `assets_ready` and
   Talos reconciliation, the `/v2/` mirror and the runtime GC quiet window (§5.6); the Talos install script; the data
@@ -181,7 +181,7 @@ image (§3).
 | `boot` | proxyDHCP and TFTP (vendored), embedded iPXE binaries (§5.10), the `/start` and `/boot` scripts, the decision (§5.2) including row 3 for utility boots, the `/u/` artifact route, source-subnet guard (§6) |
 | `store` | The oras-go OCI-layout store (M2): push, tag, untag, resolve, blob reads with a layer size check, and GC. Only `serve` uses it. Pins, the GC coordinator, Talos prefetch jobs and the `/v2/` mirror arrive in M3 (§5.6) |
 | `catalog` | Compiled-in utility entries (M2): hand-written URLs, recipes and support, plus generated sizes, hashes, paths and pin ids written by `task catalog:pin`. It renders recipe scripts and does no I/O. Talos version discovery and schematic registration arrive in M3 |
-| `utility` | The utility fetcher and its state machine, the pure-Go extractors (zip, tar+gzip, ISO9660), startup reconciliation and GC (M2, §5.6). Runs in `serve` only |
+| `toolcache` | The utility fetcher and its state machine, the pure-Go extractors (zip, ISO9660), startup reconciliation and GC (M2, §5.6). Runs in `serve` only. Named `toolcache` because revive bans `utility`; tar+gzip was dropped because no entry uses it |
 | `fleet` | Machines, identity, lifecycle, approvals, boot events, timeline, audit; boot-next (set, clear, list) and the `utility_cache` repository (M2) |
 | `clusters` | Topf definitions from git (go-git) or native (DB); tree-hash revisions; export (§5.4) |
 | `render` | Vendored Topf renderer with guardrails |
@@ -542,14 +542,16 @@ Shell). An entry is keyed by `(entry, arch)` and carries:
 the fingerprint committed in the repo, which must come from a source separate from the download host) before parsing
 it, and refuses an object whose URL, or any redirect target, cannot negotiate TLS 1.3. A key that cannot be
 authenticated stops that entry; it never falls back to TOFU. ShredOS boots interactive and no recipe contains
-`autonuke` (CI checks), so no utility boot wipes a disk without someone at the console.
+`autonuke` (CI checks), so no utility boot wipes a disk without someone at the console. grml is fetched from
+`ftp-master.grml.org`, which serves its ISOs, `SHA256SUMS-<version>` and the signature; the signer key comes from other
+hosts (`internal/catalog/keys/PROVENANCE.md`).
 
 **Fetching (M2).** The fetcher runs in `serve` only, polls every 10 s, and runs one fetch at a time, armed boot-nexts
 first. Each `utility_cache` transition is a conditional update, and every (state, event) pair not listed is a no-op:
 - `wanted` → `fetching` when the fetcher claims it → `ready` once the push and tag are done and every layer's size is
   checked.
-- An **integrity error** (wrong size or hash, a GPG or path violation, a redirect to a non-`https` URL) moves the row to
-  `broken`, deletes the spool, and compare-and-clears every `boot_next` naming the entry (`broken`).
+- An **integrity error** (wrong size or hash, a path violation, a redirect to a non-`https` URL; GPG is checked at pin
+  time only) moves the row to `broken`, deletes the spool, and compare-and-clears every `boot_next` naming the entry (`broken`).
 - Any other error (network, any unexpected HTTP status, local I/O, disk full) moves the row to `failed`, with backoff from
   1 min doubling to 1 h. The 10th failure moves it to `broken`.
 - An admin action (`boot-next set` or `utility fetch`) moves `failed` or `broken` back to `wanted` and resets the
@@ -560,11 +562,12 @@ first. Each `utility_cache` transition is a conditional update, and every (state
 Downloads go to `<data>/spool/<pin>-<n>`. They resume with `Range` plus `If-Range` and only a strong ETag kept in a
 sidecar file; a weak or absent ETag, or a `200` in reply to a range request, restarts from zero. Bytes beyond the pinned
 size are refused, and the pinned hash is the authority whichever mirror answers. The HTTP client has no total timeout, a
-60 s idle deadline, a **TLS 1.3 minimum** (go-standards §15.1; no deviation), at most 5 `https`-only redirects, and user
+60 s idle deadline, a **TLS 1.3 minimum** (go-standards §15.1; no deviation), at most 5 `https`-only redirects (each with the `Referer` header
+removed, because SourceForge answers a request carrying one with an HTML interstitial and status 200), and user
 agent `hephaestus/<version>`. A redirect to a mirror that offers only TLS 1.2 fails that attempt as an ordinary
 retryable error. Before extraction the object's size and sha256 must match; extraction then takes only the named files
 (no absolute paths, no `..`, no links followed), each capped at its pinned size and checked against its sha256, in pure
-Go: `archive/zip`, tar+gzip, and a pinned, cgo-free ISO9660 reader (the plan names it). Each file is pushed as a blob,
+Go: `archive/zip` and `github.com/diskfs/go-diskfs` v1.9.4 (iso9660 only, cgo-free); tar+gzip was dropped because no entry uses it. Each file is pushed as a blob,
 with one manifest per `(entry, arch, pin)` of artifact type `application/vnd.hephaestus.utility.v1`, tagged
 `utility/<entry>-<arch>:<pin>`.
 - SystemRescue boots through its `archiso_pxe_http` hook: `archisobasedir=sysresccd ip=dhcp archiso_http_srv=<http base ending in />` (M2 design §5.2).
@@ -914,7 +917,7 @@ Per WL:504-543:
 - Package internals, table and column names, URL shapes beyond those named here, mux wiring, template structure, test layout.
 - The SSE event schema.
 - The AEAD construction (standard library or `x/crypto`).
-- The ISO9660 library (cgo-free, pinned, license-compatible; the plan names it).
+- The ISO9660 library: `github.com/diskfs/go-diskfs` v1.9.4 (iso9660 only; cgo-free, pinned, license-compatible).
 
 ## 9. My calls, for the owner to check
 

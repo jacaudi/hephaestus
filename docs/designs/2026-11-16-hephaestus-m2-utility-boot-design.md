@@ -70,11 +70,11 @@ This is core goal 5's "boot-next for utility OSes" (P1.6, D7), and it is useful 
 |---|---|
 | `store` (new) | The oras-go v3 `content/oci` store, opened with `SyncIndex: true`. Push, tag, untag, resolve, a blob `io.ReadSeekCloser`, a layer size check (`Exists` plus on-disk size against the descriptor), and GC. Only `serve` uses it. |
 | `catalog` (new) | The compiled-in entries (§5.2). Hand-written fields (URLs, recipes, support) live in `catalog.go`; generated fields (sizes, hashes, extracted paths, key fingerprints, pin id) live in `catalog_pins.go`, written by `task catalog:pin`. It renders recipe scripts and does no I/O. |
-| `utility` (new) | The fetcher (§5.4), the extractors (zip, tar+gzip, ISO9660, shared with the pin tool), startup reconciliation and GC (§5.7). Runs in `serve` only. |
+| `toolcache` (new) | The fetcher (§5.4), the extractors (zip and ISO9660, shared with the pin tool; tar+gzip was dropped because no entry uses it), startup reconciliation and GC (§5.7). Runs in `serve` only. The Go package is `toolcache`, not `utility`, because revive bans that name; this design still says "utility" for the feature (the `utility` CLI group, the `/u/` route, `utility_cache`). |
 | `fleet` | `SetBootNext`, `ClearBootNext` (always compare-and-clear), `ListBootNext`, and the `utility_cache` repository with conditional transitions (§5.4). Audit events only for §5.3's closed list. |
 | `boot` | Row 3 inputs, `platform` in the `/boot` query, the `/u/…` route on the plain-HTTP mux, and calls to `catalog` for rendering. Removes M1's row-3 fallback. |
 | `cmd/hephaestus` | `boot-next set`, `boot-next clear`, `boot-next list`, `utility fetch` and `utility list`, all with `--json`. `serve` starts the fetcher. |
-| `tools/catalogpin` (new, developer-only) | `task catalog:pin`. Runs **entirely inside a pinned container** and imports `utility`'s extractors. |
+| `cmd/catalogpin` (new, developer-only) | `task catalog:pin`. Runs **entirely inside a pinned container** and imports `toolcache`'s extractors. |
 
 ### 5.2 Catalog entries
 
@@ -93,9 +93,9 @@ Versions below are as of 2026-11-15. `task catalog:pin` fixes the final values.
 | `systemrescue` | 13.03 | amd64 pcbios+efi | the amd64 ISO. Files: kernel, initrd(s), `sysresccd/x86_64/airootfs.sfs` and its `.sha512` | SHA-256 + GPG `.asc` | `kernel … archisobasedir=sysresccd ip=dhcp BOOTIF=… archiso_http_srv=http://<prov-ip>/u/systemrescue/amd64/13.03/ checksum` + `initrd`. The base keeps `sysresccd/x86_64/airootfs.sfs` beneath it and ends in `/` |
 | `clonezilla` | 3.3.3-37 | amd64 pcbios+efi | the amd64 zip. Files: `live/vmlinuz`, `live/initrd.img`, `live/filesystem.squashfs` | CHECKSUMS + GPG | live-boot: `boot=live BOOTIF=… fetch=http://<prov-ip>/u/clonezilla/amd64/<v>/live/filesystem.squashfs` |
 | `gparted` | 1.8.1-6 | amd64 pcbios+efi | the amd64 zip, same layout | CHECKSUMS + GPG | live-boot, as Clonezilla |
-| `shredos` | v2025.11_32_x86-64_0.43.1 | amd64 pcbios; efi only if the pin step finds an EFI stub | the release's full x86-64 `.iso` asset (not "lite" or "plus-partition"). File: its kernel | GitHub's release-asset `sha256:` digest, cross-checked with upstream `.sha1`. The release is mutable, so **TOFU** | `kernel` + `boot`, with **no `autonuke`** |
+| `shredos` | v2025.11_32_x86-64_0.43.1 | amd64 pcbios and efi (the pin step found an EFI stub in the kernel) | the release's full x86-64 `.iso` asset (not "lite" or "plus-partition"). File: its kernel | GitHub's release-asset `sha256:` digest, cross-checked with upstream `.sha1`. The release is mutable, so **TOFU** | `kernel` + `boot`, with **no `autonuke`** |
 | `grml` | 2026.09 | amd64 pcbios+efi; arm64 efi | the full ISO, one per arch. Files: kernel, initrd, squashfs | SHA256SUMS + GPG | live-boot `BOOTIF=… fetch=http://<prov-ip>/u/grml/<arch>/<v>/<squashfs path>` |
-| `uefishell` | edk2-stable202002 | amd64 efi, arm64 efi | `ShellBinPkg.zip`. Files: `UefiShell/X64/Shell.efi` and `UefiShell/AArch64/Shell.efi` (the full shell, not `MinUefiShell`) | Nothing upstream: **TOFU** (Debian's signed `efi-shell-x64` is a later option) | `chain` the `.efi` |
+| `uefishell` | edk2-stable202002 | amd64 efi, arm64 efi | `ShellBinPkg.zip`. Files: `ShellBinPkg/UefiShell/X64/Shell.efi` and `ShellBinPkg/UefiShell/AArch64/Shell.efi` (the full shell, not `MinUefiShell`) | Nothing upstream: **TOFU** (Debian's signed `efi-shell-x64` is a later option) | `chain` the `.efi` |
 
 Every recipe follows these rules:
 - **Substitutions.** A recipe's only substitutions are the provisioning IP, the `/u/` paths, and `BOOTIF=01-${net${idx}/mac:hexhyp}`. That last one is the NIC the machine booted from; `idx` is the embedded script's interface counter, which persists across the chain. No request text ever reaches a script (core §5.2). The pin step records whether each OS honours `BOOTIF` (archiso, live-boot). e2e proves only that iPXE expands it; lab test 6 proves the OS honours it.
@@ -105,7 +105,7 @@ Every recipe follows these rules:
 **`task catalog:pin`** runs inside a pinned container:
 1. Downloads each object, checks its size, and verifies it before parsing anything.
 2. Binds GPG to `VALIDSIG` for the fingerprint committed in `catalog/keys/<entry>.asc`. `catalog/keys/PROVENANCE.md` records where each fingerprint came from, which must be a source separate from the download host. A key that cannot be authenticated stops that entry. It never falls back to TOFU.
-3. Extracts with `utility`'s extractors.
+3. Extracts with `toolcache`'s extractors.
 4. Records every hash, size and path, the pin id, ShredOS's EFI-stub finding, and each entry's `BOOTIF` support.
 
 CI checks:
@@ -113,7 +113,7 @@ CI checks:
 - every TOFU mark is explicit;
 - no recipe contains `autonuke`;
 - `catalog_pins.go` is formatted;
-- every parser that reads bytes before verification (zip, tar, ISO, the HTTP range logic) has a fuzz test (go-standards §8.6).
+- every parser that reads bytes before verification (the zip and ISO member parsers, the HTTP range logic) has a fuzz test (go-standards §8.6).
 
 ### 5.3 Data (goose `00002`, both sets)
 
@@ -150,7 +150,7 @@ They are written on state changes only. The CLI's actor is `cli`. `served` means
 
 **Migrations:** the CLI never migrates. It refuses to run while migrations are pending, with a hint to start `serve` once.
 
-### 5.4 The fetcher (`utility`, inside `serve` only)
+### 5.4 The fetcher (`toolcache`, inside `serve` only)
 
 **State machine.** Every transition is a conditional update (`… WHERE state = <expected> AND pin = <expected>`). The table is total: every (state, event) pair not listed is a no-op.
 
@@ -161,14 +161,14 @@ They are written on state changes only. The CLI's actor is `cli`. `served` means
 | `failed` or `broken` | row 3 wants it | unchanged. Row 3 never resets backoff or re-arms `broken`, so a held machine re-chaining every 30 s cannot cause a refetch loop |
 | `wanted` | the fetcher claims it (highest `priority` first, then oldest `updated_at`) | `fetching` |
 | `fetching` | push and tag done, every layer's size checked | `ready` |
-| `fetching` | **integrity error**: wrong size or hash, a GPG or path violation, or a redirect to a non-`https` URL | `broken`. The spool is deleted. Every `boot_next` naming `(entry, arch)` is compare-and-cleared with reason `broken` |
+| `fetching` | **integrity error**: wrong size or hash, a path violation, or a redirect to a non-`https` URL (GPG is checked at pin time only, §5.2; the fetcher holds the pinned size and sha256, not a signature) | `broken`. The spool is deleted. Every `boot_next` naming `(entry, arch)` is compare-and-cleared with reason `broken` |
 | `fetching` | **any other error** (the default class): network, any HTTP status other than the expected one, local I/O, disk full | `failed`. `attempts`+1. `next_attempt_at` backs off from 1 min, doubling, capped at 1 h. On the 10th failure, `broken`, with the same clears |
 | `failed` | `next_attempt_at` reached | `fetching` |
 | `ready` | row 3 or the `/u/` route finds a layer missing or wrong-sized | `wanted` (logged at Error) |
 
 **Fetching.**
 - **Polling.** The fetcher polls every 10 s. One fetch runs at a time, and armed boot-nexts go first.
-- **Free space.** Before a fetch: free space must be at least twice the object size plus 10% of the data filesystem.
+- **Free space.** Before a fetch: free space on the spool volume must be at least twice the object size plus a fixed 1 GiB reserve. A 10%-of-the-filesystem reserve blocked every fetch on a nearly full volume (ruled during Task 7); the fixed reserve still leaves the SQLite database room for its journal and growth.
 - **Spool.** Each object downloads to `<data>/spool/<pin>-<n>`, a name parsed back by an expected-name set.
 - **Size cap.** Bytes beyond the pinned size are refused.
 - **Already complete.** A spool already at the pinned size goes straight to verification, with no request.
@@ -210,9 +210,9 @@ They are written on state changes only. The CLI's actor is `cli`. `served` means
 
 | Command | Effect |
 |---|---|
-| `boot-next set <mac\|uuid> <entry>` | Requires a machine hephaestus has seen. A UUID shared by junk records is ambiguous: the CLI refuses and lists the MACs. It refuses an entry the machine's arch cannot boot. Otherwise it sets the flag and its time, applies §5.4's CLI event, audits, and prints readiness and the 24 h expiry. For `shredos` it prints a warning naming the machine |
+| `boot-next set <mac\|uuid> <entry>` | Requires a machine hephaestus has seen. A UUID shared by junk records is ambiguous: the CLI refuses and lists the MACs. It refuses an entry the machine's arch cannot boot. It judges architecture only: the firmware platform is known only at boot, so `serve` may still clear the flag as `unsupported` (row 3) for a platform the entry lacks. Otherwise it sets the flag and its time, applies §5.4's CLI event, audits, and prints readiness and the 24 h expiry. For `shredos` it prints a warning naming the machine |
 | `boot-next clear <mac\|uuid>` | Compare-and-clear with `cli` |
-| `boot-next list` | Every flag: machine, entry, age, and readiness or "expired" |
+| `boot-next list` | Every flag: machine, entry, age, and readiness or "expired". Its `unsupported` status, like `set`'s refusal, judges architecture only |
 | `utility fetch <entry> [--arch …]` | §5.4's CLI event |
 | `utility list` | Per `(entry, arch)`: version, platforms, state, progress, last error, last change, TOFU mark, minimum RAM |
 
@@ -223,8 +223,8 @@ The CLI loads the same bootstrap config as `serve` and opens the same database. 
 The listeners are bound first. That is M1's order, and a second `serve` therefore fails to bind before it can touch the database or the store.
 
 1. **Open the store.**
-   - An undecodable `index.json`: move `<data>/store` aside to `store.corrupt-<UTC>`, log an Error, start an empty store, and continue. Only the newest `store.corrupt-*` is kept; older ones are deleted.
-   - Any other open error stops `serve` with that error.
+   - A corruption on the store's allow-list: an undecodable or mistyped `index.json`, an unsupported `oci-layout` version, a malformed digest, a manifest whose bytes do not match its digest, or a truncated read. Move `<data>/store` aside to `store.corrupt-<UTC>`, log an Error, start an empty store, and continue. Only the newest `store.corrupt-*` is kept; older ones are deleted.
+   - Every other open error, a permission or I/O failure included, stops `serve` with that error and moves nothing, so a store that is merely unreadable is never discarded.
    - An empty `index.json`, which oras-go silently resets, needs no special case: step 3 handles the missing tags.
 2. **Interrupted fetches.** Rows in `fetching` become `wanted`.
 3. **Rows against the catalog.**
@@ -233,7 +233,9 @@ The listeners are bound first. That is M1's order, and a second `serve` therefor
    - A `ready` row whose tag or any layer is missing or wrong-sized becomes `wanted`. That re-queues it, as core §5.6 does for a missing blob, so a restored or repaired host refetches its offline cache unattended.
    - A tag at the current pin whose layers all pass the size check makes its row `ready`. This repairs a crash between tagging and the state update.
 4. **Spool.** Any file outside the expected-name set is removed.
-5. **GC.** Untag every `utility/*` tag that is not at a current pin, then run `Store.GC()`. oras-go spares unreachable blobs younger than an hour, and nothing is served yet. The untag is scoped to `utility/`, so M3's pins stay additive.
+5. **GC.** Untag every `utility/*` tag that is not at a current pin, then run `Store.GC()`. oras-go spares unreachable blobs younger than an hour, and nothing is served yet. The untag is scoped to `utility/`, so M3's pins stay additive. A `CollectGarbage` failure logs Warn `utility garbage collection failed` and `serve` continues: garbage is only disk.
+
+**What stops `serve`, and what requeues.** A `Reconcile` failure or a fetcher-construction failure stops `serve`. Lost content means `store.ContentLost`: an unknown tag (`ErrNotFound`), a missing layer (`ErrLayerMissing`) or a layer of the wrong size (`ErrLayerSize`). Only lost content requeues a `ready` row: at startup, at row 3 and on `/u/`. Any other store error is reported and never requeues, because content the store cannot read is not content it lacks. At startup it stops `serve`; at row 3 the utility counts as not ready; on `/u/` the answer is 500.
 
 ### 5.8 Observability
 
@@ -275,7 +277,7 @@ The listeners are bound first. That is M1's order, and a second `serve` therefor
 
 - **Milestones.** M2 becomes this scope. M3 gains Talos prefetch, `assets_ready`, Talos reconciliation, the `/v2/` mirror and the runtime GC quiet window. A follow-up after M2 adds Alpine aarch64 (D18, option A, after its spike); `zfs-lts` is out of v1. The QEMU harness exists (`task e2e`).
 - **Anti-goals ("Trusting moving refs").** Unchanged for M2. The Alpine follow-up will record its signing-key exception there.
-- **§5.1.** Rows for `store`, `catalog` and `utility`. The `cmd` row gains the CLI. The `boot` row gains row 3 and `/u/`. The `fleet` row gains boot-next and `utility_cache`.
+- **§5.1.** Rows for `store`, `catalog` and `toolcache`. The `cmd` row gains the CLI. The `boot` row gains row 3 and `/u/`. The `fleet` row gains boot-next and `utility_cache`.
 - **§5.2.** The inputs list; the "M1 behaviour" paragraph; row 3's expiry, `unknown_entry` and unsupported clears and the compare-and-clear; `platform` in the `/boot` query.
 - **§5.6.**
   - Utility fetching per this design, including pin ids.

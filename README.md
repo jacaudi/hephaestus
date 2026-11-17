@@ -120,7 +120,7 @@ task catalog:pin                      # pin every entry
 task catalog:pin -- -only grml        # re-pin one entry; every other entry keeps its pin or absent reason
 ```
 
-`task catalog:pin` runs inside a pinned container (`task catalog:image` builds it: the `catalogpin` tool plus gpg), so the host needs no gpg. It needs `DOCKER_HOST` set for colima, the internet and about 6.5 GB of downloads. For each object it downloads it over TLS 1.3 (every redirect hop is checked), checks the size, extracts the files the catalog boots, and records their hashes. A signed entry is verified against the key in `internal/catalog/keys/` before anything is parsed; a trust-on-first-use entry is pinned on first use. The report, with every hop, hash, signer, the ShredOS EFI-stub finding and whether each recipe's operating system honours BOOTIF, is `build/catalogpin/report.txt`.
+`task catalog:pin` runs inside a pinned container (`task catalog:image` builds it: the `catalogpin` tool plus gpg), so the host needs no gpg. It needs `DOCKER_HOST` set for colima, the internet and about 6.5 GB of downloads. For each object it downloads it over TLS 1.3 (every redirect hop is checked), checks the size, extracts the files the catalog boots, and records their hashes. The EFI-stub check reads the PE header where the DOS header points (`e_lfanew`, bounded to 64 KiB), because real EFI binaries, such as the UEFI Shell's AArch64 build, put it well past byte 512. A checksum list with `### <ALGO>SUMS:` section headers is read only in the wanted algorithm's section: the Clonezilla and GParted lists carry a 64-hex `B3SUMS` BLAKE3 section that is as long as a sha256. A signed entry is verified against the key in `internal/catalog/keys/` before anything is parsed; a trust-on-first-use entry is pinned on first use. The report, with every hop, hash, signer, the ShredOS EFI-stub finding and whether each recipe's operating system honours BOOTIF, is `build/catalogpin/report.txt`.
 
 An entry that cannot be pinned is not an error. It goes in the `absent` ledger of `catalog_pins.go` with a reason that starts with its class:
 
@@ -145,7 +145,7 @@ docker exec hephaestus /hephaestus boot-next set 52:54:00:12:34:56 systemrescue
 
 | Command | Effect |
 |---|---|
-| `boot-next set <mac\|uuid> <entry>` | Boots the machine into the utility on its next PXE boot, once. The machine must have booted through hephaestus before. A UUID that several machines share is refused with the list of their MACs; name one by MAC. An entry with no build for the machine's architecture is refused. It asks `serve` to fetch the utility, prints when the flag expires and the utility's state (`wanted`, `fetching`, `ready`, `failed`, `broken` or `stale_pin`), re-arms a failed or broken one and shows its previous error, and warns first for an entry that erases disks (ShredOS) |
+| `boot-next set <mac\|uuid> <entry>` | Boots the machine into the utility on its next PXE boot, once. The machine must have booted through hephaestus before. A UUID that several machines share is refused with the list of their MACs; name one by MAC. An entry with no build for the machine's architecture is refused. That check judges architecture only (so does `boot-next list`): the firmware platform is known only at boot, so `serve` may still clear the flag as `unsupported` for a platform the entry lacks. It asks `serve` to fetch the utility, prints when the flag expires and the utility's state (`wanted`, `fetching`, `ready`, `failed`, `broken` or `stale_pin`), re-arms a failed or broken one and shows its previous error, and warns first for an entry that erases disks (ShredOS) |
 | `boot-next clear <mac\|uuid>` | Cancels the machine's boot-next. It exits 0 with a note when there is none, or when the flag changed while the command ran |
 | `boot-next list` | Every flag: machine, MACs, entry, architecture, when it was set, its age in seconds and its status: `expired`, `unknown_entry`, `unsupported`, or the utility's state (`not_requested` when nothing has asked for it) |
 | `utility fetch <entry> [--arch amd64\|arm64]` | Asks `serve` to fetch the entry ahead of any boot, for every architecture it is built for or the one named; re-arms a failed or broken fetch |
@@ -206,7 +206,7 @@ task ci            # fmt and tidy checks, lint, vuln, hadolint, go test -race, c
                    # Postgres integration tests, coverage gate (needs DOCKER_HOST)
 task ipxe:build    # rebuild the embedded iPXE binaries (needs DOCKER_HOST)
 task image:build   # build hephaestus:dev for linux/arm64; PLATFORM=linux/amd64 overrides (needs DOCKER_HOST)
-task e2e           # boot QEMU VMs through hephaestus in a Linux Docker daemon; about 2.5 minutes, not part of ci (colima needs DOCKER_HOST; see test/e2e/README.md)
+task e2e           # boot QEMU VMs through hephaestus in a Linux Docker daemon; about 5 to 6 minutes with the layer cache warm, not part of ci (colima needs DOCKER_HOST; see test/e2e/README.md)
 ```
 
 With colima, set `DOCKER_HOST=unix:///Users/<you>/.colima/default/docker.sock`. The Dockerfile builds linux/amd64 and linux/arm64 by cross-compiling on the build platform; the final image is distroless and runs as `65532:65532`.
