@@ -48,6 +48,10 @@ type Machine struct {
 	HostName     *string   `bun:"host_name"`
 	CreatedAt    time.Time `bun:"created_at"`
 	LastSeenAt   time.Time `bun:"last_seen_at"`
+	// BootNext is the utility entry the next boot serves and BootNextSetAt when it
+	// was set; both are zero when no boot-next is armed.
+	BootNext      string    `bun:"boot_next,nullzero"`
+	BootNextSetAt time.Time `bun:"boot_next_set_at,nullzero"`
 	// MACs are the machine's addresses, sorted. Get and Lookup fill them.
 	MACs []string `bun:"-"`
 }

@@ -64,7 +64,7 @@ tasks:
     cmds:
       - go test -tags integration ./... -race
   cover:db:
-    desc: Every exported method in db.go and repository.go files runs on SQLite and on Postgres (WL database rule 2)
+    desc: Every exported method in db.go and *repository.go files runs on SQLite and on Postgres (WL database rule 2)
     cmds:
       - mkdir -p bin
       - go test -coverprofile=bin/cover-sqlite.out {{.DB_PKGS}}
@@ -72,5 +72,5 @@ tasks:
       - |
         set -eu
         for f in bin/cover-sqlite.out bin/cover-postgres.out; do
-          go tool cover -func="$f" | awk -v f="$f" '$1 ~ /\/(db|repository)\.go:/ && $2 ~ /^[A-Z]/ && $3 == "0.0%" {print f ": not executed: " $1 " " $2; bad=1} END {exit bad}'
+          go tool cover -func="$f" | awk -v f="$f" '$1 ~ /\/(db|([a-z]+_)?repository)\.go:/ && $2 ~ /^[A-Z]/ && $3 == "0.0%" {print f ": not executed: " $1 " " $2; bad=1} END {exit bad}'
         done

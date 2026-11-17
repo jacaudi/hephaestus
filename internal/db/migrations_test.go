@@ -53,7 +53,7 @@ func runMigrateSuite(t *testing.T, open func(testing.TB) *db.DB) {
 		if err := d.Bun().NewRaw(query).Scan(t.Context(), &got); err != nil {
 			t.Fatalf("list tables: %v", err)
 		}
-		for _, want := range []string{"machines", "machine_macs", "inventory_reports", "boot_events", "audit_events", "settings"} {
+		for _, want := range []string{"machines", "machine_macs", "inventory_reports", "boot_events", "audit_events", "settings", "utility_cache"} {
 			if !slices.Contains(got, want) {
 				t.Errorf("table %q missing; have %v", want, got)
 			}
@@ -95,6 +95,27 @@ func runMigrateSuite(t *testing.T, open func(testing.TB) *db.DB) {
 		}
 		if err := insertMachine(t, d, "m3", true); err != nil {
 			t.Fatalf("junk machine with the same UUID: %v", err)
+		}
+	})
+
+	t.Run("BootNextPair", func(t *testing.T) {
+		const insert = "INSERT INTO machines (id, smbios_uuid, junk, serial, product, arch, state, created_at, last_seen_at, boot_next, boot_next_set_at) VALUES (?, ?, TRUE, 's', 'p', 'amd64', 'discovered', '2026-11-14T12:00:00Z', '2026-11-14T12:00:00Z', ?, ?)"
+		for _, tc := range []struct {
+			name    string
+			id      string
+			next    any
+			setAt   any
+			wantErr bool
+		}{
+			{"flag without time", "bn1", "x", nil, true},
+			{"time without flag", "bn2", nil, "2026-11-14T12:00:00Z", true},
+			{"both set", "bn3", "x", "2026-11-14T12:00:00Z", false},
+			{"neither set", "bn4", nil, nil, false},
+		} {
+			_, err := d.Bun().ExecContext(t.Context(), insert, tc.id, fixtureUUID, tc.next, tc.setAt)
+			if (err != nil) != tc.wantErr {
+				t.Errorf("%s: insert error = %v, want error: %v", tc.name, err, tc.wantErr)
+			}
 		}
 	})
 

@@ -1,8 +1,11 @@
 package db_test
 
 import (
+	"database/sql"
+	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"go.jacaudi.dev/hephaestus/internal/admin"
 	"go.jacaudi.dev/hephaestus/internal/db"
@@ -137,4 +140,74 @@ func byName(checks []admin.Check) map[string]admin.Check {
 		m[c.Name] = c
 	}
 	return m
+}
+
+// Two handles on one file stand in for serve and the CLI. B begins, reads, then A writes in a goroutine;
+// B's update and commit succeed, and A's write completes after B commits, without error.
+// Under deferred transactions B's update fails with SQLITE_BUSY_SNAPSHOT, so this fails before the DSN change.
+func TestOpen_SQLiteReadThenWriteNoBusySnapshot(t *testing.T) {
+	ctx := t.Context()
+	url := secret.Secret("sqlite:" + t.TempDir() + "/shared.db")
+	open := func() *db.DB {
+		t.Helper()
+		d, err := db.Open(ctx, url)
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		t.Cleanup(func() {
+			if err := d.Close(); err != nil {
+				t.Errorf("Close: %v", err)
+			}
+		})
+		return d
+	}
+	a, b := open(), open()
+	if err := a.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+
+	tx, err := b.Bun().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("B begin: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+			t.Errorf("B rollback: %v", err)
+		}
+	})
+	var n int
+	if err := tx.NewRaw("SELECT count(*) FROM settings").Scan(ctx, &n); err != nil {
+		t.Fatalf("B read: %v", err)
+	}
+
+	aDone := make(chan error, 1)
+	go func() {
+		_, err := a.Bun().ExecContext(ctx, "INSERT INTO settings (key, value) VALUES ('from_a', '1')")
+		aDone <- err
+	}()
+	// Deferred: A completes while B holds only a read snapshot. Immediate: A waits for B's write lock.
+	var aErr error
+	aFinished := false
+	select {
+	case aErr = <-aDone:
+		aFinished = true
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	if _, err := tx.ExecContext(ctx, "INSERT INTO settings (key, value) VALUES ('from_b', '2')"); err != nil {
+		t.Fatalf("B write after a read: %v (A finished first: %v)", err, aFinished)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("B commit: %v", err)
+	}
+	if !aFinished {
+		aErr = <-aDone
+	}
+	if aErr != nil {
+		t.Fatalf("A write: %v", aErr)
+	}
+	var got int
+	if err := a.Bun().NewRaw("SELECT count(*) FROM settings WHERE key IN ('from_a', 'from_b')").Scan(ctx, &got); err != nil || got != 2 {
+		t.Fatalf("rows from A and B = %d, %v; want 2, nil", got, err)
+	}
 }

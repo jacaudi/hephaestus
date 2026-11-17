@@ -74,7 +74,7 @@ func Open(ctx context.Context, url secret.Secret) (*DB, error) {
 	var bunDB *bun.DB
 	switch dialect {
 	case DialectSQLite:
-		sqlDB, err := sql.Open("sqlite", "file:"+target+"?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
+		sqlDB, err := sql.Open("sqlite", "file:"+target+"?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_txlock=immediate")
 		if err != nil {
 			return nil, fmt.Errorf("db: open sqlite: %w", err)
 		}
