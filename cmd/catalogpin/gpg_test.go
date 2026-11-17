@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -112,6 +113,39 @@ func TestGPG_MissingGPGIsLocal(t *testing.T) {
 	}
 }
 
+// TestGPGVerify_VerifyFailureClass pins the --verify split: a gpg that runs
+// and exits non-zero gave a verdict (signature), while a gpg that cannot start
+// for --verify gave none (local, so network). The fake gpg on PATH accepts
+// --import; its --verify either exits 1 or is gone because --import removed it.
+func TestGPGVerify_VerifyFailureClass(t *testing.T) {
+	tests := []struct {
+		name      string
+		onImport  string
+		wantLocal bool
+		wantClass string
+	}{
+		{name: "verify exits non-zero", onImport: "exit 0", wantLocal: false, wantClass: classSignature},
+		{name: "verify cannot start", onImport: `/bin/rm -f "$0"; exit 0`, wantLocal: true, wantClass: classNetwork},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			putFakeGPG(t, "case \"$*\" in\n*--import*) "+tt.onImport+" ;;\n*) exit 1 ;;\nesac")
+
+			_, err := gpgVerify(t.Context(), "key.asc", "data.sig", filepath.Join(t.TempDir(), "data"))
+
+			if err == nil {
+				t.Fatal("gpgVerify = nil error, want a failure")
+			}
+			if got := errors.Is(err, errGPGLocal); got != tt.wantLocal {
+				t.Errorf("errors.Is(%v, errGPGLocal) = %t, want %t", err, got, tt.wantLocal)
+			}
+			if got := gpgClass(err); got != tt.wantClass {
+				t.Errorf("gpgClass = %q, want %q", got, tt.wantClass)
+			}
+		})
+	}
+}
+
 func TestGPG_UnwritableHomeIsLocal(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "no-such-dir")
 
@@ -123,4 +157,31 @@ func TestGPG_UnwritableHomeIsLocal(t *testing.T) {
 			t.Errorf("%s with no room for a home = %v, want errGPGLocal", name, err)
 		}
 	}
+}
+
+// TestGPG_BrokenKeyIsLocal pins that a committed key gpg cannot import, or
+// whose listing holds no primary fingerprint, is local (network), never a
+// signature verdict.
+func TestGPG_BrokenKeyIsLocal(t *testing.T) {
+	putFakeGPG(t, "case \"$*\" in\n*--import*) exit 2 ;;\n*--show-keys*) echo 'pub:-:4096:1:AAAA:1:::-:::scESC:::::::' ;;\nesac")
+	dir := t.TempDir()
+
+	_, verifyErr := gpgVerify(t.Context(), "key.asc", "data.sig", filepath.Join(dir, "data"))
+	_, primaryErr := gpgKeyPrimary(t.Context(), dir, "key.asc")
+
+	for name, err := range map[string]error{"gpgVerify": verifyErr, "gpgKeyPrimary": primaryErr} {
+		if got := gpgClass(err); got != classNetwork {
+			t.Errorf("gpgClass(%s = %v) = %q, want %q", name, err, got, classNetwork)
+		}
+	}
+}
+
+// putFakeGPG puts a gpg on a PATH of its own that runs the shell body.
+func putFakeGPG(t *testing.T, body string) {
+	t.Helper()
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "gpg"), []byte("#!/bin/sh\n"+body+"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin)
 }

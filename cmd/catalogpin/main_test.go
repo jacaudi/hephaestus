@@ -267,34 +267,54 @@ func TestRun_NeedsGPGIgnoresUnselectedSpecs(t *testing.T) {
 	}
 }
 
-func TestRun_RefusesKeptPinWithOtherURL(t *testing.T) {
-	cfg := runConfig(t)
-	cfg.only = []string{"ok"}
-	stale := catalog.Pin{ID: "old", Objects: []catalog.ObjectPin{{URL: "https://old.example.test/held.zip"}}}
-	in := pinRun{
-		Specs: []catalog.Spec{
-			zipSpec("ok", "https://upstream.example.test/ok.zip", "f.bin"),
-			zipSpec("held", "https://upstream.example.test/held.zip", "f.bin"),
+func TestRun_RefusesStaleKeptPin(t *testing.T) {
+	const heldURL = "https://upstream.example.test/held.zip"
+	tests := []struct {
+		name  string
+		stale catalog.ObjectPin
+		files []string // the held spec's files
+	}{
+		{
+			name:  "other URL",
+			stale: catalog.ObjectPin{URL: "https://old.example.test/held.zip", Files: []catalog.FilePin{{Path: "f.bin"}}},
+			files: []string{"f.bin"},
 		},
-		Existing: map[catalog.Key]catalog.Pin{{Entry: "held", Arch: "amd64"}: stale},
+		{
+			name:  "same URL, the spec adds a file",
+			stale: catalog.ObjectPin{URL: heldURL, Files: []catalog.FilePin{{Path: "f.bin"}}},
+			files: []string{"f.bin", "initrd"},
+		},
 	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := runConfig(t)
+			cfg.only = []string{"ok"}
+			in := pinRun{
+				Specs: []catalog.Spec{
+					zipSpec("ok", "https://upstream.example.test/ok.zip", "f.bin"),
+					zipSpec("held", heldURL, tt.files...),
+				},
+				Existing: map[catalog.Key]catalog.Pin{{Entry: "held", Arch: "amd64"}: {ID: "old", Objects: []catalog.ObjectPin{tt.stale}}},
+			}
 
-	err := run(t.Context(), cfg, in, nil, io.Discard)
+			err := run(t.Context(), cfg, in, nil, io.Discard)
 
-	if err == nil || !strings.Contains(err.Error(), "held/amd64") || !strings.Contains(err.Error(), "re-pin") {
-		t.Fatalf("run error = %v, want one naming held/amd64 and saying to re-pin it", err)
-	}
-	if _, statErr := os.Stat(cfg.out); !errors.Is(statErr, fs.ErrNotExist) {
-		t.Errorf("the pins file was written for a refused run (stat: %v)", statErr)
+			if err == nil || !strings.Contains(err.Error(), "held/amd64") || !strings.Contains(err.Error(), "re-pin") {
+				t.Fatalf("run error = %v, want one naming held/amd64 and saying to re-pin it", err)
+			}
+			if _, statErr := os.Stat(cfg.out); !errors.Is(statErr, fs.ErrNotExist) {
+				t.Errorf("the pins file was written for a refused run (stat: %v)", statErr)
+			}
+		})
 	}
 }
 
-func TestRun_KeepsPinWithMatchingURLs(t *testing.T) {
+func TestRun_KeepsMatchingPin(t *testing.T) {
 	good := makeZip(t, member{"f.bin", []byte("payload")})
 	srv := startServer(t, serveBytes(good), false)
 	cfg := runConfig(t)
 	cfg.only = []string{"ok"}
-	kept := catalog.Pin{ID: "keptpin", Objects: []catalog.ObjectPin{{URL: "https://upstream.example.test/held.zip"}}}
+	kept := catalog.Pin{ID: "keptpin", Objects: []catalog.ObjectPin{{URL: "https://upstream.example.test/held.zip", Files: []catalog.FilePin{{Path: "f.bin"}}}}}
 	in := pinRun{
 		Specs: []catalog.Spec{
 			zipSpec("ok", srv.URL+"/ok.zip", "f.bin"),

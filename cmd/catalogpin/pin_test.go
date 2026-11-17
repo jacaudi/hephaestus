@@ -481,7 +481,7 @@ func TestPin_AbsentReasonClasses(t *testing.T) {
 		},
 		{
 			name: "key file missing", serve: serveObjectAndSig, spec: signed("absent.asc"),
-			gpg: fakeGPG{signer: testFPR, primary: testFPR}, prov: trusted, want: "signature: ",
+			gpg: fakeGPG{signer: testFPR, primary: testFPR}, prov: trusted, want: "network: ",
 		},
 		{
 			name: "TOFU list names another digest", serve: serveList(strings.Repeat("0", 64) + "  obj.zip\n"),

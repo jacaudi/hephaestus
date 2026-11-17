@@ -468,11 +468,12 @@ func gpgClass(err error) string {
 }
 
 // keyPath returns the path of the signer key file key, after confirming it
-// opens beneath the keys directory.
+// opens beneath the keys directory. A missing key is the repository's defect,
+// not a verdict on the signature, so it is local (errGPGLocal) and network.
 func (p *pinner) keyPath(key string) (keyFile string, err error) {
 	f, err := p.keys.Open(key)
 	if err != nil {
-		return "", failf(classSignature, "open signer key %s: %w", key, err)
+		return "", failf(classNetwork, "%w: open signer key %s: %w", errGPGLocal, key, err)
 	}
 	defer func() { err = errors.Join(err, f.Close()) }()
 	return filepath.Join(p.keys.Name(), key), nil

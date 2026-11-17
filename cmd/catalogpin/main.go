@@ -124,8 +124,8 @@ func (in pinRun) selected(entry string) bool {
 }
 
 // checkKept refuses a run whose kept pins no longer match their specs: a pin
-// made for other object URLs would be written back and then rejected by
-// catalog.New at startup.
+// made for other object URLs or file paths would be written back and then
+// rejected by catalog.New at startup.
 func checkKept(in pinRun) error {
 	var errs []error
 	for i := range in.Specs {
@@ -134,11 +134,18 @@ func checkKept(in pinRun) error {
 		if in.selected(s.Entry) || !ok {
 			continue
 		}
-		if !slices.EqualFunc(s.Objects, pin.Objects, func(o catalog.ObjectSpec, op catalog.ObjectPin) bool { return o.URL == op.URL }) {
-			errs = append(errs, fmt.Errorf("-only: the pin kept for %s/%s was made for other object URLs than its spec names; re-pin it with -only %s", s.Entry, s.Arch, s.Entry))
+		if !slices.EqualFunc(s.Objects, pin.Objects, keptObjectMatches) {
+			errs = append(errs, fmt.Errorf("-only: the pin kept for %s/%s was made for other object URLs or files than its spec names; re-pin it with -only %s", s.Entry, s.Arch, s.Entry))
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// keptObjectMatches reports whether a kept object pin still fits its spec on
+// what catalog.New compares them by (validateObjectPin): the URL and the file
+// paths, in order.
+func keptObjectMatches(o catalog.ObjectSpec, op catalog.ObjectPin) bool {
+	return o.URL == op.URL && slices.EqualFunc(o.Files, op.Files, func(path string, f catalog.FilePin) bool { return path == f.Path })
 }
 
 // needsGPG reports whether a selected spec has an object that is not TOFU.

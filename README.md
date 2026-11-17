@@ -127,7 +127,7 @@ An entry that cannot be pinned is not an error. It goes in the `absent` ledger o
 | Class | Meaning |
 |---|---|
 | `tls13:` | a hop did not complete TLS 1.3 |
-| `network:` | DNS, connect, reset, timeout, another transfer failure or a local gpg failure such as no gpg (up to 3 attempts for a transfer) |
+| `network:` | DNS, connect, reset, timeout, another transfer failure, a local gpg failure such as no gpg, or a broken/missing committed key (up to 3 attempts for a transfer) |
 | `http-<status>:` | an unexpected HTTP status (`5xx` and `429` get up to 3 attempts) |
 | `integrity:` | a size, hash or extraction failure |
 | `signature:` | signature verification, key fingerprint or provenance failure |
