@@ -1,0 +1,786 @@
+package toolcache
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"net/http"
+	"net/url"
+	"os"
+	"sync/atomic"
+	"time"
+
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/metric/noop"
+	"golang.org/x/sys/unix"
+
+	"go.jacaudi.dev/hephaestus/internal/catalog"
+	"go.jacaudi.dev/hephaestus/internal/fleet"
+	"go.jacaudi.dev/hephaestus/internal/store"
+)
+
+const (
+	// PollInterval is how often Run looks for a row to fetch.
+	PollInterval = 10 * time.Second
+	// IdleTimeout is how long a download may receive no data before it is
+	// abandoned. It restarts on every read that makes progress; it is not a
+	// total timeout.
+	IdleTimeout = 60 * time.Second
+
+	// progressEvery bounds how often a download records its progress.
+	progressEvery = 5 * time.Second
+
+	// The FetchEvent classes of a failure.
+	classIntegrity = "integrity"
+	classOther     = "other"
+
+	spoolFileMode = 0o600
+	spoolDirMode  = 0o750
+)
+
+// errIdle is why a download was cancelled: no data arrived within the idle
+// timeout.
+var errIdle = errors.New("idle timeout: no data from the upstream")
+
+// FetcherConfig is what a Fetcher works on. Every field is required.
+type FetcherConfig struct {
+	// Repo holds the utility_cache rows the fetcher claims and settles.
+	Repo *fleet.Repository
+	// Store receives the extracted files.
+	Store *store.Store
+	// Catalog says what each row's pin fixes.
+	Catalog *catalog.Catalog
+	// Client is the upstream client, NewHTTPClient's.
+	Client *http.Client
+	// SpoolDir holds the partial downloads. It is created when missing.
+	SpoolDir string
+}
+
+// FetchEvent is one state change of a cache row the fetcher made.
+type FetchEvent struct {
+	Key      fleet.CacheKey
+	Pin      string
+	From, To fleet.CacheState
+	// Attempts is the row's failed attempts after the change.
+	Attempts int
+	// Class is "" for a change that is not a failure, "integrity" for a failure
+	// no retry can fix and "other" for any other failure.
+	Class string
+	// Err is the failure's cause, with any URL query removed.
+	Err error
+	// Bytes is how many bytes this run downloaded.
+	Bytes    int64
+	Duration time.Duration
+}
+
+// FetcherOption configures a Fetcher.
+type FetcherOption func(*Fetcher)
+
+// WithClock sets the clock behind the times written to the database.
+func WithClock(now func() time.Time) FetcherOption { return func(f *Fetcher) { f.now = now } }
+
+// WithMeter sets the meter the fetcher's counters are created on.
+func WithMeter(m metric.Meter) FetcherOption { return func(f *Fetcher) { f.meter = m } }
+
+// WithEvents sets the function called with every state change.
+func WithEvents(fn func(context.Context, FetchEvent)) FetcherOption {
+	return func(f *Fetcher) { f.events = fn }
+}
+
+// WithErrorHandler sets the function called with every error the fetcher
+// cannot settle on a row: an unrecorded repository error, or a spool file it
+// could not remove.
+func WithErrorHandler(fn func(context.Context, error)) FetcherOption {
+	return func(f *Fetcher) { f.onError = fn }
+}
+
+// Fetcher downloads the objects of wanted cache rows, verifies them against
+// the catalog's pins, extracts their files into the store and settles each
+// row. Run it once; runOnce is not safe for concurrent use.
+type Fetcher struct {
+	cfg      FetcherConfig
+	now      func() time.Time
+	meter    metric.Meter
+	events   func(context.Context, FetchEvent)
+	onError  func(context.Context, error)
+	bytes    metric.Int64Counter
+	failures metric.Int64Counter
+
+	// Test hooks.
+	poll   time.Duration
+	idle   time.Duration
+	statfs func(path string) (free, total uint64, err error)
+
+	// held is an outcome the database refused to take, retried on the next poll.
+	held *heldOutcome
+}
+
+// NewFetcher returns a Fetcher over cfg and creates cfg.SpoolDir if it is
+// missing. Every problem with cfg is reported together.
+func NewFetcher(cfg FetcherConfig, opts ...FetcherOption) (*Fetcher, error) {
+	var errs []error
+	for _, missing := range []struct {
+		name string
+		is   bool
+	}{
+		{"Repo", cfg.Repo == nil}, {"Store", cfg.Store == nil}, {"Catalog", cfg.Catalog == nil},
+		{"Client", cfg.Client == nil}, {"SpoolDir", cfg.SpoolDir == ""},
+	} {
+		if missing.is {
+			errs = append(errs, fmt.Errorf("toolcache: fetcher config has no %s", missing.name))
+		}
+	}
+	if err := errors.Join(errs...); err != nil {
+		return nil, err
+	}
+
+	f := &Fetcher{
+		cfg:     cfg,
+		now:     time.Now,
+		meter:   noop.NewMeterProvider().Meter(""),
+		events:  func(context.Context, FetchEvent) {},
+		onError: func(context.Context, error) {},
+		poll:    PollInterval,
+		idle:    IdleTimeout,
+		statfs:  diskFree,
+	}
+	for _, opt := range opts {
+		opt(f)
+	}
+
+	var err error
+	f.bytes, err = f.meter.Int64Counter("hephaestus.utility.fetch.bytes", metric.WithUnit("By"),
+		metric.WithDescription("Bytes downloaded from upstreams."))
+	if err != nil {
+		return nil, fmt.Errorf("toolcache: create the fetch bytes counter: %w", err)
+	}
+	f.failures, err = f.meter.Int64Counter("hephaestus.utility.fetch.failures",
+		metric.WithDescription("Failed fetches, by class: integrity or other."))
+	if err != nil {
+		return nil, fmt.Errorf("toolcache: create the fetch failures counter: %w", err)
+	}
+	if err := os.MkdirAll(cfg.SpoolDir, spoolDirMode); err != nil {
+		return nil, fmt.Errorf("toolcache: create the spool dir: %w", err)
+	}
+	return f, nil
+}
+
+// diskFree is the default statfs: the space free to an unprivileged process
+// and the size of the volume holding path.
+func diskFree(path string) (free, total uint64, err error) {
+	var st unix.Statfs_t
+	if err := unix.Statfs(path, &st); err != nil {
+		return 0, 0, fmt.Errorf("statfs %s: %w", path, err)
+	}
+	block := uint64(st.Bsize)
+	return st.Bavail * block, st.Blocks * block, nil
+}
+
+// Run fetches one claimed row now and then every poll interval, until ctx is
+// done, and then returns nil. It never returns an error: each runOnce error
+// other than ctx's own goes to the error handler and polling continues.
+func (f *Fetcher) Run(ctx context.Context) error {
+	tick := time.NewTicker(f.poll)
+	defer tick.Stop()
+	for {
+		if _, err := f.runOnce(ctx); err != nil && ctx.Err() == nil {
+			f.onError(ctx, err)
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-tick.C:
+		}
+	}
+}
+
+// outcome is how one claimed row ended: ready, or a failure to record.
+type outcome struct {
+	ready bool
+	fail  fleet.FetchFailure
+	// ev is the event to emit once the outcome is stored, less To and Attempts.
+	ev FetchEvent
+}
+
+// heldOutcome is an outcome the database refused. retried is set once the
+// next poll has tried it again.
+type heldOutcome struct {
+	outcome
+
+	retried bool
+}
+
+// runOnce settles one row. It reports false when nothing was claimed, and true
+// when a row was: with a nil error when its outcome (ready or a recorded
+// failure) was stored, with ctx's error when ctx ended the fetch, which leaves
+// the row fetching and its spool in place, and otherwise with the repository
+// error that kept the outcome from being stored.
+func (f *Fetcher) runOnce(ctx context.Context) (bool, error) {
+	if f.held != nil {
+		return f.retryHeld(ctx)
+	}
+	row, ok, err := f.cfg.Repo.ClaimFetch(ctx, f.now())
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		return false, nil
+	}
+	f.events(ctx, FetchEvent{Key: row.Key(), Pin: row.Pin, From: claimedFrom(row), To: fleet.CacheFetching, Attempts: row.Attempts})
+
+	start := time.Now()
+	job := &fetchJob{f: f, row: row}
+	defer job.close(ctx)
+	err = job.run(ctx)
+	o := outcome{ev: FetchEvent{Key: row.Key(), Pin: row.Pin, From: fleet.CacheFetching, Bytes: job.downloaded}}
+	if err == nil {
+		o.ready = true
+	} else {
+		if ctx.Err() != nil {
+			return true, ctx.Err()
+		}
+		o.ev.Class = classOf(err)
+		o.ev.Err = err
+		o.fail = fleet.FetchFailure{Key: row.Key(), Pin: row.Pin, Cause: err.Error(), Integrity: o.ev.Class == classIntegrity, At: f.now()}
+		f.failures.Add(ctx, 1, metric.WithAttributes(attribute.String("class", o.ev.Class)))
+		if o.fail.Integrity {
+			job.discard(ctx)
+		}
+	}
+	o.ev.Duration = time.Since(start)
+
+	recordErr := f.record(ctx, o)
+	if o.ready {
+		job.discard(ctx)
+	}
+	if recordErr == nil {
+		return true, nil
+	}
+	if ctx.Err() != nil {
+		return true, ctx.Err()
+	}
+	f.held = &heldOutcome{outcome: o}
+	return true, recordErr
+}
+
+// claimedFrom is the state a claimed row was in. ClaimFetch returns it already
+// fetching, but only a failed row keeps its next_attempt_at.
+func claimedFrom(row fleet.CacheRow) fleet.CacheState {
+	if row.NextAttemptAt.IsZero() {
+		return fleet.CacheWanted
+	}
+	return fleet.CacheFailed
+}
+
+// record stores o and emits its event. A failure that could not be stored
+// carries its cause along, for the error handler.
+func (f *Fetcher) record(ctx context.Context, o outcome) error {
+	if o.ready {
+		moved, err := f.cfg.Repo.MarkReady(ctx, o.ev.Key, o.ev.Pin, f.now())
+		if err != nil {
+			return err
+		}
+		if moved {
+			o.ev.To = fleet.CacheReady
+			f.events(ctx, o.ev)
+		}
+		return nil
+	}
+	row, err := f.cfg.Repo.RecordFetchFailure(ctx, o.fail)
+	if err != nil {
+		return fmt.Errorf("%w (the fetch failed: %w)", err, o.ev.Err)
+	}
+	if row.Pin == o.ev.Pin && (row.State == fleet.CacheFailed || row.State == fleet.CacheBroken) {
+		o.ev.To, o.ev.Attempts = row.State, row.Attempts
+		f.events(ctx, o.ev)
+	}
+	return nil
+}
+
+// retryHeld tries the held outcome once more. When that fails too, or when an
+// earlier reset did, it gives the row back to wanted and drops the outcome, so
+// no row stays fetching because the database refused its settlement.
+func (f *Fetcher) retryHeld(ctx context.Context) (bool, error) {
+	h := f.held
+	var cause error
+	if !h.retried {
+		err := f.record(ctx, h.outcome)
+		switch {
+		case err == nil:
+			f.held = nil
+			return true, nil
+		case ctx.Err() != nil:
+			return true, ctx.Err()
+		}
+		h.retried, cause = true, err
+	}
+	if _, err := f.cfg.Repo.ResetFetching(ctx, f.now()); err != nil {
+		if ctx.Err() != nil {
+			return true, ctx.Err()
+		}
+		return true, errors.Join(cause, err)
+	}
+	f.held = nil
+	if cause == nil {
+		return true, nil
+	}
+	return true, fmt.Errorf("the outcome of %s/%s could not be stored twice and the row went back to wanted: %w", h.ev.Key.Entry, h.ev.Key.Arch, cause)
+}
+
+// fetchJob is the work on one claimed row.
+type fetchJob struct {
+	f     *Fetcher
+	row   fleet.CacheRow
+	entry catalog.Entry
+	root  *os.Root
+
+	// total is the pinned size of every object; done is the bytes of objects
+	// complete in their spool so far.
+	total, done int64
+	// downloaded is how many bytes this run received.
+	downloaded int64
+}
+
+func (j *fetchJob) close(ctx context.Context) {
+	if j.root != nil {
+		if err := j.root.Close(); err != nil {
+			j.f.onError(ctx, fmt.Errorf("close the spool dir: %w", err))
+		}
+	}
+}
+
+// run takes the row to the point where its files are in the store, tagged and
+// whole. It returns ctx's error, wrapped, when ctx ends it.
+func (j *fetchJob) run(ctx context.Context) error {
+	root, err := os.OpenRoot(j.f.cfg.SpoolDir)
+	if err != nil {
+		return fmt.Errorf("open the spool dir: %w", err)
+	}
+	j.root = root
+
+	e, ok := j.f.cfg.Catalog.Lookup(j.row.Entry, string(j.row.Arch))
+	if !ok || e.Pin.ID != j.row.Pin {
+		return fmt.Errorf("%s/%s is not in the catalog at this pin %q", j.row.Entry, j.row.Arch, j.row.Pin)
+	}
+	j.entry = e
+	if j.f.cfg.Store.CheckLayers(ctx, e.Tag()) == nil {
+		return nil
+	}
+
+	for _, o := range e.Pin.Objects {
+		j.total += o.Size
+	}
+	var layers []ocispec.Descriptor
+	for n := range e.Pin.Objects {
+		if err := j.download(ctx, n); err != nil {
+			return err
+		}
+		if err := j.verify(ctx, n); err != nil {
+			return err
+		}
+		l, err := j.extract(ctx, n)
+		if err != nil {
+			return err
+		}
+		layers = append(layers, l...)
+	}
+	if _, err := j.f.cfg.Store.TagArtifact(ctx, e.Tag(), catalog.ArtifactType, layers); err != nil {
+		return fmt.Errorf("tag %s: %w", e.Tag(), err)
+	}
+	if err := j.f.cfg.Store.CheckLayers(ctx, e.Tag()); err != nil {
+		return fmt.Errorf("check %s after tagging it: %w", e.Tag(), err)
+	}
+	return nil
+}
+
+// discard removes the pin's spool files and sidecars. It cannot fail the row,
+// so what it cannot remove goes to the error handler.
+func (j *fetchJob) discard(ctx context.Context) {
+	if j.root == nil {
+		return
+	}
+	var errs []error
+	for n := range j.entry.Pin.Objects {
+		for _, name := range []string{SpoolName(j.row.Pin, n), ETagName(j.row.Pin, n), ETagName(j.row.Pin, n) + ".tmp"} {
+			if err := j.root.Remove(name); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				errs = append(errs, err)
+			}
+		}
+	}
+	if err := errors.Join(errs...); err != nil {
+		j.f.onError(ctx, fmt.Errorf("remove the spool of %s/%s: %w", j.row.Entry, j.row.Arch, err))
+	}
+}
+
+// progress records that done of total bytes are in place. It is advisory: a
+// failure goes to the error handler and the fetch goes on.
+func (j *fetchJob) progress(ctx context.Context, done int64) {
+	err := j.f.cfg.Repo.RecordProgress(ctx, fleet.FetchProgress{Key: j.row.Key(), Pin: j.row.Pin, Done: done, Total: j.total, At: j.f.now()})
+	if err != nil && ctx.Err() == nil {
+		j.f.onError(ctx, err)
+	}
+}
+
+// download brings object n of the pin into its spool file in full.
+func (j *fetchJob) download(ctx context.Context, n int) error {
+	obj := j.entry.Pin.Objects[n]
+	have, etag, err := j.resumePoint(n, obj.Size)
+	if err != nil {
+		return err
+	}
+	if have == obj.Size {
+		j.done += obj.Size
+		j.progress(ctx, j.done)
+		return nil
+	}
+	if err := j.checkSpace(obj.Size); err != nil {
+		return err
+	}
+	return j.transfer(ctx, n, have, etag)
+}
+
+// resumePoint says how much of object n is already in its spool and under
+// which strong ETag. A spool longer than the pin, or one with no strong ETag
+// to resume under, is emptied.
+func (j *fetchJob) resumePoint(n int, size int64) (have int64, etag string, err error) {
+	spool := SpoolName(j.row.Pin, n)
+	fi, err := j.root.Stat(spool)
+	if errors.Is(err, fs.ErrNotExist) {
+		return 0, "", nil
+	}
+	if err != nil {
+		return 0, "", fmt.Errorf("stat the spool: %w", err)
+	}
+	have = fi.Size()
+	if have == size || have == 0 {
+		return have, "", nil
+	}
+	if have < size {
+		raw, err := j.root.ReadFile(ETagName(j.row.Pin, n))
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return 0, "", fmt.Errorf("read the ETag sidecar: %w", err)
+		}
+		if err == nil && strongETag(string(raw)) {
+			return have, string(raw), nil
+		}
+	}
+	return 0, "", j.reset(n)
+}
+
+// reset empties object n's spool and removes its sidecar.
+func (j *fetchJob) reset(n int) error {
+	f, err := j.root.OpenFile(SpoolName(j.row.Pin, n), os.O_WRONLY|os.O_TRUNC, spoolFileMode)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+	case err != nil:
+		return fmt.Errorf("empty the spool: %w", err)
+	default:
+		if err := f.Close(); err != nil {
+			return fmt.Errorf("empty the spool: %w", err)
+		}
+	}
+	return j.dropETag(n)
+}
+
+func (j *fetchJob) dropETag(n int) error {
+	if err := j.root.Remove(ETagName(j.row.Pin, n)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("remove the ETag sidecar: %w", err)
+	}
+	return nil
+}
+
+// keepETag stores etag as object n's sidecar when it is strong, atomically,
+// and removes the sidecar otherwise.
+func (j *fetchJob) keepETag(n int, etag string) error {
+	if !strongETag(etag) {
+		return j.dropETag(n)
+	}
+	name := ETagName(j.row.Pin, n)
+	tmp := name + ".tmp"
+	if err := j.root.WriteFile(tmp, []byte(etag), spoolFileMode); err != nil {
+		return errors.Join(fmt.Errorf("write the ETag sidecar: %w", err), j.root.Remove(tmp))
+	}
+	if err := j.root.Rename(tmp, name); err != nil {
+		return errors.Join(fmt.Errorf("replace the ETag sidecar: %w", err), j.root.Remove(tmp))
+	}
+	return nil
+}
+
+// checkSpace refuses a download the spool volume has no room for: twice the
+// object (the spool and its extracted copy) and a tenth of the volume.
+func (j *fetchJob) checkSpace(size int64) error {
+	free, total, err := j.f.statfs(j.f.cfg.SpoolDir)
+	if err != nil {
+		return fmt.Errorf("free space on the spool volume: %w", err)
+	}
+	need := 2*uint64(max(size, 0)) + total/10
+	if free < need {
+		return fmt.Errorf("free space on the spool volume is %d bytes, a %d byte object needs %d", free, size, need)
+	}
+	return nil
+}
+
+// transfer requests object n, from byte have under etag when etag is set, and
+// writes the body into the spool.
+func (j *fetchJob) transfer(ctx context.Context, n int, have int64, etag string) error {
+	obj := j.entry.Pin.Objects[n]
+	reqCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, obj.URL, http.NoBody)
+	if err != nil {
+		return fmt.Errorf("build the request for object %d: %w", n, redactURLError(err))
+	}
+	if etag != "" {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", have))
+		req.Header.Set("If-Range", etag)
+	}
+	resp, err := j.f.cfg.Client.Do(req)
+	if err != nil {
+		return fmt.Errorf("get object %d: %w", n, redactURLError(err))
+	}
+	defer resp.Body.Close() //nolint:errcheck // read-only
+
+	offset, err := j.accept(resp, n, have)
+	if err != nil {
+		return err
+	}
+	body := newIdleReader(resp.Body, j.f.idle, cancel)
+	defer body.Stop()
+	return j.write(ctx, body, n, offset)
+}
+
+// accept checks the response to object n's request against the pin and returns
+// the spool offset its body continues at. A 206 is checked in this order: the
+// Content-Range start, then its total, then the Content-Length.
+func (j *fetchJob) accept(resp *http.Response, n int, have int64) (int64, error) {
+	size := j.entry.Pin.Objects[n].Size
+	switch resp.StatusCode {
+	case http.StatusOK:
+		if resp.ContentLength >= 0 && resp.ContentLength != size {
+			return 0, integrityf("the upstream sent %d bytes for an object pinned at %d", resp.ContentLength, size)
+		}
+		return 0, j.keepETag(n, resp.Header.Get("ETag"))
+	case http.StatusPartialContent:
+		header := resp.Header.Get("Content-Range")
+		start, _, total, err := parseContentRange(header)
+		if err != nil || start != have {
+			return 0, errors.Join(fmt.Errorf("a 206 with Content-Range %q does not continue at byte %d", header, have), err, j.reset(n))
+		}
+		if total != size {
+			return 0, integrityf("Content-Range %q says the object is %d bytes, pinned at %d", header, total, size)
+		}
+		if resp.ContentLength >= 0 && resp.ContentLength != size-have {
+			return 0, integrityf("the upstream sent %d bytes for the %d the range asked for", resp.ContentLength, size-have)
+		}
+		return have, nil
+	default:
+		return 0, fmt.Errorf("the upstream answered %s", resp.Status)
+	}
+}
+
+// write copies body into object n's spool from offset, and records the
+// progress. Bytes past the pinned size are an integrity failure; a body that
+// ends short is not, and its spool is kept.
+func (j *fetchJob) write(ctx context.Context, body io.Reader, n int, offset int64) (err error) {
+	obj := j.entry.Pin.Objects[n]
+	flags := os.O_WRONLY | os.O_CREATE | os.O_APPEND
+	if offset == 0 {
+		flags = os.O_WRONLY | os.O_CREATE | os.O_TRUNC
+	}
+	file, err := j.root.OpenFile(SpoolName(j.row.Pin, n), flags, spoolFileMode)
+	if err != nil {
+		return fmt.Errorf("open the spool: %w", err)
+	}
+	defer func() { err = errors.Join(err, file.Close()) }()
+
+	want := obj.Size - offset
+	w := &spoolWriter{file: file, last: time.Now()}
+	w.tick = func() { j.progress(ctx, j.done+offset+w.n) }
+	// One byte past the end is enough to see an oversize body.
+	copied, err := io.Copy(w, io.LimitReader(body, want+1))
+	j.downloaded += w.n
+	j.f.bytes.Add(ctx, w.n)
+	switch {
+	case err != nil:
+		return fmt.Errorf("copy object %d: %w", n, err)
+	case copied > want:
+		return integrityf("the upstream sent more than the pinned %d bytes", obj.Size)
+	case copied < want:
+		return fmt.Errorf("the body of object %d ended at byte %d of %d", n, offset+copied, obj.Size)
+	}
+	j.done += obj.Size
+	j.progress(ctx, j.done)
+	return nil
+}
+
+// spoolWriter writes to a spool file and calls tick at most every
+// progressEvery.
+type spoolWriter struct {
+	file *os.File
+	n    int64
+	last time.Time
+	tick func()
+}
+
+func (s *spoolWriter) Write(p []byte) (int, error) {
+	n, err := s.file.Write(p)
+	s.n += int64(n)
+	if time.Since(s.last) >= progressEvery {
+		s.last = time.Now()
+		s.tick()
+	}
+	return n, err
+}
+
+// verify checks that object n's whole spool is the pinned size and sha256.
+func (j *fetchJob) verify(ctx context.Context, n int) error {
+	obj := j.entry.Pin.Objects[n]
+	f, err := j.root.Open(SpoolName(j.row.Pin, n))
+	if err != nil {
+		return fmt.Errorf("open the spool: %w", err)
+	}
+	defer f.Close() //nolint:errcheck // read-only
+
+	h := sha256.New()
+	size, err := io.Copy(h, ctxReader{r: f, err: ctx.Err})
+	if err != nil {
+		return fmt.Errorf("hash the spool: %w", err)
+	}
+	if size != obj.Size {
+		return integrityf("the spool holds %d bytes, the pin says %d", size, obj.Size)
+	}
+	if got := hex.EncodeToString(h.Sum(nil)); got != obj.SHA256 {
+		return integrityf("the object's sha256 is %s, the pin says %s", got, obj.SHA256)
+	}
+	return nil
+}
+
+// extract pushes each pinned file of object n from its spool into the store
+// and returns their layers. A file that is not what the pin says, or a member
+// the extractor refuses, is an integrity failure; a failing disk is not.
+func (j *fetchJob) extract(ctx context.Context, n int) ([]ocispec.Descriptor, error) {
+	pin := j.entry.Pin.Objects[n]
+	container := j.entry.Objects[n].Container
+	f, err := j.root.Open(SpoolName(j.row.Pin, n))
+	if err != nil {
+		return nil, fmt.Errorf("open the spool: %w", err)
+	}
+	defer f.Close() //nolint:errcheck // read-only
+
+	layers := make([]ocispec.Descriptor, 0, len(pin.Files))
+	for _, fp := range pin.Files {
+		desc, err := store.Layer(fp.Path, fp.Size, fp.SHA256)
+		if err != nil {
+			return nil, err
+		}
+		member, declared, err := OpenMember(container, f, pin.Size, fp.Path)
+		if err != nil {
+			return nil, extractionError(err)
+		}
+		if declared != fp.Size {
+			return nil, integrityf("%s is %d bytes in the object, the pin says %d", fp.Path, declared, fp.Size)
+		}
+		src := ctxReader{r: io.LimitReader(member, fp.Size), err: ctx.Err}
+		if err := j.f.cfg.Store.PushBlob(ctx, desc, src); err != nil {
+			return nil, extractionError(fmt.Errorf("store %s: %w", fp.Path, err))
+		}
+		layers = append(layers, desc)
+	}
+	return layers, nil
+}
+
+// ctxReader fails every read once its context is done. It holds the context's
+// Err method, not the context.
+type ctxReader struct {
+	r   io.Reader
+	err func() error
+}
+
+func (c ctxReader) Read(p []byte) (int, error) {
+	if err := c.err(); err != nil {
+		return 0, err
+	}
+	return c.r.Read(p)
+}
+
+// idleReader cancels a request when no read makes progress for idle. Every
+// read that returns data restarts the wait; the request's own context is
+// cancelled, so a Read blocked on the network returns.
+type idleReader struct {
+	r     io.Reader
+	timer *time.Timer
+	idle  time.Duration
+	fired atomic.Bool
+}
+
+// newIdleReader wraps r and starts its idle timer. The caller stops it with
+// Stop on every return path.
+func newIdleReader(r io.Reader, idle time.Duration, cancel context.CancelCauseFunc) *idleReader {
+	i := &idleReader{r: r, idle: idle}
+	i.timer = time.AfterFunc(idle, func() {
+		i.fired.Store(true)
+		cancel(errIdle)
+	})
+	return i
+}
+
+// Read implements io.Reader.
+func (i *idleReader) Read(p []byte) (int, error) {
+	n, err := i.r.Read(p)
+	if n > 0 {
+		i.timer.Reset(i.idle)
+	}
+	if err != nil && i.fired.Load() {
+		err = fmt.Errorf("%w for %s", errIdle, i.idle)
+	}
+	return n, err
+}
+
+// Stop ends the idle timer.
+func (i *idleReader) Stop() { i.timer.Stop() }
+
+// integrityf returns an *IntegrityError for a failure the retry cannot fix.
+func integrityf(format string, args ...any) error {
+	return &IntegrityError{Err: fmt.Errorf(format, args...)}
+}
+
+// extractionError classes a failure to open a member or store its file:
+// integrity, unless a *fs.PathError says the local disk failed.
+func extractionError(err error) error {
+	if _, ok := errors.AsType[*fs.PathError](err); ok { //nolint:errcheck // the match target is not a dropped error; modernize requires AsType over errors.As
+		return err
+	}
+	return &IntegrityError{Err: err}
+}
+
+// classOf is the FetchEvent class of a failure.
+func classOf(err error) string {
+	if _, ok := errors.AsType[*IntegrityError](err); ok { //nolint:errcheck // the match target is not a dropped error; modernize requires AsType over errors.As
+		return classIntegrity
+	}
+	return classOther
+}
+
+// redactURLError returns err with the URL of any *url.Error in its chain
+// stripped of userinfo, query and fragment, since a mirror's redirect target
+// often carries a signed token. An unparsable URL becomes "<unparsable>". The
+// cause is kept, so errors.AsType[*IntegrityError] still finds it. err is
+// returned as it is when no *url.Error is in its chain.
+func redactURLError(err error) error {
+	ue, ok := errors.AsType[*url.Error](err)
+	if !ok {
+		return err
+	}
+	redacted := "<unparsable>"
+	if u, perr := url.Parse(ue.URL); perr == nil {
+		u.User, u.RawQuery, u.ForceQuery, u.Fragment, u.RawFragment = nil, "", false, "", ""
+		redacted = u.String()
+	}
+	return &url.Error{Op: ue.Op, URL: redacted, Err: ue.Err}
+}
