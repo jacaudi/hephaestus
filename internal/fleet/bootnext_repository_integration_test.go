@@ -16,6 +16,9 @@ func TestBootNextRepository_Postgres(t *testing.T) {
 // Postgres hands timestamptz back in the process's local zone; every read puts
 // boot_next_set_at in UTC, as it does created_at and last_seen_at.
 func TestBootNextSetAtReadInUTC_Postgres(t *testing.T) {
+	if time.Local == time.UTC {
+		t.Skip("process zone is UTC; normalisation cannot be observed")
+	}
 	t0 := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
 	r := NewRepository(dbtest.Postgres(t))
 	m := bootNextMachine(t, r, 1, t0)

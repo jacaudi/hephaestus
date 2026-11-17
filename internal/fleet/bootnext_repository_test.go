@@ -161,11 +161,31 @@ func runConcurrentSetAndServe(t *testing.T, pair func(testing.TB) (*db.DB, *db.D
 	if n := bootEvents(t, serveDB, m.ID, 3); n != len(served) {
 		t.Fatalf("%d row-3 boot events for %d served flags", n, len(served))
 	}
-	if n := len(auditsOf(t, serveDB, "boot_next.set")); n != rounds {
-		t.Fatalf("%d boot_next.set audits, want %d", n, rounds)
+	sets := auditsOf(t, serveDB, actionBootNextSet)
+	if len(sets) != rounds {
+		t.Fatalf("%d boot_next.set audits, want %d", len(sets), rounds)
+	}
+	// A flag served before the next set found nothing to replace. A clear that
+	// compared the entry alone would clear the newer flag, and this fails.
+	replaced := make(map[string]string, len(sets))
+	for _, a := range sets {
+		var d setDetail
+		if err := json.Unmarshal([]byte(a.Detail), &d); err != nil {
+			t.Fatalf("audit detail %q: %v", a.Detail, err)
+		}
+		replaced[d.SetAt] = d.Replaced
+	}
+	for i := range rounds - 1 {
+		next := at(i + 1).Format(time.RFC3339Nano)
+		if got, ok := replaced[next]; seen[at(i).Format(time.RFC3339Nano)] && (!ok || got != "") {
+			t.Fatalf("flag %d was served, but set %d replaced %q (found: %v); want it to find the flag cleared", i, i+1, got, ok)
+		}
 	}
 	if final := mustGet(t, serve, m.ID); final.BootNext != "" && !final.BootNextSetAt.Equal(at(rounds-1)) {
 		t.Fatalf("final flag set at %v, want the last set, at %v", final.BootNextSetAt, at(rounds-1))
+	}
+	if lostOnce == 0 {
+		t.Fatal("no clear lost a race: the CLI and serve no longer contend, so the test proves nothing")
 	}
 	t.Logf("served %d of %d flags; %d clears lost once, %d twice (serve falls through)", len(served), rounds, lostOnce, lostTwice)
 }
@@ -365,6 +385,28 @@ func runBootNextSuite(t *testing.T, open func(testing.TB) *db.DB, pair func(test
 		got, err := r.ResolveMachine(t.Context(), macN(0xa))
 		if err != nil || got.ID != a.ID {
 			t.Fatalf("ResolveMachine(%s) = %+v, %v; want machine %s", macN(0xa), got, err, a.ID)
+		}
+	})
+
+	t.Run("ResolveAmbiguousMultiNIC", func(t *testing.T) {
+		r := NewRepository(open(t))
+		firstContact(t, r, Identity{UUID: zeroUUID, MAC: macN(0xa)}, t0)
+		b := firstContact(t, r, Identity{UUID: zeroUUID, MAC: macN(0xb)}, t0)
+		rec := bootOf(b, 7, "hold", t0.Add(time.Minute))
+		rec.Identity.MAC = macN(0xc)
+		knownBoot(t, r, rec)
+
+		_, err := r.ResolveMachine(t.Context(), zeroUUID)
+		amb, ok := errors.AsType[*AmbiguousError](err)
+		if !ok {
+			t.Fatalf("ResolveMachine(%s) error = %v, want *AmbiguousError", zeroUUID, err)
+		}
+		if want := []string{macN(0xa), macN(0xb), macN(0xc)}; amb.Machines != 2 || !slices.Equal(amb.MACs, want) {
+			t.Fatalf("Machines = %d, MACs = %v; want 2 machines, MACs %v", amb.Machines, amb.MACs, want)
+		}
+		const want = "00000000-0000-0000-0000-000000000000 matches 2 machines; name one by MAC: aa:bb:cc:00:00:0a, aa:bb:cc:00:00:0b, aa:bb:cc:00:00:0c"
+		if err.Error() != want {
+			t.Fatalf("error = %q, want %q", err.Error(), want)
 		}
 	})
 

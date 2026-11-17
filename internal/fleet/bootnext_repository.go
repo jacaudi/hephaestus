@@ -16,17 +16,17 @@ const (
 )
 
 // AmbiguousError is returned by ResolveMachine when a UUID names more than one
-// machine, as a junk-pattern UUID does: MACs are every MAC of those machines,
-// sorted, for the admin to name one by.
+// machine, as a junk-pattern UUID does: Machines is how many, and MACs are
+// every MAC of those machines, sorted, for the admin to name one by.
 type AmbiguousError struct {
-	Ref  string
-	MACs []string
+	Ref      string
+	Machines int
+	MACs     []string
 }
 
-// Error formats as "<ref> matches <n> machines; name one by MAC: <MACs>". It
-// counts the MACs for the machines, which agree while a machine has one MAC.
+// Error formats as "<ref> matches <n> machines; name one by MAC: <MACs>".
 func (e *AmbiguousError) Error() string {
-	return fmt.Sprintf("%s matches %d machines; name one by MAC: %s", e.Ref, len(e.MACs), strings.Join(e.MACs, ", "))
+	return fmt.Sprintf("%s matches %d machines; name one by MAC: %s", e.Ref, e.Machines, strings.Join(e.MACs, ", "))
 }
 
 // setDetail is the detail of a boot_next.set audit event; Replaced is the entry
@@ -89,13 +89,13 @@ func (r *Repository) ResolveMachine(ctx context.Context, ref string) (Machine, e
 		return cands[0], nil
 	}
 	slices.Sort(macs)
-	return Machine{}, &AmbiguousError{Ref: ref, MACs: macs}
+	return Machine{}, &AmbiguousError{Ref: ref, Machines: len(cands), MACs: macs}
 }
 
 // SetBootNext arms the machine's boot-next with req.Entry at req.At, replacing
 // any flag, and audits boot_next.set by actor "cli" with the entry it replaced.
 // In the same transaction it asks for the entry's content for the machine's
-// architecture at priority 1, re-arming a failed or broken row.
+// architecture at priority 1, re-arming a failed or broken row at req.Pin.
 func (r *Repository) SetBootNext(ctx context.Context, req SetBootNextRequest) (SetBootNextResult, error) {
 	var out SetBootNextResult
 	err := r.bdb.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
@@ -151,7 +151,7 @@ func (r *Repository) ClearBootNext(ctx context.Context, req ClearBootNextRequest
 		return err
 	})
 	if err != nil {
-		return false, fmt.Errorf("fleet: clear boot-next: %w", err)
+		return false, fmt.Errorf("fleet: clear boot-next of %s: %w", req.MachineID, err)
 	}
 	return cleared, nil
 }

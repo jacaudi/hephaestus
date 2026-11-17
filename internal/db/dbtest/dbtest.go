@@ -39,7 +39,7 @@ var postgresAddr string //nolint:gochecknoglobals // process-wide test container
 // closes it when the test ends.
 func SQLite(tb testing.TB) *db.DB {
 	tb.Helper()
-	return openMigrated(tb, sqliteURL(tb))
+	return openMigrated(tb, "sqlite", sqliteURL(tb))
 }
 
 // SQLitePair opens two handles on one migrated SQLite file under tb.TempDir,
@@ -48,8 +48,8 @@ func SQLite(tb testing.TB) *db.DB {
 func SQLitePair(tb testing.TB) (serve, cli *db.DB) {
 	tb.Helper()
 	url := sqliteURL(tb)
-	serve = openMigrated(tb, url)
-	return serve, open(tb, url)
+	serve = openMigrated(tb, "sqlite", url)
+	return serve, open(tb, "sqlite", url)
 }
 
 func sqliteURL(tb testing.TB) secret.Secret {
@@ -57,23 +57,24 @@ func sqliteURL(tb testing.TB) secret.Secret {
 	return secret.Secret("sqlite:" + tb.TempDir() + "/test.db")
 }
 
-// open connects to url and closes the handle when the test ends.
-func open(tb testing.TB, url secret.Secret) *db.DB {
+// open connects to url and closes the handle when the test ends. label names
+// the database in failures; the URL never appears in them, as it holds a secret.
+func open(tb testing.TB, label string, url secret.Secret) *db.DB {
 	tb.Helper()
 	d, err := db.Open(tb.Context(), url)
 	if err != nil {
-		tb.Fatalf("dbtest: open: %v", err)
+		tb.Fatalf("dbtest: open %s: %v", label, err)
 	}
 	tb.Cleanup(func() { closeDB(tb, d) })
 	return d
 }
 
 // openMigrated is open followed by Migrate.
-func openMigrated(tb testing.TB, url secret.Secret) *db.DB {
+func openMigrated(tb testing.TB, label string, url secret.Secret) *db.DB {
 	tb.Helper()
-	d := open(tb, url)
+	d := open(tb, label, url)
 	if err := d.Migrate(tb.Context()); err != nil {
-		tb.Fatalf("dbtest: migrate: %v", err)
+		tb.Fatalf("dbtest: migrate %s: %v", label, err)
 	}
 	return d
 }
@@ -144,21 +145,22 @@ func postgresURL(addr, name string) secret.Secret {
 // RunWithPostgres started and drops it when the test ends.
 func Postgres(tb testing.TB) *db.DB {
 	tb.Helper()
-	return openMigrated(tb, createPostgres(tb))
+	name, url := createPostgres(tb)
+	return openMigrated(tb, name, url)
 }
 
 // PostgresPair is Postgres with a second handle on the same database: serve's
 // and the CLI's.
 func PostgresPair(tb testing.TB) (serve, cli *db.DB) {
 	tb.Helper()
-	url := createPostgres(tb)
-	serve = openMigrated(tb, url)
-	return serve, open(tb, url)
+	name, url := createPostgres(tb)
+	serve = openMigrated(tb, name, url)
+	return serve, open(tb, name, url)
 }
 
 // createPostgres creates an empty database in the RunWithPostgres container,
-// drops it when the test ends, and returns its URL.
-func createPostgres(tb testing.TB) secret.Secret {
+// drops it when the test ends, and returns its name and URL.
+func createPostgres(tb testing.TB) (string, secret.Secret) {
 	tb.Helper()
 	if postgresAddr == "" {
 		tb.Fatal("dbtest: Postgres needs TestMain to call dbtest.RunWithPostgres")
@@ -183,7 +185,7 @@ func createPostgres(tb testing.TB) secret.Secret {
 			tb.Errorf("dbtest: drop database %s: %v", name, err)
 		}
 	})
-	return postgresURL(postgresAddr, name)
+	return name, postgresURL(postgresAddr, name)
 }
 
 func closeDB(tb testing.TB, d *db.DB) {
