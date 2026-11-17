@@ -44,7 +44,7 @@ func (s bootNextSet) text() string {
 	}
 	fmt.Fprintf(&b, "%s\nentry: %s\narch: %s\nexpires: %s\nutility: %s\n", machine, s.Entry, s.Arch, s.ExpiresAt, s.State)
 	if s.PreviousError != "" {
-		fmt.Fprintf(&b, "previous error: %s\n", s.PreviousError)
+		fmt.Fprintf(&b, "previous error: %s\n", safeText(s.PreviousError))
 	}
 	return b.String()
 }
@@ -118,7 +118,7 @@ or broken. A failed or broken utility is re-armed, and the error it had is shown
 					MachineID: m.ID, MACs: m.MACs, Entry: e.Entry, Arch: string(m.Arch),
 					SetAt:         formatTime(res.Machine.BootNextSetAt),
 					ExpiresAt:     formatTime(res.Machine.BootNextSetAt.Add(boot.BootNextTTL)),
-					State:         string(res.Fetch.Row.State),
+					State:         stateAtPin(res.Fetch.Row, e.Pin.ID),
 					PreviousError: res.Fetch.PreviousError,
 					Warning:       e.Warning,
 				}

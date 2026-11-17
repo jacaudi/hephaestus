@@ -1,9 +1,12 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -81,39 +84,61 @@ names. A failed or broken fetch is re-armed, and the error it had is shown.`,
 				if arch != "" {
 					arches = []string{arch}
 				}
-				var rows []utilityFetch
+				entries := make([]catalog.Entry, 0, len(arches))
 				for _, a := range arches {
 					e, err := entryFor(cat, entry, fleet.Arch(a))
 					if err != nil {
 						return err
 					}
-					key := fleet.CacheKey{Entry: entry, Arch: fleet.Arch(a)}
-					req, err := repo.RequestFetch(cmd.Context(), key, e.Pin.ID, 0, deps.now())
-					if err != nil {
-						return err
-					}
-					rows = append(rows, utilityFetch{
-						Entry: entry, Arch: a, Pin: e.Pin.ID,
-						State: stateAtPin(req.Row, e.Pin.ID), PreviousError: req.PreviousError,
-					})
+					entries = append(entries, e)
+				}
+				// Rows requested before a failure are still printed, so the admin knows what stuck.
+				rows, reqErr := requestFetches(cmd.Context(), repo, entries, deps.now)
+				if len(rows) == 0 {
+					return reqErr
 				}
 				if asJSON {
-					return writeJSON(cmd, rows)
+					return errors.Join(writeJSON(cmd, rows), reqErr)
 				}
-				var b strings.Builder
-				for _, r := range rows {
-					fmt.Fprintf(&b, "%s/%s: %s\n", r.Entry, r.Arch, r.State)
-					if r.PreviousError != "" {
-						fmt.Fprintf(&b, "  previous error: %s\n", r.PreviousError)
-					}
-				}
-				return writeText(cmd, b.String())
+				return errors.Join(writeText(cmd, fetchText(rows)), reqErr)
 			})
 		},
 	}
 	cmd.Flags().BoolVar(&asJSON, "json", false, "print the result as JSON")
 	cmd.Flags().StringVar(&arch, "arch", "", "architecture to fetch, amd64 or arm64 (default: every build of the entry)")
 	return cmd
+}
+
+// requestFetches asks for each of entries, in order, and returns the rows it
+// requested, up to the first failure.
+func requestFetches(ctx context.Context, repo *fleet.Repository, entries []catalog.Entry, now func() time.Time) ([]utilityFetch, error) {
+	var rows []utilityFetch
+	for i := range entries {
+		e := &entries[i]
+		key := fleet.CacheKey{Entry: e.Entry, Arch: fleet.Arch(e.Arch)}
+		req, err := repo.RequestFetch(ctx, key, e.Pin.ID, 0, now())
+		if err != nil {
+			return rows, err
+		}
+		rows = append(rows, utilityFetch{
+			Entry: e.Entry, Arch: e.Arch, Pin: e.Pin.ID,
+			State: stateAtPin(req.Row, e.Pin.ID), PreviousError: req.PreviousError,
+		})
+	}
+	return rows, nil
+}
+
+// fetchText is rows as "utility fetch" prints them.
+func fetchText(rows []utilityFetch) string {
+	var b strings.Builder
+	for i := range rows {
+		r := &rows[i]
+		fmt.Fprintf(&b, "%s/%s: %s\n", r.Entry, r.Arch, r.State)
+		if r.PreviousError != "" {
+			fmt.Fprintf(&b, "  previous error: %s\n", safeText(r.PreviousError))
+		}
+	}
+	return b.String()
 }
 
 func newUtilityListCmd(deps cliDeps) *cobra.Command {
@@ -174,8 +199,8 @@ func writeUtilityRows(cmd *cobra.Command, rows []utilityRow) error {
 		r := &rows[i]
 		table = append(table, []string{
 			r.Entry, r.Arch, r.Version, strings.Join(r.Platforms, ","), r.State,
-			fmt.Sprintf("%d/%d", r.BytesDone, r.BytesTotal), r.LastError, r.UpdatedAt,
-			strconv.FormatBool(r.TOFU), strconv.FormatInt(r.MinRAMBytes/bytesPerMiB, 10),
+			fmt.Sprintf("%d/%d", r.BytesDone, r.BytesTotal), safeText(r.LastError), r.UpdatedAt,
+			strconv.FormatBool(r.TOFU), strconv.FormatInt((r.MinRAMBytes+bytesPerMiB-1)/bytesPerMiB, 10),
 		})
 	}
 	header := []string{"ENTRY", "ARCH", "VERSION", "PLATFORMS", "STATE", "PROGRESS", "LAST_ERROR", "UPDATED", "TOFU", "MIN_RAM_MIB"}

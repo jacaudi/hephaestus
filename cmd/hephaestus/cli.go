@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/spf13/cobra"
 
@@ -182,4 +185,27 @@ func writeTable(cmd *cobra.Command, header []string, rows [][]string) error {
 		}
 	}
 	return tw.Flush()
+}
+
+// safeText is s with every rune that is not graphic written as a Go escape
+// (for example \x1b or \t), so text from upstream cannot drive the admin's terminal:
+// an escape sequence could erase a warning printed above it, a tab or newline
+// could break a table. Quotes and backslashes are left as they are. JSON output
+// needs none of this: encoding/json escapes control characters already.
+func safeText(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		switch {
+		case r == utf8.RuneError && size == 1:
+			fmt.Fprintf(&b, `\x%02x`, s[i])
+		case unicode.IsGraphic(r):
+			b.WriteRune(r)
+		default:
+			q := strconv.QuoteToGraphic(string(r))
+			b.WriteString(q[1 : len(q)-1])
+		}
+		i += size
+	}
+	return b.String()
 }

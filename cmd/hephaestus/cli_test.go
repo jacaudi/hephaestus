@@ -16,6 +16,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/spf13/cobra"
+
 	"go.jacaudi.dev/hephaestus/internal/boot"
 	"go.jacaudi.dev/hephaestus/internal/catalog"
 	"go.jacaudi.dev/hephaestus/internal/db"
@@ -871,6 +873,165 @@ func TestCLI_GroupsRejectStrayArguments(t *testing.T) {
 		_, err := c.run(t, args...)
 		if err == nil || exitCode(err) != 2 {
 			t.Errorf("hephaestus %s: error = %v, exit %d; want a usage error, exit 2", strings.Join(args, " "), err, exitCode(err))
+		}
+	}
+}
+
+func TestBootNextSet_RowAtAnotherPinIsStale(t *testing.T) {
+	c := newCLITest(t)
+	c.machine(t, 1, fleet.ArchAMD64)
+	// A ready row for an older pin: RequestFetch leaves it alone, and boot row 3
+	// would not serve it, so set must not call the utility ready.
+	key := fleet.CacheKey{Entry: "tshell", Arch: fleet.ArchAMD64}
+	if _, err := c.repo.RequestFetch(t.Context(), key, "oldpin", 0, cliT0); err != nil {
+		t.Fatalf("RequestFetch: %v", err)
+	}
+	if moved, err := c.repo.RestoreReady(t.Context(), key, "oldpin", cliT0); err != nil || !moved {
+		t.Fatalf("RestoreReady = %v, %v; want the old-pin row ready", moved, err)
+	}
+
+	if out := c.mustRun(t, "boot-next", "set", cliMAC(1), "tshell"); !strings.Contains(out, "utility: stale_pin\n") {
+		t.Errorf("text output lacks %q:\n%s", "utility: stale_pin", out)
+	}
+	if got := jsonObject(t, c.mustRun(t, "boot-next", "set", cliMAC(1), "tshell", "--json"))["state"]; got != "stale_pin" {
+		t.Errorf("state = %v, want stale_pin", got)
+	}
+}
+
+// hostileCause carries what a hostile mirror could put in an HTTP reason phrase:
+// a screen clear and a tab.
+const hostileCause = "the upstream answered 200 \x1b[2J\x1b[1;1H\tdone"
+
+func TestCLI_TextEscapesUpstreamErrors(t *testing.T) {
+	const escaped = `the upstream answered 200 \x1b[2J\x1b[1;1H\tdone`
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{"boot-next set", []string{"boot-next", "set", cliMAC(1), "tshell"}},
+		{"utility fetch", []string{"utility", "fetch", "tshell", "--arch", "amd64"}},
+		{"utility list", []string{"utility", "list"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := newCLITest(t)
+			c.machine(t, 1, fleet.ArchAMD64)
+			c.breakRow(t, "tshell", fleet.ArchAMD64, hostileCause)
+
+			out := c.mustRun(t, tt.args...)
+
+			if strings.ContainsAny(out, "\x1b\t") {
+				t.Errorf("output holds a raw ESC or TAB:\n%q", out)
+			}
+			if !strings.Contains(out, escaped) {
+				t.Errorf("output lacks the escaped error %q:\n%s", escaped, out)
+			}
+		})
+	}
+
+	t.Run("JSON keeps the bytes", func(t *testing.T) {
+		c := newCLITest(t)
+		c.machine(t, 1, fleet.ArchAMD64)
+		c.breakRow(t, "tshell", fleet.ArchAMD64, hostileCause)
+		got := jsonObject(t, c.mustRun(t, "boot-next", "set", cliMAC(1), "tshell", "--json"))["previous_error"]
+		if got != hostileCause {
+			t.Errorf("previous_error = %q, want %q", got, hostileCause)
+		}
+	})
+}
+
+func TestSafeText(t *testing.T) {
+	tests := []struct{ name, in, want string }{
+		{"plain", "the upstream answered 404 Not Found", "the upstream answered 404 Not Found"},
+		{"quotes and backslash kept", `open "a\b"`, `open "a\b"`},
+		{"unicode kept", "héllo 世界", "héllo 世界"},
+		{"escape and tab", "a\x1b[2J\tb", `a\x1b[2J\tb`},
+		{"newline and carriage return", "a\r\nb", `a\r\nb`},
+		{"invalid UTF-8", "a\xffb", `a\xffb`},
+		{"bidi override", "a\u202eb", `a\u202eb`},
+		{"empty", "", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := safeText(tt.in); got != tt.want {
+				t.Errorf("safeText(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestUtilityFetch_PartialFailurePrintsTheRowsRequested(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		args []string
+		want func(t *testing.T, out string)
+	}{
+		{"text", []string{"utility", "fetch", "tlive"}, func(t *testing.T, out string) {
+			t.Helper()
+			if !strings.Contains(out, "tlive/amd64: wanted\n") || strings.Contains(out, "arm64") {
+				t.Errorf("output = %q, want the amd64 row and no arm64 row", out)
+			}
+		}},
+		{"JSON", []string{"utility", "fetch", "tlive", "--json"}, func(t *testing.T, out string) {
+			t.Helper()
+			if rows := jsonRows(t, out); len(rows) != 1 || rows[0]["arch"] != "amd64" {
+				t.Errorf("rows = %v, want the amd64 row only", rows)
+			}
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			c := newCLITest(t)
+			// The CLI reads its clock once per request: the second request, for
+			// arm64, finds its table gone.
+			calls := 0
+			c.onNow = func() {
+				calls++
+				if calls == 2 {
+					if _, err := c.d.Bun().ExecContext(t.Context(), "DROP TABLE utility_cache"); err != nil {
+						t.Errorf("drop utility_cache: %v", err)
+					}
+				}
+			}
+
+			out, err := c.run(t, tt.args...)
+
+			if err == nil || exitCode(err) != 1 {
+				t.Fatalf("error = %v, exit %d; want a failure with exit 1", err, exitCode(err))
+			}
+			tt.want(t, out)
+		})
+	}
+}
+
+func TestUtilityList_MinRAMRoundsUpToMiB(t *testing.T) {
+	var out bytes.Buffer
+	cmd := &cobra.Command{}
+	cmd.SetOut(&out)
+
+	if err := writeUtilityRows(cmd, []utilityRow{{Entry: "e", MinRAMBytes: 1<<20 + 1}}); err != nil {
+		t.Fatalf("writeUtilityRows: %v", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if fields := strings.Fields(lines[len(lines)-1]); fields[len(fields)-1] != "2" {
+		t.Errorf("row %q: minimum RAM for 1 MiB + 1 byte, want 2 MiB, the least that holds it", lines[len(lines)-1])
+	}
+}
+
+func TestUtilityList_SignedEntryIsNotTOFU(t *testing.T) {
+	c := newCLITest(t)
+	c.useCatalog(derive(t, testCatalog(t), func(s *catalog.Spec) bool {
+		if s.Entry == "tshell" {
+			s.Objects[0].Signature = catalog.Signature{SigURL: "https://upstream.invalid/tshell.zip.asc", Key: "tshell.asc"}
+		}
+		return true
+	}))
+
+	rows := jsonRows(t, c.mustRun(t, "utility", "list", "--json"))
+
+	for _, row := range rows {
+		if want := row["entry"] == "tlive"; row["tofu"] != want {
+			t.Errorf("%v/%v: tofu = %v, want %v", row["entry"], row["arch"], row["tofu"], want)
 		}
 	}
 }
