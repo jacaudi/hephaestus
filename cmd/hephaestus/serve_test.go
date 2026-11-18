@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"log/slog"
@@ -26,6 +27,7 @@ import (
 
 	"go.uber.org/goleak"
 
+	"go.jacaudi.dev/hephaestus/internal/boot"
 	"go.jacaudi.dev/hephaestus/internal/catalog"
 	"go.jacaudi.dev/hephaestus/internal/catalog/catalogtest"
 	"go.jacaudi.dev/hephaestus/internal/db"
@@ -1202,5 +1204,33 @@ func TestRunServe_GarbageCollectionFailureDoesNotStopServe(t *testing.T) {
 	}
 	if collected := logRecords(logs.Bytes(), "utility garbage collected"); len(collected) != 0 {
 		t.Errorf("%d \"utility garbage collected\" lines after a failure, want none", len(collected))
+	}
+}
+
+// TestBootErrorHandler_Level pins that a lost race with the CLI, which is
+// expected now and then, logs at Warn, and every other boot error, lost
+// content included, at Error.
+func TestBootErrorHandler_Level(t *testing.T) {
+	tests := []struct {
+		name  string
+		err   error
+		level string
+	}{
+		{name: "boot-next race", err: boot.ErrBootNextRace, level: "WARN"},
+		{name: "wrapped boot-next race", err: fmt.Errorf("decide: %w", boot.ErrBootNextRace), level: "WARN"},
+		{name: "lost content", err: boot.ErrUtilityMissing, level: "ERROR"},
+		{name: "any other error", err: errors.New("disk on fire"), level: "ERROR"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var logs bytes.Buffer
+
+			bootErrorHandler(slog.New(slog.NewJSONHandler(&logs, nil)))(t.Context(), tt.err)
+
+			got := logRecords(logs.Bytes(), "boot error")
+			if len(got) != 1 || got[0]["level"] != tt.level {
+				t.Errorf("records = %v, want one \"boot error\" at %s", got, tt.level)
+			}
+		})
 	}
 }

@@ -283,14 +283,7 @@ func runServe(ctx context.Context, cfg serveConfig, logger *slog.Logger, deps se
 	handlers, err := boot.NewHandlers(boot.Config{
 		Repo: repo, Store: content, Catalog: deps.catalog,
 		FQDN: cfg.FQDN, Address: cfg.Address, Subnet: cfg.Subnet, Files: deps.files,
-	}, boot.WithMeter(metrics.Meter()), boot.WithErrorHandler(func(ctx context.Context, err error) {
-		// A lost race with the CLI is expected now and then; lost content is not.
-		level := slog.LevelError
-		if errors.Is(err, boot.ErrBootNextRace) {
-			level = slog.LevelWarn
-		}
-		logger.Log(ctx, level, "boot error", "error", err)
-	}))
+	}, boot.WithMeter(metrics.Meter()), boot.WithErrorHandler(bootErrorHandler(logger)))
 	if err != nil {
 		return err
 	}
@@ -340,6 +333,18 @@ func runServe(ctx context.Context, cfg serveConfig, logger *slog.Logger, deps se
 		}
 	}
 	return p.run(ctx)
+}
+
+// bootErrorHandler logs what boot reports. A lost race with the CLI is expected
+// now and then, so it is a Warn; lost content is not, nor is anything else.
+func bootErrorHandler(logger *slog.Logger) func(context.Context, error) {
+	return func(ctx context.Context, err error) {
+		level := slog.LevelError
+		if errors.Is(err, boot.ErrBootNextRace) {
+			level = slog.LevelWarn
+		}
+		logger.Log(ctx, level, "boot error", "error", err)
+	}
 }
 
 // prepareUtility runs design section 5.7's steps 2 to 5: it reconciles the
