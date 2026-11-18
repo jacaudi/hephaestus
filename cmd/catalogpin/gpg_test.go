@@ -30,6 +30,8 @@ var validSigCases = []struct {
 	{"VALIDSIG without the primary field", "[GNUPG:] VALIDSIG 62989046EB5C7E985ECDF5DD3B0FEA9BE13CA3C9\n", "", false},
 	{"VALIDSIG whose last field is not a fingerprint", "[GNUPG:] VALIDSIG 62989046EB5C7E985ECDF5DD3B0FEA9BE13CA3C9 2026-11-01 1793404800 0 4 0 1 10 00\n", "", false},
 	{"a VALIDSIG text that is not a status line", "VALIDSIG " + primaryA + "\n", "", false},
+	{"a detached signature carries no data of its own: PLAINTEXT", "[GNUPG:] PLAINTEXT 62 1793404800 x\n" + validSig + "\n", "", false},
+	{"a detached signature carries no data of its own: PLAINTEXT_LENGTH", validSig + "\n[GNUPG:] PLAINTEXT_LENGTH 5\n", "", false},
 }
 
 func TestParseValidSig(t *testing.T) {

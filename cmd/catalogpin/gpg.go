@@ -45,8 +45,10 @@ func isFingerprint(s string) bool {
 
 // parseValidSig returns the primary-key fingerprint of the first VALIDSIG
 // line of gpg's status output, which is its last field. It returns false when
-// there is none, and when EXPKEYSIG, REVKEYSIG or BADSIG appears anywhere:
-// gpg exits 0 for a signature by an expired key.
+// there is none, when EXPKEYSIG, REVKEYSIG or BADSIG appears anywhere (gpg exits
+// 0 for a signature by an expired key), and when PLAINTEXT or PLAINTEXT_LENGTH
+// does: a detached signature carries no data of its own, so the status of one
+// that did is not a verdict on the data file.
 func parseValidSig(status []byte) (string, bool) {
 	primary := ""
 	for line := range strings.Lines(string(status)) {
@@ -59,7 +61,7 @@ func parseValidSig(status []byte) (string, bool) {
 			continue
 		}
 		switch fields[0] {
-		case "EXPKEYSIG", "REVKEYSIG", "BADSIG":
+		case "EXPKEYSIG", "REVKEYSIG", "BADSIG", "PLAINTEXT", "PLAINTEXT_LENGTH":
 			return "", false
 		case "VALIDSIG":
 			if last := fields[len(fields)-1]; primary == "" && len(fields) >= validSigFields && isFingerprint(last) {
