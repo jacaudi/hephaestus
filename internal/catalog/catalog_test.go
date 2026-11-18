@@ -270,6 +270,19 @@ func TestPins_Complete(t *testing.T) {
 	}
 }
 
+// TestPins_AbsentAllowList fails when a compiled-in entry is absent without
+// being listed here, so a re-pin that leaves one unpinned cannot pass ci. The
+// list is empty: every entry is pinned. An entry may be listed only with the
+// reason it is knowingly absent.
+func TestPins_AbsentAllowList(t *testing.T) {
+	allowed := map[catalog.Key]string{}
+	for k, reason := range catalog.Absent() {
+		if _, ok := allowed[k]; !ok {
+			t.Errorf("%v is absent (%s); re-pin it, or list it here with the reason it stays absent", k, reason)
+		}
+	}
+}
+
 func TestPinsFile_Formatted(t *testing.T) {
 	src, err := os.ReadFile("catalog_pins.go")
 	if err != nil {
