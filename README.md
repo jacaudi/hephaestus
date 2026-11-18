@@ -130,7 +130,7 @@ An entry that cannot be pinned is not an error. It goes in the `absent` ledger o
 | `network:` | DNS, connect, reset, timeout, another transfer failure, a local gpg failure such as no gpg, or a broken/missing committed key (up to 3 attempts for a transfer) |
 | `http-<status>:` | an unexpected HTTP status (`5xx` and `429` get up to 3 attempts) |
 | `integrity:` | a size, hash or extraction failure |
-| `signature:` | signature verification, key fingerprint or provenance failure |
+| `signature:` | signature verification failed, the signer is not the committed key's primary, or the signer is not in `PROVENANCE.md` |
 | `checksum:` | the upstream checksum list does not name the object's digest |
 
 `internal/catalog/keys/PROVENANCE.md` records where each signer key came from and who corroborates it. **The grml key expires on 2028-04-21**: a re-pin after that date needs a refreshed `grml.asc` first.

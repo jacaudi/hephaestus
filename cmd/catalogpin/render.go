@@ -47,9 +47,6 @@ func readEFIHeader(r io.Reader) ([]byte, error) {
 		return head, nil
 	}
 	end := e + peOptionalHeader + peSubsystem + 2
-	if end <= dosHeaderLen {
-		return head, nil
-	}
 	more, err := readUpTo(r, make([]byte, end-dosHeaderLen))
 	return append(head, more...), err
 }

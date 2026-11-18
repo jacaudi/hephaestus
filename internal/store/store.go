@@ -76,8 +76,8 @@ func Layer(file string, size int64, sha256Hex string) (ocispec.Descriptor, error
 //
 // Corruption is recognised by an explicit list of load errors only: an
 // undecodable or mistyped index.json, an unsupported oci-layout version, a bad
-// digest, a manifest whose bytes do not match its digest, and a truncated
-// read. Every other error, a permission or I/O failure included, is returned
+// digest, a manifest whose bytes do not match its digest, trailing data after a
+// manifest, and a truncated read. Every other error, a permission or I/O failure included, is returned
 // untouched, so serve stops rather than discarding a store it merely cannot
 // read. An empty index.json is not corruption: oras resets it and keeps the
 // blobs.
