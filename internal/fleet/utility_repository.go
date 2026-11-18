@@ -138,7 +138,8 @@ func wantFetch(ctx context.Context, q bun.IDB, w FetchWant, at time.Time) error 
 
 // ClaimFetch moves the next row the fetcher should work on to fetching and
 // returns it: the wanted rows and the failed rows due at at, highest priority
-// first, then the oldest updated_at. It reports false when none is eligible.
+// first, then the oldest updated_at. A row another worker takes first is skipped
+// for the next. It reports false when none is eligible.
 func (r *Repository) ClaimFetch(ctx context.Context, at time.Time) (CacheRow, bool, error) {
 	var (
 		claimed CacheRow
@@ -146,7 +147,7 @@ func (r *Repository) ClaimFetch(ctx context.Context, at time.Time) (CacheRow, bo
 	)
 	err := r.bdb.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
 		var err error
-		claimed, ok, err = claimFetch(ctx, tx, stamp(at))
+		claimed, ok, err = claimFetch(ctx, tx, stamp(at), nil)
 		return err
 	})
 	if err != nil {
@@ -155,7 +156,10 @@ func (r *Repository) ClaimFetch(ctx context.Context, at time.Time) (CacheRow, bo
 	return claimed, ok, nil
 }
 
-func claimFetch(ctx context.Context, tx bun.IDB, at time.Time) (CacheRow, bool, error) {
+// claimFetch is ClaimFetch's transaction body. afterSelect, when set, runs between
+// the select of the candidates and the update of the first: tests land another
+// worker's claim there, a race only Postgres lets happen on its own.
+func claimFetch(ctx context.Context, tx bun.IDB, at time.Time, afterSelect func()) (CacheRow, bool, error) {
 	var rows []CacheRow
 	err := tx.NewSelect().Model(&rows).Where("state = ? OR (state = ? AND next_attempt_at <= ?)", CacheWanted, CacheFailed, at).Scan(ctx)
 	if err != nil {
@@ -164,17 +168,28 @@ func claimFetch(ctx context.Context, tx bun.IDB, at time.Time) (CacheRow, bool, 
 	if len(rows) == 0 {
 		return CacheRow{}, false, nil
 	}
-	next := slices.MinFunc(rows, func(a, b CacheRow) int {
-		return cmp.Or(cmp.Compare(b.Priority, a.Priority), a.UpdatedAt.Compare(b.UpdatedAt), cmp.Compare(a.Entry, b.Entry), cmp.Compare(a.Arch, b.Arch))
-	}).utc()
-
-	moved, err := applied(ctx, updateCache(tx, next.Key(), next.Pin).Where("state = ?", next.State).
-		Set("state = ?", CacheFetching).Set("updated_at = ?", at))
-	if err != nil || !moved {
-		return CacheRow{}, false, wrapIf("claim "+next.Entry+"/"+string(next.Arch), err)
+	if afterSelect != nil {
+		afterSelect()
 	}
-	next.State, next.UpdatedAt = CacheFetching, at
-	return next, true, nil
+	slices.SortFunc(rows, func(a, b CacheRow) int {
+		return cmp.Or(cmp.Compare(b.Priority, a.Priority), a.UpdatedAt.Compare(b.UpdatedAt), cmp.Compare(a.Entry, b.Entry), cmp.Compare(a.Arch, b.Arch))
+	})
+
+	// Another worker may take a candidate first: the update that moves nothing
+	// means it did, and the next candidate is tried.
+	for i := range rows {
+		next := rows[i].utc()
+		moved, err := applied(ctx, updateCache(tx, next.Key(), next.Pin).Where("state = ?", next.State).
+			Set("state = ?", CacheFetching).Set("updated_at = ?", at))
+		if err != nil {
+			return CacheRow{}, false, wrapIf("claim "+next.Entry+"/"+string(next.Arch), err)
+		}
+		if moved {
+			next.State, next.UpdatedAt = CacheFetching, at
+			return next, true, nil
+		}
+	}
+	return CacheRow{}, false, nil
 }
 
 // RecordProgress stores how much of the object being fetched is downloaded. It
@@ -352,6 +367,18 @@ func (r *Repository) ResetFetching(ctx context.Context, at time.Time) (int, erro
 		return 0, fmt.Errorf("fleet: reset fetching: %w", err)
 	}
 	return int(n), nil
+}
+
+// ResetFetchingRow moves the fetching row at key and pin back to wanted, when the
+// fetch that held it ends without an outcome to record. Unlike ResetFetching it
+// leaves every other fetching row to its own worker. It reports whether it did.
+func (r *Repository) ResetFetchingRow(ctx context.Context, key CacheKey, pin string, at time.Time) (bool, error) {
+	moved, err := applied(ctx, updateCache(r.bdb, key, pin).Where("state = ?", CacheFetching).
+		Set("state = ?", CacheWanted).Set("updated_at = ?", stamp(at)))
+	if err != nil {
+		return false, fmt.Errorf("fleet: reset fetching %s/%s: %w", key.Entry, key.Arch, err)
+	}
+	return moved, nil
 }
 
 // Repin moves a row at oldPin, in any state, to wanted at newPin with its

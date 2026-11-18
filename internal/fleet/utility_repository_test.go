@@ -1,9 +1,12 @@
 package fleet
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/uptrace/bun"
 
 	"go.jacaudi.dev/hephaestus/internal/db"
 	"go.jacaudi.dev/hephaestus/internal/db/dbtest"
@@ -87,6 +90,31 @@ func mustFail(t *testing.T, r *Repository, f FetchFailure) CacheRow {
 		t.Fatalf("RecordFetchFailure(%+v): %v", f, err)
 	}
 	return row
+}
+
+// claimLosingRace runs claimFetch in a transaction in which another worker's
+// claim of lost lands between the select and the update, and returns its result.
+func claimLosingRace(t *testing.T, d *db.DB, at time.Time, lost CacheKey) (CacheRow, bool) {
+	t.Helper()
+	var (
+		got CacheRow
+		ok  bool
+	)
+	err := d.Bun().RunInTx(t.Context(), nil, func(ctx context.Context, tx bun.Tx) error {
+		takeLost := func() {
+			_, err := updateCache(tx, lost, pinOne).Where("state = ?", CacheWanted).Set("state = ?", CacheFetching).Exec(ctx)
+			if err != nil {
+				t.Fatalf("take %s: %v", lost.Entry, err)
+			}
+		}
+		var err error
+		got, ok, err = claimFetch(ctx, tx, at, takeLost)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("claimFetch: %v", err)
+	}
+	return got, ok
 }
 
 // wantBool fails unless got is want and err is nil.
@@ -380,6 +408,64 @@ func runUtilitySuite(t *testing.T, open func(testing.TB) *db.DB) {
 		for _, row := range rows {
 			wantCache(t, r, row.Key(), *row)
 		}
+	})
+
+	// Another worker claims the best candidate between claimFetch's select and its
+	// update, the race several fetchers run. A raw update before the claim would
+	// not do: the select already skips a fetching row. The hook lands the other
+	// worker's claim in the same transaction, between the two statements.
+	t.Run("ClaimSkipsRowTakenMeanwhile", func(t *testing.T) {
+		d := open(t)
+		k1, k2 := CacheKey{Entry: "ta", Arch: ArchAMD64}, CacheKey{Entry: "tb", Arch: ArchAMD64}
+		row1, row2 := cacheRowIn(k1, CacheWanted, t0), cacheRowIn(k2, CacheWanted, t0.Add(time.Minute))
+		seedCache(t, d, row1)
+		seedCache(t, d, row2)
+
+		at := t0.Add(time.Hour)
+		got, ok := claimLosingRace(t, d, at, k1)
+		want := row2
+		want.State, want.UpdatedAt = CacheFetching, at
+		if !ok || !sameCacheRow(got, want) {
+			t.Fatalf("claimFetch after losing %s = %+v, %v; want %+v", k1.Entry, got, ok, want)
+		}
+		r := NewRepository(d)
+		wantCache(t, r, k2, want)
+		taken := row1
+		taken.State = CacheFetching
+		wantCache(t, r, k1, taken)
+	})
+
+	t.Run("ClaimLostRaceNoneLeft", func(t *testing.T) {
+		d := open(t)
+		seedCache(t, d, cacheRowIn(k, CacheWanted, t0))
+
+		if got, ok := claimLosingRace(t, d, t0.Add(time.Hour), k); ok {
+			t.Fatalf("claimFetch after losing the only row = %+v, true; want false", got)
+		}
+	})
+
+	t.Run("ResetFetchingRowOnlyItsOwn", func(t *testing.T) {
+		d := open(t)
+		r := NewRepository(d)
+		k2 := CacheKey{Entry: "tb", Arch: ArchAMD64}
+		seed1, seed2 := cacheRowIn(k, CacheFetching, t0), cacheRowIn(k2, CacheFetching, t0)
+		seedCache(t, d, seed1)
+		seedCache(t, d, seed2)
+
+		at := t0.Add(time.Minute)
+		ok, err := r.ResetFetchingRow(t.Context(), k, pinTwo, at)
+		wantBool(t, "ResetFetchingRow at another pin", ok, err, false)
+		wantCache(t, r, k, seed1)
+
+		ok, err = r.ResetFetchingRow(t.Context(), k, pinOne, at)
+		wantBool(t, "ResetFetchingRow", ok, err, true)
+		want := cacheRowIn(k, CacheWanted, at)
+		wantCache(t, r, k, want)
+		wantCache(t, r, k2, seed2)
+
+		ok, err = r.ResetFetchingRow(t.Context(), k, pinOne, at.Add(time.Minute))
+		wantBool(t, "second ResetFetchingRow", ok, err, false)
+		wantCache(t, r, k, want)
 	})
 
 	t.Run("ReadyFromFetching", func(t *testing.T) {

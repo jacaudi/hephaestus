@@ -5,6 +5,7 @@ package fleet
 import (
 	"database/sql"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -129,5 +130,64 @@ func TestSetBootNext_RowBrokenUnderTx_Postgres(t *testing.T) {
 	}
 	if row.State != CacheWanted || row.Attempts != 0 {
 		t.Errorf("row = %s with %d attempts, want wanted with none", row.State, row.Attempts)
+	}
+}
+
+// claimTogether has every repository claim at once and returns what each got.
+func claimTogether(t *testing.T, repos []*Repository, at time.Time) (rows []CacheRow, oks []bool) {
+	t.Helper()
+	rows, oks = make([]CacheRow, len(repos)), make([]bool, len(repos))
+	errs := make([]error, len(repos))
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i, r := range repos {
+		wg.Go(func() {
+			<-start
+			rows[i], oks[i], errs[i] = r.ClaimFetch(t.Context(), at)
+		})
+	}
+	close(start)
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("ClaimFetch %d: %v", i, err)
+		}
+	}
+	return rows, oks
+}
+
+// Two fetchers claim at once from one database. The one that loses the row lock
+// finds its candidate taken and must take the next row, not report none. It is
+// repeated so the claims overlap on some rounds.
+func TestClaimFetch_ConcurrentClaims_Postgres(t *testing.T) {
+	t0 := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
+	d := dbtest.Postgres(t)
+	repos := []*Repository{NewRepository(d), NewRepository(d)}
+	k1, k2 := CacheKey{Entry: "ta", Arch: ArchAMD64}, CacheKey{Entry: "tb", Arch: ArchAMD64}
+	seedCache(t, d, cacheRowIn(k1, CacheWanted, t0))
+	seedCache(t, d, cacheRowIn(k2, CacheWanted, t0))
+
+	for round := range 25 {
+		if _, err := repos[0].ResetFetching(t.Context(), t0); err != nil {
+			t.Fatalf("round %d: reset: %v", round, err)
+		}
+		rows, oks := claimTogether(t, repos, t0.Add(time.Hour))
+		if !oks[0] || !oks[1] || rows[0].Key() == rows[1].Key() {
+			t.Fatalf("round %d: claims = %+v %v, want two rows with different keys", round, rows, oks)
+		}
+	}
+
+	// One row, two claimers: exactly one gets it.
+	if err := repos[0].DeleteCacheRow(t.Context(), k2); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	for round := range 25 {
+		if _, err := repos[0].ResetFetching(t.Context(), t0); err != nil {
+			t.Fatalf("round %d: reset: %v", round, err)
+		}
+		_, oks := claimTogether(t, repos, t0.Add(time.Hour))
+		if oks[0] == oks[1] {
+			t.Fatalf("round %d: oks = %v, want exactly one claim of the one row", round, oks)
+		}
 	}
 }
