@@ -122,7 +122,7 @@ CI checks:
 **`machines` gains three columns:**
 - `boot_next TEXT`;
 - `boot_next_set_at`;
-- `boot_next_mac TEXT`: a junk-pattern machine's flag is bound to the MAC the operator named and served only to a boot from that MAC; it is NULL for any other machine.
+- `boot_next_mac TEXT`: the flag of a machine identified only by its MAC (a junk or shared UUID) is bound to the MAC the operator named and served only to a boot from that MAC; it is NULL for any other machine.
 
 A `CHECK` makes `boot_next` and `boot_next_set_at` NULL together or set together, and allows `boot_next_mac` only while `boot_next` is set. Every clear of the flag clears `boot_next_mac` too. The value is validated against the catalog in Go.
 
@@ -190,7 +190,7 @@ They are written on state changes only. The CLI's actor is `cli`. `served` means
 **`platform`.** `/start`'s server-side chain query (`internal/boot/scripts.go`) gains `&platform=${platform}`, so no iPXE rebuild is needed. `platform` joins the length-capped keys (`handlers.go:327`). Only `efi` and `pcbios` are recognised. Any other value, `linux` included, or no value at all, means "not ready" for row 3: the flag is kept. Such a value is never treated as unsupported.
 
 **Row 3 inputs:**
-- `BootNext` and `BootNextSetAt`; a junk-pattern machine's flag with a bound MAC is an input only to a boot from that MAC, and any other boot of its record is decided as if it had no flag (no clear, no fetch request, the flag stays for the right boot);
+- `BootNext` and `BootNextSetAt`; the flag of a machine identified only by its MAC is an input only to a boot from the MAC it is bound to (a flag with no bound MAC is no input), and any other boot of its record is decided as if it had no flag (no clear, no fetch request, the flag stays for the right boot);
 - `UtilityReady`: the row is `ready` at the catalog's current pin, and its layers pass the size check;
 - support: whether the entry supports `(arch, platform)`.
 
@@ -216,7 +216,7 @@ They are written on state changes only. The CLI's actor is `cli`. `served` means
 
 | Command | Effect |
 |---|---|
-| `boot-next set <mac\|uuid> <entry>` | Requires a machine hephaestus has seen. A UUID shared by junk records is ambiguous: the CLI refuses and lists the MACs. A machine with a junk-pattern UUID is refused when named by UUID (`<id> has a junk-pattern UUID; name it by the MAC it boots from`): its flag is bound to the MAC it is named by and served only to a boot from that MAC, and `set` and `list` show the bound MAC. It refuses an entry the machine's arch cannot boot. It judges architecture only: the firmware platform is known only at boot, so `serve` may still clear the flag as `unsupported` (row 3) for a platform the entry lacks. Otherwise it sets the flag and its time, applies §5.4's CLI event, audits, and prints readiness and the 24 h expiry. For `shredos` it prints a warning naming the machine |
+| `boot-next set <mac\|uuid> <entry>` | Requires a machine hephaestus has seen. A UUID shared by junk records is ambiguous: the CLI refuses and lists the MACs. A machine identified only by its MAC (a junk or shared UUID) is refused when named by UUID (`<id> is identified only by its MAC (junk or shared UUID); name it by the MAC it boots from`): its flag is bound to the MAC it is named by and served only to a boot from that MAC, and `set` and `list` show the bound MAC. It refuses an entry the machine's arch cannot boot. It judges architecture only: the firmware platform is known only at boot, so `serve` may still clear the flag as `unsupported` (row 3) for a platform the entry lacks. Otherwise it sets the flag and its time, applies §5.4's CLI event, audits, and prints readiness and the 24 h expiry. For `shredos` it prints a warning naming the machine |
 | `boot-next clear <mac\|uuid>` | Compare-and-clear with `cli` |
 | `boot-next list` | Every flag: machine, entry, age, and a status in row 3's order: `expired`, `unknown_entry` (the catalog lost the entry), `unsupported`, then the cache row's state, or `not_requested` when the entry has no row at the catalog's pin. Its `unsupported` status, like `set`'s refusal, judges architecture only |
 | `utility fetch <entry> [--arch …]` | §5.4's CLI event |

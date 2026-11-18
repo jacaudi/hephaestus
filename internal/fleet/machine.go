@@ -50,7 +50,7 @@ type Machine struct {
 	LastSeenAt   time.Time `bun:"last_seen_at"`
 	// BootNext is the utility entry the next boot serves and BootNextSetAt when it
 	// was set; both are zero when no boot-next is armed. BootNextMAC is the
-	// normalized MAC a junk-pattern machine's flag is bound to, so the flag is
+	// normalized MAC a junk machine's flag is bound to, so the flag is
 	// served only to a boot from that MAC; it is empty for any other machine and
 	// whenever no boot-next is armed.
 	BootNext      string    `bun:"boot_next,nullzero"`

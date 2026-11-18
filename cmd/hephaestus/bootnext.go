@@ -100,9 +100,9 @@ func newBootNextSetCmd(deps cliDeps) *cobra.Command {
 		Short: "Boot a machine into a utility OS on its next boot",
 		Long: fmt.Sprintf(`Arm the machine's boot-next with the utility entry and ask for its content to be fetched.
 The machine must have booted through hephaestus once. A UUID that several machines share is
-refused; name one by MAC. A machine with a junk-pattern UUID (empty, all zeros or all Fs) must be
-named by MAC: its flag is bound to that MAC and served only to a boot from it. The flag expires
-%d hours after it was set.
+refused; name one by MAC. A machine identified only by its MAC (a junk or shared UUID) must be named by
+MAC: its flag is bound to that MAC and served only to a boot from it. The flag expires %d hours
+after it was set.
 
 The output shows when the flag expires and the utility's state: wanted, fetching, ready, failed,
 broken or stale_pin. A failed or broken utility is re-armed, and the error it had is shown.`, bootNextTTLHours),
@@ -195,8 +195,8 @@ func newBootNextListCmd(deps cliDeps) *cobra.Command {
 		Use:   "list",
 		Short: "List the machines with a boot-next flag",
 		Long: fmt.Sprintf(`List every machine with a boot-next flag: the entry, when it was set, its age in seconds and
-a status, and the MAC a junk-pattern machine's flag is bound to. The status is expired after %d hours, unknown_entry when the catalog no longer has the
-entry, unsupported when it has no build for the machine's architecture, and otherwise the
+a status and, if bound, the MAC. The status is expired after %d hours, unknown_entry when the
+catalog no longer has the entry, unsupported when it has no build for the machine's architecture, and otherwise the
 utility's state (not_requested, wanted, fetching, ready, failed or broken).`, bootNextTTLHours),
 		Example: `  hephaestus boot-next list
   hephaestus boot-next list --json`,
@@ -264,17 +264,18 @@ func writeBootNextRows(cmd *cobra.Command, rows []bootNextRow) error {
 	return writeTable(cmd, []string{"MACHINE", "MACS", "ENTRY", "ARCH", "SET_AT", "AGE_SECONDS", "STATUS", "BOUND_MAC"}, table)
 }
 
-// boundMAC is the MAC to bind m's flag to: for a junk-pattern machine, the MAC
-// ref names, because a junk machine is known only by the MAC it boots from and
-// its flag is served only to a boot from that MAC; "" for any other machine. A
-// junk machine named any other way is refused.
+// boundMAC is the MAC to bind m's flag to: for a junk machine (junk-pattern UUID,
+// or a valid UUID a conflict marked junk), the MAC ref names, because it is
+// identified only by the MAC it boots from and its flag is served only to a boot
+// from that MAC; "" for any other machine. A junk machine named any other way is
+// refused.
 func boundMAC(m fleet.Machine, ref string) (string, error) {
 	if !m.Junk {
 		return "", nil
 	}
 	mac, err := fleet.NormalizeMAC(ref)
 	if err != nil {
-		return "", fmt.Errorf("%s has a junk-pattern UUID; name it by the MAC it boots from", m.ID)
+		return "", fmt.Errorf("%s is identified only by its MAC (junk or shared UUID); name it by the MAC it boots from", m.ID)
 	}
 	return mac, nil
 }

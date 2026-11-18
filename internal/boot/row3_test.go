@@ -231,11 +231,41 @@ func TestBoot_Row3JunkFlagKeptForOtherNIC(t *testing.T) {
 	g, a := junkFlagged(t)
 	const secondNIC = "52:54:00:e2:e0:0c"
 	g.discoverOK(discoverForm("uuid", zeroUUID, "mac", junkMACA, "serial", "S", "product", "P", "nic0_mac", junkMACA, "nic1_mac", secondNIC))
+	if other, ok, err := g.repo.Lookup(t.Context(), fleet.Identity{UUID: zeroUUID, MAC: secondNIC}); err != nil || !ok || other.ID != a.ID {
+		t.Fatalf("Lookup(second NIC) = %s, %v, %v; want the flagged record %s", other.ID, ok, err, a.ID)
+	}
 
 	body := g.boot(junkQuery(zeroUUID, secondNIC))
 
 	wantReportExit(t, body)
 	g.wantFlagKept(a.ID)
+}
+
+// A valid-UUID machine a conflicting request has marked junk is identified only
+// by its MAC from then on, so a flag armed before that, which names no MAC, is
+// not served to anyone: it stays until it expires or is set again by MAC.
+func TestBoot_Row3FlagOfMachineMarkedJunkIsNotServed(t *testing.T) {
+	g := newRig(t)
+	g.armed()
+	g.stock()
+	g.boot(queryWith("S2", "P1"))
+	m := g.machine()
+	if !m.Junk || m.BootNextMAC != "" {
+		t.Fatalf("machine junk = %v, bound MAC %q; want a junk machine whose flag names no MAC", m.Junk, m.BootNextMAC)
+	}
+
+	for _, query := range []string{efiQ, "uuid=" + bootUUID + "&arch=x86_64&serial=S1&product=P1&platform=efi"} {
+		wantReportExit(t, g.boot(query))
+	}
+	if got := g.machine().BootNext; got != entryName {
+		t.Errorf("boot-next = %q, want the flag kept", got)
+	}
+	if n := g.cleared(""); n != 0 {
+		t.Errorf("boot_next.cleared events = %d, want 0", n)
+	}
+	if n := g.count("SELECT count(*) FROM boot_events WHERE decision_row = 3"); n != 0 {
+		t.Errorf("row 3 events = %d, want 0", n)
+	}
 }
 
 func TestBoot_Row3NotReadyKeepsFlag(t *testing.T) {

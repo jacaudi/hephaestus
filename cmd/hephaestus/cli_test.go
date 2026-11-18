@@ -362,7 +362,7 @@ func TestBootNextSet_JunkMachineByUUIDIsRefused(t *testing.T) {
 			if got := exitCode(err); got != 1 {
 				t.Errorf("exit code = %d, want 1 (%v)", got, err)
 			}
-			if want := m.ID + " has a junk-pattern UUID; name it by the MAC it boots from"; err.Error() != want {
+			if want := m.ID + " is identified only by its MAC (junk or shared UUID); name it by the MAC it boots from"; err.Error() != want {
 				t.Errorf("error = %q, want %q", err, want)
 			}
 			if armed, err := c.repo.ListBootNext(t.Context()); err != nil || len(armed) != 0 {

@@ -351,13 +351,15 @@ func (h *Handlers) decideAndRecord(ctx context.Context, id fleet.Identity, req R
 	}
 }
 
-// flagServesMAC reports whether m's boot-next is for a boot from mac. A junk-pattern
-// machine is known only by the MAC it boots from, and a MAC can move to another
-// machine's record, so its flag is bound to the MAC the operator named and
-// applies only to a boot from it; any other request is decided as if the
-// machine had no flag, which leaves the flag for the right boot.
+// flagServesMAC reports whether m's boot-next is for a boot from mac. A junk
+// record (one marked junk, which includes every junk-pattern UUID) is identified
+// only by its MACs, and a MAC can move to another record, so its flag is bound to
+// the MAC the operator named and applies only to a boot from it. A junk record
+// whose flag names no MAC (it was armed before the record was marked junk) is
+// served to no one. Any other request is decided as if the machine had no flag,
+// which leaves the flag for the right boot.
 func flagServesMAC(m fleet.Machine, mac string) bool {
-	return !m.Junk || m.BootNextMAC == "" || m.BootNextMAC == mac
+	return !m.Junk || (m.BootNextMAC != "" && m.BootNextMAC == mac)
 }
 
 // countAlert counts one raised uuid_conflict alert.

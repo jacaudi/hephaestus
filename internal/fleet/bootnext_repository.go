@@ -39,7 +39,7 @@ type setDetail struct {
 
 // SetBootNextRequest arms a machine's boot-next: the entry its next boot serves
 // and the catalog pin its content must have. BoundMAC, normalized, binds a
-// junk-pattern machine's flag to the MAC it was named by; it is empty for any
+// junk machine's flag to the MAC it was named by; it is empty for any
 // other machine.
 type SetBootNextRequest struct {
 	MachineID, Entry, Pin string
