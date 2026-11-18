@@ -184,13 +184,16 @@
 
   <line class="arrow a-server" x1="390" y1="598" x2="283.23" y2="598"/>
 
-  <g transform="translate(740,545.3)" filter="url(#shadow)">
-    <path class="db-box" d="M0,6 L0,78 A115,6 0 0 0 230,78 L230,6 Z"/>
-    <ellipse cx="115" cy="6" rx="115" ry="6" class="db-box"/>
+  <rect class="db-box" x="740" y="556" width="230" height="84" rx="10" filter="url(#shadow)"/>
+  <!-- database icon, same line weight as the monitor icon (.icon, 2) -->
+  <g transform="translate(934,567)" class="icon" stroke="var(--db)">
+    <ellipse cx="9" cy="3.5" rx="9" ry="3.5"/>
+    <path d="M0,3.5 V16.5 A9,3.5 0 0 0 18,16.5 V3.5"/>
+    <path d="M0,10 A9,3.5 0 0 0 18,10"/>
   </g>
-  <text class="h center" x="855" y="582">SQLite or Postgres</text>
-  <text class="b center" x="855" y="600">fleet state</text>
-  <text class="b center" x="855" y="616">SQLite file by default</text>
+  <text class="h" x="758" y="582">SQLite or Postgres</text>
+  <text class="b" x="758" y="600">fleet state</text>
+  <text class="b" x="758" y="616">SQLite file by default</text>
 
   <!-- the boot services and the admin listener use the data directory -->
   <line class="arrow a-server a-both" x1="480" y1="481.23" x2="480" y2="496.77"/>
