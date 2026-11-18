@@ -3,7 +3,7 @@
   <defs>
     <!-- Swept arrowheads. markerUnits are user units, so every head is the same size: 13 wide at scale 1.3.
          refX is the notch (x=2.9), so a line ends at the base of its head; the tip lands 9.23 units
-         (7.1 marker units x 1.3) past the line's end, on the target edge. -->
+         (7.1 marker units x 1.3) past the line's end, and the line is stopped a further 4 units short, so the tip stops 4 units before the target edge. -->
     <marker id="arrow" viewBox="0 0 10 10" refX="2.9" refY="5" markerUnits="userSpaceOnUse" markerWidth="13" markerHeight="13" orient="auto-start-reverse">
       <path d="M0,0.4 L10,5 L0,9.6 L2.9,5 Z" fill="var(--arrowhead)"/>
     </marker>
@@ -109,7 +109,7 @@
   <text class="b" x="368" y="146">UDP 67 and 4011</text>
   <text class="b" x="368" y="162">offers the PXE boot file</text>
 
-  <line class="arrow" x1="480" y1="172" x2="480" y2="186.77"/>
+  <line class="arrow" x1="480" y1="172" x2="480" y2="182.77"/>
 
   <!-- 2 TFTP -->
   <rect class="server-box" x="320" y="196" width="320" height="68" rx="10" filter="url(#shadow)"/>
@@ -119,7 +119,7 @@
   <text class="b" x="368" y="238">UDP 69</text>
   <text class="b" x="368" y="254">serves the embedded iPXE binaries</text>
 
-  <line class="arrow" x1="480" y1="264" x2="480" y2="278.77"/>
+  <line class="arrow" x1="480" y1="264" x2="480" y2="274.77"/>
 
   <!-- 3 HTTP -->
   <rect class="server-box" x="320" y="288" width="320" height="68" rx="10" filter="url(#shadow)"/>
@@ -129,7 +129,7 @@
   <text class="b" x="368" y="330">/start · /boot (chain to HTTPS)</text>
   <text class="b" x="368" y="346">/tftp · /u/ utility files</text>
 
-  <line class="arrow" x1="480" y1="356" x2="480" y2="370.77"/>
+  <line class="arrow" x1="480" y1="356" x2="480" y2="366.77"/>
 
   <!-- 4 HTTPS -->
   <rect class="server-box" x="320" y="380" width="320" height="68" rx="10" filter="url(#shadow)"/>
@@ -141,16 +141,16 @@
 
   <!-- the machine talks to each service, in boot order -->
   <g>
-    <path class="arrow a-client" d="M220,240 C 262,240 282,138 310.77,138"/>
-    <path class="arrow a-client" d="M220,240 C 262,240 282,230 310.77,230"/>
-    <path class="arrow a-client" d="M220,240 C 262,240 282,322 310.77,322"/>
-    <path class="arrow a-client" d="M220,240 C 262,240 282,414 310.77,414"/>
+    <path class="arrow a-client" d="M220,240 C 262,240 282,138 306.77,138"/>
+    <path class="arrow a-client" d="M220,240 C 262,240 282,230 306.77,230"/>
+    <path class="arrow a-client" d="M220,240 C 262,240 282,322 306.77,322"/>
+    <path class="arrow a-client" d="M220,240 C 262,240 282,414 306.77,414"/>
   </g>
 
   <!-- ===================== RIGHT: ADMIN AND TLS ===================== -->
   <rect class="zone" x="700" y="40" width="290" height="170" rx="18"/>
   <text class="title" x="720" y="72">Management Network</text>
-  <text class="sub" x="720" y="90">off the provisioning VLAN</text>
+  <text class="sub" x="720" y="90">Off the provisioning VLAN</text>
   <rect class="mgmt-box" x="720" y="104" width="250" height="86" rx="10" filter="url(#shadow)"/>
   <text class="h" x="738" y="128">Admin Listener :9090</text>
   <text class="b" x="738" y="146">default 127.0.0.1:9090</text>
@@ -169,7 +169,7 @@
   <text class="b" x="718" y="421">and forwards plain HTTP to</text>
   <text class="b" x="718" y="437">HEPHAESTUS_PROXY_ADDRESS</text>
 
-  <path class="arrow a-tls" d="M700,414 H649.23"/>
+  <path class="arrow a-tls" d="M700,414 H653.23"/>
 
   <!-- ===================== BOTTOM: DATA DIRECTORY ===================== -->
   <rect class="zone" x="20" y="510" width="970" height="150" rx="18"/>
@@ -186,7 +186,7 @@
   <text class="b" x="408" y="600">4 parallel downloads by</text>
   <text class="b" x="408" y="616">default (1 to 16)</text>
 
-  <line class="arrow a-db" x1="390" y1="598" x2="279.23" y2="598"/>
+  <line class="arrow a-db" x1="390" y1="598" x2="283.23" y2="598"/>
 
   <g transform="translate(740,556)" filter="url(#shadow)">
     <path class="db-box" d="M0,12 L0,72 A115,12 0 0 0 230,72 L230,12 Z"/>
@@ -197,16 +197,16 @@
   <text class="b center" x="855" y="630">SQLite file by default</text>
 
   <!-- the boot services and the admin listener use the data directory -->
-  <line class="arrow a-server a-both" x1="480" y1="477.23" x2="480" y2="500.77"/>
+  <line class="arrow a-server a-both" x1="480" y1="481.23" x2="480" y2="496.77"/>
   <text class="lbl" x="492" y="494">fleet state and utility files</text>
-  <line class="arrow a-mgmt" x1="960" y1="190" x2="960" y2="500.77"/>
+  <line class="arrow a-mgmt" x1="960" y1="190" x2="960" y2="496.77"/>
   <text class="lbl end" x="948" y="494">health checks</text>
 
   <!-- ===================== BELOW: UPSTREAM ===================== -->
   <rect class="box" x="390" y="690" width="230" height="70" rx="10" filter="url(#shadow)"/>
   <text class="h" x="408" y="718">Upstream Mirrors</text>
   <text class="b" x="408" y="737">utility OS downloads</text>
-  <path class="arrow a-db" d="M505,690 V649.23"/>
+  <path class="arrow a-db" d="M505,690 V653.23"/>
   <text class="lbl" x="520" y="678">downloaded over TLS 1.3</text>
 
   </g>
