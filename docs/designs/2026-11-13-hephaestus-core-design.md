@@ -546,8 +546,8 @@ authenticated stops that entry; it never falls back to TOFU. ShredOS boots inter
 `ftp-master.grml.org`, which serves its ISOs, `SHA256SUMS-<version>` and the signature; the signer key comes from other
 hosts (`internal/catalog/keys/PROVENANCE.md`).
 
-**Fetching (M2).** The fetcher runs in `serve` only, polls every 10 s, and runs one fetch at a time, armed boot-nexts
-first. Each `utility_cache` transition is a conditional update, and every (state, event) pair not listed is a no-op:
+**Fetching (M2).** The fetcher runs in `serve` only, polls every 10 s, and runs a pool of fetch workers
+(`HEPHAESTUS_FETCH_WORKERS`, default 4), each fetching one row at a time, armed boot-nexts first. Each `utility_cache` transition is a conditional update, and every (state, event) pair not listed is a no-op:
 - `wanted` → `fetching` when the fetcher claims it → `ready` once the push and tag are done and every layer's size is
   checked.
 - An **integrity error** (wrong size or hash, a path violation, a redirect to a non-`https` URL; GPG is checked at pin

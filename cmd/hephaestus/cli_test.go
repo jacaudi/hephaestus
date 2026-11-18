@@ -1178,3 +1178,49 @@ func TestUtilityList_TextEscapesLegacyCause(t *testing.T) {
 		t.Errorf("utility list lacks the escaped cause %q:\n%s", want, out)
 	}
 }
+
+// TestCLI_JSONPrintsLegacyCauseAsPrintable seeds a stored error with a C1
+// control, a bidi override and a zero-width space by SQL: a row written before
+// storage cleaned them still holds them, and encoding/json prints them raw.
+// Every --json command that shows a stored error prints it printable.
+func TestCLI_JSONPrintsLegacyCauseAsPrintable(t *testing.T) {
+	const legacy, printable = "legacy\u009b mirror\u202e\u200b", "legacy mirror"
+	tests := []struct {
+		name  string
+		args  []string
+		field func(t *testing.T, out string) any
+	}{
+		{"utility list", []string{"utility", "list", "--json"}, func(t *testing.T, out string) any {
+			t.Helper()
+			return rowFor(t, jsonRows(t, out), "tshell", "amd64")["last_error"]
+		}},
+		{"utility fetch", []string{"utility", "fetch", "tshell", "--arch", "amd64", "--json"}, func(t *testing.T, out string) any {
+			t.Helper()
+			return rowFor(t, jsonRows(t, out), "tshell", "amd64")["previous_error"]
+		}},
+		{"boot-next set", []string{"boot-next", "set", cliMAC(1), "tshell", "--json"}, func(t *testing.T, out string) any {
+			t.Helper()
+			return jsonObject(t, out)["previous_error"]
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := newCLITest(t)
+			c.machine(t, 1, fleet.ArchAMD64)
+			c.breakRow(t, "tshell", fleet.ArchAMD64, "placeholder")
+			q := "UPDATE utility_cache SET last_error = ? WHERE entry = 'tshell' AND arch = 'amd64'"
+			if _, err := c.d.Bun().ExecContext(t.Context(), q, legacy); err != nil {
+				t.Fatalf("seed last_error: %v", err)
+			}
+
+			out := c.mustRun(t, tt.args...)
+
+			if strings.ContainsAny(out, "\u009b\u202e\u200b") {
+				t.Errorf("%s holds a control, bidi or zero-width rune: %q", tt.name, out)
+			}
+			if got := tt.field(t, out); got != printable {
+				t.Errorf("%s error = %q, want %q", tt.name, got, printable)
+			}
+		})
+	}
+}

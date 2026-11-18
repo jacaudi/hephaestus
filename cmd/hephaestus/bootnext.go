@@ -137,6 +137,7 @@ broken or stale_pin. A failed or broken utility is re-armed, and the error it ha
 					BoundMAC:      res.Machine.BootNextMAC,
 				}
 				if asJSON {
+					out.PreviousError = fleet.PrintableText(out.PreviousError) // as in utility fetch
 					return writeJSON(cmd, out)
 				}
 				return writeText(cmd, out.text())

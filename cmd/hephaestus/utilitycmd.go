@@ -98,6 +98,11 @@ names. A failed or broken fetch is re-armed, and the error it had is shown.`,
 					return reqErr
 				}
 				if asJSON {
+					// A row stored before storage cleaned its error may still hold control
+					// runes, which encoding/json prints raw; the text paths escape them instead.
+					for i := range rows {
+						rows[i].PreviousError = fleet.PrintableText(rows[i].PreviousError)
+					}
 					return errors.Join(writeJSON(cmd, rows), reqErr)
 				}
 				return errors.Join(writeText(cmd, fetchText(rows)), reqErr)
@@ -165,6 +170,9 @@ row is for an older pin than the catalog's.`,
 					rows = append(rows, utilityRowOf(&entries[i], cached))
 				}
 				if asJSON {
+					for i := range rows {
+						rows[i].LastError = fleet.PrintableText(rows[i].LastError) // as in utility fetch
+					}
 					return writeJSON(cmd, rows)
 				}
 				return writeUtilityRows(cmd, rows)

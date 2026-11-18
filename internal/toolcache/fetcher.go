@@ -758,6 +758,11 @@ func (j *fetchJob) write(ctx context.Context, body io.Reader, n int, offset int6
 	copied, err := io.Copy(w, io.LimitReader(body, want+1))
 	j.downloaded += w.n
 	j.f.bytes.Add(ctx, w.n)
+	// The floor judges a Read after its bytes were returned, so it can cut the Read
+	// that delivered the object's last byte. The spool is then whole: no failure.
+	if copied == want && errors.Is(err, errTooSlow) {
+		err = nil
+	}
 	switch {
 	case err != nil:
 		return fmt.Errorf("copy object %d: %w", n, err)
@@ -927,8 +932,8 @@ func newFloorReader(r io.Reader, now func() time.Time) *floorReader {
 
 // Read implements io.Reader. A Read that returns an error, the end of the body
 // included, is not judged. The bytes of the Read that fails are still returned.
-// The final Read that returns data can still be cut off; that is harmless, as
-// the spool is then complete and the next attempt finishes the download.
+// The Read that returns the last data can still be cut off; fetchJob.write
+// treats that as success when the copy delivered every wanted byte.
 func (f *floorReader) Read(p []byte) (int, error) {
 	n, err := f.r.Read(p)
 	f.total += int64(n)

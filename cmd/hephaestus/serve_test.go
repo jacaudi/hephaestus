@@ -1329,3 +1329,17 @@ func TestLogFetchEvent_ErrorIsPrintable(t *testing.T) {
 		t.Errorf("logged error = %q, want %q", got, want)
 	}
 }
+
+// TestServeHelp_ListsFetchWorkers: serve's help names every variable it reads,
+// and HEPHAESTUS_FETCH_WORKERS is read by loadConfig.
+func TestServeHelp_ListsFetchWorkers(t *testing.T) {
+	_, optional, ok := strings.Cut(newServeCmd().Long, "Optional:")
+	if !ok {
+		t.Fatal("serve's help has no Optional paragraph")
+	}
+	optional, _, _ = strings.Cut(optional, "\n\n")
+
+	if !strings.Contains(optional, "HEPHAESTUS_FETCH_WORKERS") {
+		t.Errorf("serve's optional variables are %q, want HEPHAESTUS_FETCH_WORKERS among them", optional)
+	}
+}

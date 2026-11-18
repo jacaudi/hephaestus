@@ -191,7 +191,8 @@ func writeTable(cmd *cobra.Command, header []string, rows [][]string) error {
 // (for example \x1b or \t), so text from upstream cannot drive the admin's terminal:
 // an escape sequence could erase a warning printed above it, a tab or newline
 // could break a table. Quotes and backslashes are left as they are. JSON output
-// needs none of this: encoding/json escapes control characters already.
+// does not use it: encoding/json escapes only the ASCII controls, so the JSON
+// paths print stored errors through fleet.PrintableText.
 func safeText(s string) string {
 	var b strings.Builder
 	for i := 0; i < len(s); {

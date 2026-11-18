@@ -2467,6 +2467,51 @@ func TestFetcher_FloorMeasuresThisTransfer(t *testing.T) {
 	}
 }
 
+// TestFetcher_FloorOnTheLastRead: the floor judges a Read after it returned its
+// bytes, so it can cut the very Read that delivers the object's last byte. The
+// spool is then whole, and the transfer succeeded; a cut that leaves bytes
+// undelivered is still the failure it was.
+func TestFetcher_FloorOnTheLastRead(t *testing.T) {
+	tests := []struct {
+		name    string
+		size    int // the pinned size; the body holds 1024 bytes, the second half with the cut
+		wantErr error
+	}{
+		{"the cut Read delivers the last byte", 1024, nil},
+		{"the cut Read leaves bytes undelivered", 2048, errTooSlow},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := floorRun(t, 64<<10, tt.size, 0)
+			root, err := os.OpenRoot(r.spool)
+			if err != nil {
+				t.Fatalf("OpenRoot: %v", err)
+			}
+			j := &fetchJob{f: r.f, row: r.row(r.sc.key), entry: r.e, root: root}
+			defer j.close(t.Context())
+			var clk simClock
+			reads := []time.Duration{time.Minute, ThroughputWindow} // each delivers 512 bytes
+			body := readerFunc(func(p []byte) (int, error) {
+				if len(reads) == 0 {
+					return 0, io.EOF
+				}
+				clk.advance(reads[0] - time.Duration(clk.elapsed.Load()))
+				reads = reads[1:]
+				return 512, nil
+			})
+
+			err = j.write(t.Context(), newFloorReader(body, clk.Now), 0, 0)
+
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("write = %v, want %v", err, tt.wantErr)
+			}
+			if got := r.spoolSize(SpoolName(r.e.Pin.ID, 0)); got != 1024 {
+				t.Errorf("spool size = %d, want 1024: the bytes of the cut Read are written", got)
+			}
+		})
+	}
+}
+
 func TestFloorReader(t *testing.T) {
 	const perSecond = MinThroughput // bytes in one second at exactly the floor
 	type step struct {

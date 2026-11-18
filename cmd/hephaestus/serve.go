@@ -68,6 +68,7 @@ TLS comes from one of two sources, chosen by HEPHAESTUS_TLS_MODE:
                   client address is taken from their X-Forwarded-For header
 
 Optional: HEPHAESTUS_ADMIN_ADDRESS, HEPHAESTUS_DATA_DIR, HEPHAESTUS_DATABASE_URL,
+HEPHAESTUS_FETCH_WORKERS (utility downloads at once, 1 to 16, default 4),
 HEPHAESTUS_SHUTDOWN_GRACE, HEPHAESTUS_LOG_LEVEL and HEPHAESTUS_LOG_FORMAT (or
 --log-format).
 
