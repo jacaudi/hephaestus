@@ -188,9 +188,9 @@
     <path class="db-box" d="M0,6 L0,78 A115,6 0 0 0 230,78 L230,6 Z"/>
     <ellipse cx="115" cy="6" rx="115" ry="6" class="db-box"/>
   </g>
-  <text class="h center" x="855" y="586.2">SQLite or Postgres</text>
-  <text class="b center" x="855" y="604.2">fleet state</text>
-  <text class="b center" x="855" y="620.2">SQLite file by default</text>
+  <text class="h center" x="855" y="592.7">SQLite or Postgres</text>
+  <text class="b center" x="855" y="610.7">fleet state</text>
+  <text class="b center" x="855" y="626.7">SQLite file by default</text>
 
   <!-- the boot services and the admin listener use the data directory -->
   <line class="arrow a-server a-both" x1="480" y1="481.23" x2="480" y2="496.77"/>
