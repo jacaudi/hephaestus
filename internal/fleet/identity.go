@@ -68,10 +68,11 @@ func CleanText(s string) string {
 }
 
 // PrintableText returns s without invalid UTF-8 and without any rune that
-// unicode.IsGraphic rejects: control and format runes, the line and paragraph
-// separators, tab, CR and LF. Ordinary spaces, those of category Zs (the ASCII
-// space and, for example, NBSP), stay. Text that came from the network goes
-// through it before it reaches a log, a database row or a terminal.
+// unicode.IsGraphic rejects: control and format runes, private-use and
+// unassigned runes, the line and paragraph separators, tab, CR and LF.
+// Ordinary spaces, those of category Zs (the ASCII space and, for example,
+// NBSP), stay. Text that came from the network goes through it before it
+// reaches a log, a database row or a terminal.
 func PrintableText(s string) string {
 	return strings.Map(func(r rune) rune {
 		if unicode.IsGraphic(r) {

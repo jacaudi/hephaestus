@@ -114,7 +114,8 @@ func WithClock(now func() time.Time) FetcherOption { return func(f *Fetcher) { f
 // WithMeter sets the meter the fetcher's counters are created on.
 func WithMeter(m metric.Meter) FetcherOption { return func(f *Fetcher) { f.meter = m } }
 
-// WithEvents sets the function called with every state change.
+// WithEvents sets the function called with every state change. Several workers
+// call it at once, so fn must be safe for concurrent use.
 func WithEvents(fn func(context.Context, FetchEvent)) FetcherOption {
 	return func(f *Fetcher) { f.events = fn }
 }
@@ -122,7 +123,7 @@ func WithEvents(fn func(context.Context, FetchEvent)) FetcherOption {
 // WithErrorHandler sets the function called with every error the fetcher
 // cannot settle on a row: an unrecorded repository error, a progress record
 // that failed, or a spool file or the spool directory it could not remove or
-// close.
+// close. Several workers call it at once, so fn must be safe for concurrent use.
 func WithErrorHandler(fn func(context.Context, error)) FetcherOption {
 	return func(f *Fetcher) { f.onError = fn }
 }
@@ -499,10 +500,15 @@ func (j *fetchJob) download(ctx context.Context, n int) error {
 		return err
 	}
 	if have == obj.Size {
+		// Whole already, so nothing is downloaded, but its extraction still writes
+		// about its size into the store.
+		if err := j.reserveSpace(obj.Size, 1); err != nil {
+			return err
+		}
 		j.progress(ctx, obj.Size, obj.Size)
 		return nil
 	}
-	if err := j.reserveSpace(obj.Size); err != nil {
+	if err := j.reserveSpace(obj.Size, 2); err != nil {
 		return err
 	}
 	return j.transfer(ctx, n, have, etag)
@@ -576,18 +582,19 @@ func (j *fetchJob) keepETag(n int, etag string) error {
 }
 
 // reserveSpace refuses a download the spool volume has no room for, and
-// otherwise holds the room for the job until close. The need is twice the
-// object (the spool and its extracted copy) and spaceReserve, and it must fit in
+// otherwise holds the room for the job until close. The need is copies times
+// the object (2: the spool and its extracted copy; 1 when the spool is already
+// whole and only the extraction is left) and spaceReserve, and it must fit in
 // what is free less what the other downloads in flight hold, because their
 // bytes are not all on the disk yet. A job that reserved for an earlier object
 // swaps that reservation for this one: those bytes are on the disk by now.
-func (j *fetchJob) reserveSpace(size int64) error {
+func (j *fetchJob) reserveSpace(size int64, copies uint64) error {
 	f := j.f
 	// Past this, the need below does not fit in a uint64; no volume holds it.
-	if size > (math.MaxUint64-spaceReserve)/2 {
+	if uint64(max(size, 0)) > (math.MaxUint64-spaceReserve)/copies {
 		return fmt.Errorf("free space on the spool volume cannot hold a %d byte object", size)
 	}
-	need := 2*uint64(max(size, 0)) + spaceReserve
+	need := copies*uint64(max(size, 0)) + spaceReserve
 
 	// ponytail: statfs runs under the lock so check and reserve are one step;
 	// a slow volume delays only other reservations, and a measured delay can move it out.

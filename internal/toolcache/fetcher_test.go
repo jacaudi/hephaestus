@@ -1355,8 +1355,14 @@ func TestFetcher_ShutdownAbandons(t *testing.T) {
 		}
 		// The handler having flushed is not the client having the chunk: cancelled
 		// before the response arrives, the fetch leaves no spool at all.
+		deadline := time.Now().Add(10 * time.Second)
 		for {
 			if fi, err := os.Stat(spool); err == nil && fi.Size() >= 64<<10 {
+				cancel()
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Error("timed out waiting for the spool to hold the chunk")
 				cancel()
 				return
 			}
@@ -1851,6 +1857,8 @@ func TestFetcher_PoolSlowDoesNotBlockFast(t *testing.T) {
 	r.request("tshell", "amd64", 0)
 	stop := r.startRun()
 	defer stop()
+	// The slow download is tlive/amd64: it must be claimed before the fast one is judged.
+	r.waitRow(tliveAMD64(), fleet.CacheFetching)
 
 	r.waitRow(tshellAMD64(), fleet.CacheReady)
 
@@ -1961,21 +1969,24 @@ func TestFetcher_ReservationReleasedOnFailure(t *testing.T) {
 		name string
 		// first serves the first download's object; cancel ends its context.
 		first func(object []byte, cancel context.CancelFunc) http.Handler
+		// wantState and wantAttempts are where tlive/amd64, the first row claimed, ends.
+		wantState    fleet.CacheState
+		wantAttempts int
 	}{
 		{"integrity failure", func(object []byte, _ context.CancelFunc) http.Handler {
 			bad := slices.Clone(object)
 			bad[0] ^= 0xff
 			return serveObject(bad)
-		}},
+		}, fleet.CacheBroken, 1},
 		{"other failure", func([]byte, context.CancelFunc) http.Handler {
 			return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusServiceUnavailable) })
-		}},
+		}, fleet.CacheFailed, 1},
 		{"cancelled", func(_ []byte, cancel context.CancelFunc) http.Handler {
 			return http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 				cancel()
 				<-r.Context().Done()
 			})
-		}},
+		}, fleet.CacheFetching, 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1998,10 +2009,84 @@ func TestFetcher_ReservationReleasedOnFailure(t *testing.T) {
 			if claimed, _ := r.w.runOnce(ctx); !claimed {
 				t.Fatal("the first runOnce claimed nothing")
 			}
+			// The first claim must have been tlive/amd64, the row whose upstream misbehaves.
+			if got := r.row(tliveAMD64()).State; got == fleet.CacheWanted {
+				t.Fatalf("tlive/amd64 is %s, want it claimed first", got)
+			}
+			r.wantRow(tliveAMD64(), tt.wantState, tt.wantAttempts)
 			r.fetchOnce()
 
 			r.wantRow(tliveARM64(), fleet.CacheReady, 0)
 		})
+	}
+}
+
+// TestFetcher_SpooledObjectReservesItsExtraction holds a job on an object that
+// is whole in the spool: extracting it still writes about its size into the
+// store, so the job holds that room, and another job's space check sees it.
+func TestFetcher_SpooledObjectReservesItsExtraction(t *testing.T) {
+	r := runScenario(t, func(t *testing.T, base string) scenario {
+		t.Helper()
+		sc := poolScenario(1, objectsAt)(t, base)
+		spooled, other := uint64(len(sc.fx.Objects[base+"/tlive-amd64.zip"])), uint64(len(sc.fx.Objects[base+"/tlive-arm64.zip"]))
+		// Room for the spooled job's extraction and, but for it, the other job's whole need.
+		free := spooled + spaceReserve + 2*other + spaceReserve - 1
+		sc.seed = func(t *testing.T, h *harness, e catalog.Entry) {
+			t.Helper()
+			seedSpool(t, h, e, sc.fx.Objects[base+"/tlive-amd64.zip"], "")
+		}
+		sc.tune = func(f *Fetcher) { f.statfs = func(string) (uint64, error) { return free, nil } }
+		return sc
+	})
+	arm := r.request("tlive", "arm64", 0)
+	jobOf := func(key fleet.CacheKey, e catalog.Entry) *fetchJob {
+		t.Helper()
+		root, err := os.OpenRoot(r.spool)
+		if err != nil {
+			t.Fatalf("OpenRoot: %v", err)
+		}
+		return &fetchJob{f: r.f, row: r.row(key), entry: e, root: root}
+	}
+	spooledJob, otherJob := jobOf(tliveAMD64(), r.e), jobOf(tliveARM64(), arm)
+	defer spooledJob.close(t.Context())
+	defer otherJob.close(t.Context())
+
+	if err := spooledJob.download(t.Context(), 0); err != nil {
+		t.Fatalf("download of the spooled object: %v", err)
+	}
+
+	if want := uint64(r.e.Pin.Objects[0].Size) + spaceReserve; r.f.reserved != want {
+		t.Errorf("reserved = %d, want %d: the extraction share and spaceReserve", r.f.reserved, want)
+	}
+	if err := otherJob.download(t.Context(), 0); err == nil || !strings.Contains(err.Error(), "reserved") {
+		t.Errorf("the other job's download = %v, want a free space refusal that names what is reserved", err)
+	}
+}
+
+// TestFetchJob_ReserveSpaceSwaps pins that a job with several objects holds one
+// reservation, the latest, not a stack of them: its first object is on the disk
+// by the time it asks for the second, so counting it again would refuse the job
+// for room it does not need.
+func TestFetchJob_ReserveSpaceSwaps(t *testing.T) {
+	h := newHarness(t, catalogtest.New(t, "https://example.test").Catalog, NewHTTPClient(testUserAgent, nil))
+	const first, second = int64(1 << 20), int64(2 << 20)
+	need2 := 2*uint64(second) + spaceReserve
+	h.f.statfs = func(string) (uint64, error) { return need2, nil } // room for one of them
+	j := &fetchJob{f: h.f}
+
+	if err := j.reserveSpace(first, 2); err != nil {
+		t.Fatalf("reserveSpace of the first object: %v", err)
+	}
+	if err := j.reserveSpace(second, 2); err != nil {
+		t.Fatalf("reserveSpace of the second object: %v, want the first reservation swapped out, not counted against it", err)
+	}
+
+	if h.f.reserved != need2 || j.reserved != need2 {
+		t.Errorf("reserved = %d, job holds %d; want both %d", h.f.reserved, j.reserved, need2)
+	}
+	j.close(t.Context())
+	if h.f.reserved != 0 {
+		t.Errorf("reserved after close = %d, want 0", h.f.reserved)
 	}
 }
 
