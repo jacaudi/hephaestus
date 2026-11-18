@@ -7,6 +7,9 @@
     <marker id="arrow" viewBox="0 0 10 10" refX="2.9" refY="5" markerUnits="userSpaceOnUse" markerWidth="13" markerHeight="13" orient="auto-start-reverse">
       <path d="M0,0.4 L10,5 L0,9.6 L2.9,5 Z" fill="var(--arrowhead)"/>
     </marker>
+    <marker id="arrow-client" viewBox="0 0 10 10" refX="2.9" refY="5" markerUnits="userSpaceOnUse" markerWidth="13" markerHeight="13" orient="auto-start-reverse">
+      <path d="M0,0.4 L10,5 L0,9.6 L2.9,5 Z" fill="var(--client)"/>
+    </marker>
     <marker id="arrow-server" viewBox="0 0 10 10" refX="2.9" refY="5" markerUnits="userSpaceOnUse" markerWidth="13" markerHeight="13" orient="auto-start-reverse">
       <path d="M0,0.4 L10,5 L0,9.6 L2.9,5 Z" fill="var(--server)"/>
     </marker>
@@ -63,6 +66,7 @@
       .db-box { fill: var(--db-fill); stroke: var(--db); stroke-width: 1.5; }
       .badge { fill: var(--box-fill); stroke: var(--server); stroke-width: 1.5; }
       .arrow { stroke: var(--arrow); stroke-width: 2; fill: none; marker-end: url(#arrow); stroke-linecap: butt; stroke-linejoin: round; }
+      .a-client { stroke: var(--client); marker-end: url(#arrow-client); }
       .a-server { stroke: var(--server); marker-end: url(#arrow-server); }
       .a-both { marker-start: url(#arrow-server); }
       .a-mgmt { stroke: var(--mgmt); marker-end: url(#arrow-mgmt); }
@@ -137,10 +141,10 @@
 
   <!-- the machine talks to each service, in boot order -->
   <g>
-    <path class="arrow a-server" d="M220,240 C 262,240 282,138 310.77,138"/>
-    <path class="arrow a-server" d="M220,240 C 262,240 282,230 310.77,230"/>
-    <path class="arrow a-server" d="M220,240 C 262,240 282,322 310.77,322"/>
-    <path class="arrow a-server" d="M220,240 C 262,240 282,414 310.77,414"/>
+    <path class="arrow a-client" d="M220,240 C 262,240 282,138 310.77,138"/>
+    <path class="arrow a-client" d="M220,240 C 262,240 282,230 310.77,230"/>
+    <path class="arrow a-client" d="M220,240 C 262,240 282,322 310.77,322"/>
+    <path class="arrow a-client" d="M220,240 C 262,240 282,414 310.77,414"/>
   </g>
 
   <!-- ===================== RIGHT: ADMIN AND TLS ===================== -->
