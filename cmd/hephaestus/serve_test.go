@@ -337,15 +337,15 @@ func TestRunServe_ServesAndDrains(t *testing.T) {
 	}
 
 	tlsClient := testClient(&tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13})
-	boot := get(t, tlsClient, deps.httpsURL()+"/boot?"+bootQuery)
-	if boot.status != http.StatusOK {
-		t.Errorf("GET /boot status = %d, want 200", boot.status)
+	bootResp := get(t, tlsClient, deps.httpsURL()+"/boot?"+bootQuery)
+	if bootResp.status != http.StatusOK {
+		t.Errorf("GET /boot status = %d, want 200", bootResp.status)
 	}
-	if !strings.HasPrefix(boot.body, "#!ipxe\nparams\n") {
-		t.Errorf("GET /boot body = %q, want an iPXE script starting with params", boot.body)
+	if !strings.HasPrefix(bootResp.body, "#!ipxe\nparams\n") {
+		t.Errorf("GET /boot body = %q, want an iPXE script starting with params", bootResp.body)
 	}
-	if boot.tlsVersion != tls.VersionTLS13 {
-		t.Errorf("GET /boot TLS version = %#x, want TLS 1.3 (%#x)", boot.tlsVersion, tls.VersionTLS13)
+	if bootResp.tlsVersion != tls.VersionTLS13 {
+		t.Errorf("GET /boot TLS version = %#x, want TLS 1.3 (%#x)", bootResp.tlsVersion, tls.VersionTLS13)
 	}
 
 	metrics := get(t, testClient(nil), deps.adminURL()+"/metrics")
@@ -406,11 +406,11 @@ func TestRunServe_NoSessionTickets(t *testing.T) {
 		ClientSessionCache: cache,
 	})
 	for i := range 2 {
-		boot := get(t, tlsClient, deps.httpsURL()+"/boot?"+bootQuery)
-		if boot.status != http.StatusOK {
-			t.Errorf("connection %d: GET /boot status = %d, want 200", i+1, boot.status)
+		bootResp := get(t, tlsClient, deps.httpsURL()+"/boot?"+bootQuery)
+		if bootResp.status != http.StatusOK {
+			t.Errorf("connection %d: GET /boot status = %d, want 200", i+1, bootResp.status)
 		}
-		if boot.resumed {
+		if bootResp.resumed {
 			t.Errorf("connection %d: the handshake resumed a session, so the server issued a ticket", i+1)
 		}
 		if n := cache.stored.Load(); n != 0 {
