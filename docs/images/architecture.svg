@@ -70,6 +70,7 @@
       .a-tls { stroke: var(--tls); marker-end: url(#arrow-tls); }
       .arrowhead { fill: var(--arrowhead); }
       .icon { fill: none; stroke: var(--icon); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+      .icon-db { stroke: var(--db); }
       .center { text-anchor: middle; }
       .end { text-anchor: end; }
     </style>
@@ -185,8 +186,8 @@
   <line class="arrow a-server" x1="390" y1="598" x2="283.23" y2="598"/>
 
   <rect class="db-box" x="740" y="556" width="230" height="84" rx="10" filter="url(#shadow)"/>
-  <!-- database icon, same line weight as the monitor icon (.icon, 2) -->
-  <g transform="translate(934,567)" class="icon" stroke="var(--db)">
+  <!-- database icon: the .icon line weight, in the colour of its box -->
+  <g transform="translate(934,567)" class="icon icon-db">
     <ellipse cx="9" cy="3.5" rx="9" ry="3.5"/>
     <path d="M0,3.5 V16.5 A9,3.5 0 0 0 18,16.5 V3.5"/>
     <path d="M0,10 A9,3.5 0 0 0 18,10"/>
