@@ -2332,6 +2332,15 @@ func TestFloorReader(t *testing.T) {
 		}
 		return steps
 	}
+	// halves is a Read every half second at exactly the floor, from the first
+	// to past the first judged second, so one second holds two Reads.
+	halves := func() []step {
+		var steps []step
+		for at := 500 * time.Millisecond; at <= ThroughputWindow+5*time.Second; at += 500 * time.Millisecond {
+			steps = append(steps, step{at: at, n: perSecond / 2})
+		}
+		return steps
+	}
 	// pulsed is cycles rounds of a one byte Read, then half a second later a
 	// burst of burst bytes, one gap apart (under the idle timeout), and then a
 	// one byte Read that must be cut off: the burst every 59 s averages
@@ -2358,6 +2367,7 @@ func TestFloorReader(t *testing.T) {
 			{at: ThroughputWindow, n: 1}, // the burst is still inside the last window
 			{at: ThroughputWindow + time.Second, n: 1, wantErr: errTooSlow},
 		}},
+		{"exactly the floor in half-second Reads passes", halves()},
 		{"bursts spaced by the idle limit do not hide a slow average", pulsed(3, 59*time.Second, 1_320_000)},
 		{"a read that ends the body is not judged", []step{{at: time.Minute, n: 1}, {at: 3 * ThroughputWindow, srcErr: io.EOF, wantErr: io.EOF}}},
 	}

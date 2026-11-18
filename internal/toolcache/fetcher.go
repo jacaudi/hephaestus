@@ -891,8 +891,10 @@ func (f *floorReader) Read(p []byte) (int, error) {
 	}
 	now := f.now()
 	// Every Read lands in its second's sample, so each counted byte belongs to
-	// a sample at most floorSampleEvery from when it arrived.
-	if last := &f.samples[len(f.samples)-1]; last.at.Sub(f.start)/floorSampleEvery == now.Sub(f.start)/floorSampleEvery {
+	// a sample at most floorSampleEvery from when it arrived. The start sample
+	// is never overwritten: it is the baseline until a later one is at or before
+	// the cutoff.
+	if last := &f.samples[len(f.samples)-1]; len(f.samples) > 1 && last.at.Sub(f.start)/floorSampleEvery == now.Sub(f.start)/floorSampleEvery {
 		last.at, last.total = now, f.total
 	} else {
 		f.samples = append(f.samples, floorSample{at: now, total: f.total})
