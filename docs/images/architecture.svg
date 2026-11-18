@@ -1,0 +1,210 @@
+<svg viewBox="0 0 1010 780" xmlns="http://www.w3.org/2000/svg" role="img"
+     aria-label="Architecture: a booting machine on the provisioning VLAN talks, in boot order, to four hephaestus services on the provisioning interface: proxyDHCP on UDP 67 and 4011, TFTP serving the embedded iPXE binaries, HTTP on port 80 for /start, /boot, /tftp and /u/ utility files, and HTTPS on port 443 for /boot and /discover over TLS 1.3. The HTTPS service gets its certificate from files written by an external tool in file mode, or from a TLS-terminating proxy in proxy mode. An admin listener on port 9090, on a management address off the VLAN, serves the health and metrics routes. The services and the admin listener use the data directory, which holds the SQLite or Postgres fleet state and the content store. A fetcher, running four parallel downloads by default, fills the content store from upstream mirrors over TLS 1.3.">
+  <defs>
+    <!-- swept arrowheads -->
+    <marker id="arrow" viewBox="0 0 10 10" refX="9.2" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0.4 L10,5 L0,9.6 L2.9,5 Z" class="arrowhead"/>
+    </marker>
+    <marker id="arrow-server" viewBox="0 0 10 10" refX="9.2" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0.4 L10,5 L0,9.6 L2.9,5 Z" fill="var(--server)"/>
+    </marker>
+    <marker id="arrow-mgmt" viewBox="0 0 10 10" refX="9.2" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0.4 L10,5 L0,9.6 L2.9,5 Z" fill="var(--mgmt)"/>
+    </marker>
+    <marker id="arrow-db" viewBox="0 0 10 10" refX="9.2" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0.4 L10,5 L0,9.6 L2.9,5 Z" fill="var(--db)"/>
+    </marker>
+    <!-- flows that cross a zone border carry the colour of where they come from and go to -->
+    <linearGradient id="flow-boot" gradientUnits="userSpaceOnUse" x1="220" y1="240" x2="318" y2="240">
+      <stop offset="0" stop-color="var(--client)"/>
+      <stop offset="1" stop-color="var(--server)"/>
+    </linearGradient>
+    <linearGradient id="flow-tls" gradientUnits="userSpaceOnUse" x1="700" y1="414" x2="642" y2="414">
+      <stop offset="0" stop-color="var(--tls)"/>
+      <stop offset="1" stop-color="var(--server)"/>
+    </linearGradient>
+    <linearGradient id="flow-fetch" gradientUnits="userSpaceOnUse" x1="455" y1="690" x2="455" y2="642">
+      <stop offset="0" stop-color="var(--arrow)"/>
+      <stop offset="1" stop-color="var(--db)"/>
+    </linearGradient>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="1.5" stdDeviation="3" flood-color="#000000" flood-opacity="0.16"/>
+    </filter>
+    <style>
+      :root {
+        --text: #1f2328; --muted: #57606a; --bg: #ffffff;
+        --zone-fill: #f6f8fa; --zone-stroke: #b6bcc4;
+        --box-fill: #ffffff; --box-stroke: #d0d7de;
+        --client: #1a7f37; --client-fill: #e6f8ec;
+        --server: #0969da; --server-fill: #eaf5ff;
+        --db: #8250df; --db-fill: #f8f0ff;
+        --mgmt: #1b7c83; --mgmt-fill: #e0f7f8;
+        --tls: #bc4c00; --tls-fill: #fff1e5;
+        --arrow: #6e7781; --arrowhead: #6e7781; --icon: #6e7781;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --text: #e6edf3; --muted: #9198a1; --bg: #0d1117;
+          --zone-fill: #161b22; --zone-stroke: #3d4450;
+          --box-fill: #161b22; --box-stroke: #30363d;
+          --client: #56d364; --client-fill: #10261a;
+          --server: #58a6ff; --server-fill: #0c1f33;
+          --db: #d2a8ff; --db-fill: #1e1329;
+          --mgmt: #39c5cf; --mgmt-fill: #0d2b2e;
+          --tls: #f0883e; --tls-fill: #2b1a0e;
+          --arrow: #8b949e; --arrowhead: #8b949e; --icon: #8b949e;
+        }
+      }
+      text { font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; fill: var(--text); }
+      .title { font-size: 16px; font-weight: 700; }
+      .sub { font-size: 12.5px; font-style: italic; fill: var(--muted); }
+      .h { font-size: 14.5px; font-weight: 700; }
+      .b { font-size: 12.5px; fill: var(--muted); }
+      .lbl { font-size: 12.5px; fill: var(--muted); }
+      .num { font-size: 12.5px; font-weight: 700; fill: var(--server); }
+      .zone { fill: var(--zone-fill); stroke: var(--zone-stroke); stroke-width: 1.5; stroke-dasharray: 5 4; }
+      .box { fill: var(--box-fill); stroke: var(--box-stroke); stroke-width: 1.5; }
+      .client-box { fill: var(--client-fill); stroke: var(--client); stroke-width: 1.75; }
+      .server-box { fill: var(--server-fill); stroke: var(--server); stroke-width: 1.75; }
+      .mgmt-box { fill: var(--mgmt-fill); stroke: var(--mgmt); stroke-width: 1.75; }
+      .tls-box { fill: var(--tls-fill); stroke: var(--tls); stroke-width: 1.75; }
+      .db-box { fill: var(--db-fill); stroke: var(--db); stroke-width: 1.5; }
+      .badge { fill: var(--box-fill); stroke: var(--server); stroke-width: 1.5; }
+      .arrow { stroke: var(--arrow); stroke-width: 1.9; fill: none; marker-end: url(#arrow); stroke-linecap: round; stroke-linejoin: round; }
+      .flow { fill: none; stroke-width: 2.4; stroke-linecap: round; }
+      .arrowhead { fill: var(--arrowhead); }
+      .icon { fill: none; stroke: var(--icon); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+      .center { text-anchor: middle; }
+      .end { text-anchor: end; }
+    </style>
+  </defs>
+
+  <rect x="0" y="0" width="1010" height="780" fill="var(--bg)"/>
+
+  <!-- ===================== LEFT: PROVISIONING VLAN ===================== -->
+  <rect class="zone" x="20" y="40" width="220" height="428" rx="18"/>
+  <text class="title" x="40" y="72">Provisioning VLAN</text>
+
+  <rect class="client-box" x="40" y="190" width="180" height="100" rx="12" filter="url(#shadow)"/>
+  <g transform="translate(56,202)" class="icon" stroke="var(--client)">
+    <rect x="0" y="0" width="28" height="19" rx="2.5"/>
+    <path d="M9,26 H19 M14,19 V26"/>
+  </g>
+  <text class="h" x="56" y="254">Booting machine</text>
+  <text class="b" x="56" y="272">PXE firmware, then iPXE</text>
+
+  <!-- ===================== MIDDLE: HEPHAESTUS SERVICES ===================== -->
+  <rect class="zone" x="290" y="40" width="380" height="428" rx="18"/>
+  <text class="title" x="310" y="70">hephaestus serve</text>
+  <text class="sub" x="310" y="89">boot services on the provisioning interface</text>
+
+  <!-- 1 proxyDHCP -->
+  <rect class="server-box" x="320" y="104" width="320" height="68" rx="10" filter="url(#shadow)"/>
+  <circle class="badge" cx="344" cy="138" r="11"/>
+  <text class="num center" x="344" y="142.5">1</text>
+  <text class="h" x="368" y="128">proxyDHCP</text>
+  <text class="b" x="368" y="146">UDP 67 and 4011</text>
+  <text class="b" x="368" y="162">offers the PXE boot file</text>
+
+  <line class="arrow" x1="480" y1="172" x2="480" y2="194"/>
+
+  <!-- 2 TFTP -->
+  <rect class="server-box" x="320" y="196" width="320" height="68" rx="10" filter="url(#shadow)"/>
+  <circle class="badge" cx="344" cy="230" r="11"/>
+  <text class="num center" x="344" y="234.5">2</text>
+  <text class="h" x="368" y="220">TFTP</text>
+  <text class="b" x="368" y="238">UDP 69</text>
+  <text class="b" x="368" y="254">serves the embedded iPXE binaries</text>
+
+  <line class="arrow" x1="480" y1="264" x2="480" y2="286"/>
+
+  <!-- 3 HTTP -->
+  <rect class="server-box" x="320" y="288" width="320" height="68" rx="10" filter="url(#shadow)"/>
+  <circle class="badge" cx="344" cy="322" r="11"/>
+  <text class="num center" x="344" y="326.5">3</text>
+  <text class="h" x="368" y="312">HTTP :80</text>
+  <text class="b" x="368" y="330">/start · /boot (chain to HTTPS)</text>
+  <text class="b" x="368" y="346">/tftp · /u/ utility files</text>
+
+  <line class="arrow" x1="480" y1="356" x2="480" y2="378"/>
+
+  <!-- 4 HTTPS -->
+  <rect class="server-box" x="320" y="380" width="320" height="68" rx="10" filter="url(#shadow)"/>
+  <circle class="badge" cx="344" cy="414" r="11"/>
+  <text class="num center" x="344" y="418.5">4</text>
+  <text class="h" x="368" y="404">HTTPS :443</text>
+  <text class="b" x="368" y="422">/boot · /discover</text>
+  <text class="b" x="368" y="438">TLS 1.3</text>
+
+  <!-- the machine talks to each service, in boot order -->
+  <g>
+    <path class="flow" stroke="url(#flow-boot)" marker-end="url(#arrow-server)" d="M220,240 C 262,240 282,138 318,138"/>
+    <path class="flow" stroke="url(#flow-boot)" marker-end="url(#arrow-server)" d="M220,240 C 262,240 282,230 318,230"/>
+    <path class="flow" stroke="url(#flow-boot)" marker-end="url(#arrow-server)" d="M220,240 C 262,240 282,322 318,322"/>
+    <path class="flow" stroke="url(#flow-boot)" marker-end="url(#arrow-server)" d="M220,240 C 262,240 282,414 318,414"/>
+  </g>
+
+  <!-- ===================== RIGHT: ADMIN AND TLS ===================== -->
+  <rect class="zone" x="700" y="40" width="290" height="170" rx="18"/>
+  <text class="title" x="720" y="72">Management network</text>
+  <text class="sub" x="720" y="90">off the provisioning VLAN</text>
+  <rect class="mgmt-box" x="720" y="104" width="250" height="86" rx="10" filter="url(#shadow)"/>
+  <text class="h" x="738" y="128">Admin listener :9090</text>
+  <text class="b" x="738" y="146">default 127.0.0.1:9090</text>
+  <text class="b" x="738" y="162">/healthz · /readyz</text>
+  <text class="b" x="738" y="178">/health · /metrics</text>
+
+  <!-- TLS source -->
+  <rect class="tls-box" x="700" y="262" width="240" height="190" rx="12" filter="url(#shadow)"/>
+  <text class="h" x="718" y="288" fill="var(--tls)" style="fill: var(--tls)">TLS source</text>
+  <text class="b" x="718" y="310" style="font-weight: 700; fill: var(--text)">file mode (default)</text>
+  <text class="b" x="718" y="327">cert and key files written by</text>
+  <text class="b" x="718" y="343">certbot, lego or cert-manager;</text>
+  <text class="b" x="718" y="359">re-read every minute</text>
+  <text class="b" x="718" y="388" style="font-weight: 700; fill: var(--text)">proxy mode</text>
+  <text class="b" x="718" y="405">a TLS 1.3 proxy terminates TLS</text>
+  <text class="b" x="718" y="421">and forwards plain HTTP to</text>
+  <text class="b" x="718" y="437">HEPHAESTUS_PROXY_ADDRESS</text>
+
+  <path class="flow" stroke="url(#flow-tls)" marker-end="url(#arrow-server)" d="M700,414 H642"/>
+
+  <!-- ===================== BOTTOM: DATA DIRECTORY ===================== -->
+  <rect class="zone" x="20" y="510" width="970" height="150" rx="18"/>
+  <text class="title" x="40" y="538">Data directory</text>
+  <text class="sub" x="168" y="538">HEPHAESTUS_DATA_DIR, /var/lib/hephaestus by default</text>
+
+  <rect class="db-box" x="40" y="556" width="230" height="84" rx="10" filter="url(#shadow)"/>
+  <text class="h" x="58" y="582">Content store</text>
+  <text class="b" x="58" y="600">utility OS files in an OCI</text>
+  <text class="b" x="58" y="616">image layout, served at /u/</text>
+
+  <rect class="server-box" x="340" y="556" width="230" height="84" rx="10" filter="url(#shadow)"/>
+  <text class="h" x="358" y="582">Fetcher</text>
+  <text class="b" x="358" y="600">4 parallel downloads by</text>
+  <text class="b" x="358" y="616">default (1 to 16)</text>
+
+  <line class="arrow" x1="340" y1="598" x2="272" y2="598" style="marker-end: url(#arrow-db)"/>
+
+  <g transform="translate(700,552)" filter="url(#shadow)">
+    <path class="db-box" d="M0,12 L0,80 A135,12 0 0 0 270,80 L270,12 Z"/>
+    <ellipse cx="135" cy="12" rx="135" ry="12" class="db-box"/>
+  </g>
+  <text class="h center" x="835" y="594">SQLite or Postgres</text>
+  <text class="b center" x="835" y="612">fleet state</text>
+  <text class="b center" x="835" y="628">SQLite file in the data dir by default</text>
+
+  <!-- the boot services and the admin listener use the data directory -->
+  <line class="arrow" x1="480" y1="468" x2="480" y2="508" style="stroke: var(--server); marker-end: url(#arrow-server)"/>
+  <text class="lbl" x="492" y="494">fleet state and utility files</text>
+  <line class="arrow" x1="960" y1="190" x2="960" y2="508" style="stroke: var(--mgmt); marker-end: url(#arrow-mgmt)"/>
+  <text class="lbl end" x="948" y="494">health checks</text>
+
+  <!-- ===================== BELOW: UPSTREAM ===================== -->
+  <rect class="box" x="340" y="690" width="230" height="70" rx="10" filter="url(#shadow)"/>
+  <text class="h" x="358" y="718">Upstream mirrors</text>
+  <text class="b" x="358" y="737">utility OS downloads</text>
+  <path class="flow" stroke="url(#flow-fetch)" marker-end="url(#arrow-db)" d="M455,690 V642"/>
+  <text class="lbl" x="470" y="678">downloaded over TLS 1.3</text>
+
+  <text class="sub" x="40" y="720">Numbers 1 to 4 give the boot order.</text>
+</svg>

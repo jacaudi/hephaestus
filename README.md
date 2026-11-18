@@ -105,17 +105,7 @@ or root. What the host must provide is in [Run the image](docs/deployment.md).
 
 ## How it works
 
-```
- provisioning VLAN (HEPHAESTUS_PROVISIONING_ADDRESS)       management address
- +---------------------------------------------------+     +----------------+
- | proxyDHCP -> TFTP -> HTTP :80 -> HTTPS :443       |     | admin :9090    |
- +---------------------------------------------------+     +----------------+
-                          |                                        |
-                          +-------------------+--------------------+
-                                              |
-              SQLite or Postgres, and the content store in the data dir
- TLS: certificate files written by an external tool, or a TLS-terminating proxy
-```
+![A booting machine on the provisioning VLAN reaches four hephaestus services in boot order (proxyDHCP, TFTP, HTTP :80 and HTTPS :443), and the HTTPS service gets its TLS from certificate files or a TLS-terminating proxy. The services and an admin listener off the VLAN use the data directory, where a fetcher fills the content store from upstream mirrors over TLS 1.3.](docs/images/architecture.svg)
 
 | Component | Job |
 |---|---|
