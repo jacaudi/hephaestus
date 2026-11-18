@@ -2215,7 +2215,8 @@ func (b linkBody) Read(p []byte) (int, error) {
 }
 
 // simulateLink makes f's downloads run at rate bytes per simulated second, on a
-// clock that moves only with the bytes read.
+// clock that moves only with the bytes read. It replaces f's client's
+// Transport, so a scenario's client must not be shared with another scenario.
 func simulateLink(f *Fetcher, rate int64) {
 	clk := &simClock{}
 	f.now = clk.Now
@@ -2331,6 +2332,19 @@ func TestFloorReader(t *testing.T) {
 		}
 		return steps
 	}
+	// pulsed is cycles rounds of a one byte Read, then half a second later a
+	// burst of burst bytes, one gap apart (under the idle timeout), and then a
+	// one byte Read that must be cut off: the burst every 59 s averages
+	// 21.8 KiB/s, but a baseline that lags the window's start counts a burst
+	// from before the window, and the upstream is never cut.
+	pulsed := func(cycles int, gap time.Duration, burst int) []step {
+		var steps []step
+		for k := range cycles {
+			at := time.Duration(k) * gap
+			steps = append(steps, step{at: at, n: 1}, step{at: at + 500*time.Millisecond, n: burst})
+		}
+		return append(steps, step{at: time.Duration(cycles) * gap, n: 1, wantErr: errTooSlow})
+	}
 	tests := []struct {
 		name  string
 		steps []step
@@ -2344,6 +2358,7 @@ func TestFloorReader(t *testing.T) {
 			{at: ThroughputWindow, n: 1}, // the burst is still inside the last window
 			{at: ThroughputWindow + time.Second, n: 1, wantErr: errTooSlow},
 		}},
+		{"bursts spaced by the idle limit do not hide a slow average", pulsed(3, 59*time.Second, 1_320_000)},
 		{"a read that ends the body is not judged", []step{{at: time.Minute, n: 1}, {at: 3 * ThroughputWindow, srcErr: io.EOF, wantErr: io.EOF}}},
 	}
 	for _, tt := range tests {

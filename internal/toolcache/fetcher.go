@@ -850,8 +850,8 @@ func (i *idleReader) Read(p []byte) (int, error) {
 // Stop ends the idle timer.
 func (i *idleReader) Stop() { i.timer.Stop() }
 
-// floorSampleEvery is how often a floorReader keeps a sample of its running
-// total; it bounds the samples to about one window's worth.
+// floorSampleEvery is the width of the buckets a floorReader keeps one sample
+// of its running total for; it bounds the samples to about one window's worth.
 const floorSampleEvery = time.Second
 
 type floorSample struct {
@@ -881,6 +881,8 @@ func newFloorReader(r io.Reader, now func() time.Time) *floorReader {
 
 // Read implements io.Reader. A Read that returns an error, the end of the body
 // included, is not judged. The bytes of the Read that fails are still returned.
+// The final Read that returns data can still be cut off; that is harmless, as
+// the spool is then complete and the next attempt finishes the download.
 func (f *floorReader) Read(p []byte) (int, error) {
 	n, err := f.r.Read(p)
 	f.total += int64(n)
@@ -888,7 +890,11 @@ func (f *floorReader) Read(p []byte) (int, error) {
 		return n, err
 	}
 	now := f.now()
-	if now.Sub(f.samples[len(f.samples)-1].at) >= floorSampleEvery {
+	// Every Read lands in its second's sample, so each counted byte belongs to
+	// a sample at most floorSampleEvery from when it arrived.
+	if last := &f.samples[len(f.samples)-1]; last.at.Sub(f.start)/floorSampleEvery == now.Sub(f.start)/floorSampleEvery {
+		last.at, last.total = now, f.total
+	} else {
 		f.samples = append(f.samples, floorSample{at: now, total: f.total})
 	}
 	if now.Sub(f.start) < ThroughputWindow {
@@ -898,8 +904,9 @@ func (f *floorReader) Read(p []byte) (int, error) {
 	for len(f.samples) > 1 && !f.samples[1].at.After(cutoff) {
 		f.samples = f.samples[1:]
 	}
-	// ponytail: samples are a second apart, so the window may run up to a second
-	// past ThroughputWindow, in the upstream's favour; exact bucketing if that matters.
+	// ponytail: the first kept sample's second may start before the cutoff, so
+	// up to floorSampleEvery of bytes from before the window count, in the
+	// upstream's favour; exact accounting if that second matters.
 	if f.total-f.samples[0].total < MinThroughput*int64(ThroughputWindow/time.Second) {
 		return n, errTooSlow
 	}
