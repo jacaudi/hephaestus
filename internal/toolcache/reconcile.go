@@ -42,6 +42,9 @@ type ReconcileReport struct {
 	Restored int
 	// SpoolRemoved is the spool files and directories removed.
 	SpoolRemoved int
+	// SpoolErr joins what the spool sweep could not do. It is not an error of
+	// Reconcile: leftovers are only disk, as garbage is.
+	SpoolErr error
 }
 
 // Reconcile creates the spool directory when it is missing, then brings the
@@ -53,7 +56,8 @@ type ReconcileReport struct {
 // and every spool file that is not a current pin's is removed. It runs before
 // the fetcher starts. It stops at the first repository error, which a done ctx
 // causes, and at the first store error that is not lost content (see
-// store.ContentLost), such as a permission failure.
+// store.ContentLost), such as a permission failure. A spool that cannot be
+// swept is not one of those stops: the report carries the failure in SpoolErr.
 func Reconcile(ctx context.Context, cfg ReconcileConfig) (ReconcileReport, error) {
 	var rep ReconcileReport
 	if err := os.MkdirAll(cfg.SpoolDir, spoolDirMode); err != nil {
@@ -94,8 +98,8 @@ func Reconcile(ctx context.Context, cfg ReconcileConfig) (ReconcileReport, error
 		}
 	}
 
-	rep.SpoolRemoved, err = sweepSpool(cfg)
-	return rep, err
+	rep.SpoolRemoved, rep.SpoolErr = sweepSpool(cfg)
+	return rep, nil
 }
 
 // reconcileRow settles one row against the catalog and the store. A ready row

@@ -178,7 +178,7 @@ Shell access to the container is the authorization; the CLI has no network surfa
 | `repinned` | A row at an older pin moves to `wanted` at the catalog's pin, with its attempts and error reset |
 | `requeued` | A `ready` row whose tag or any layer is missing or the wrong size goes back to `wanted`, so a restored or repaired host refetches its cache unattended |
 | `restored` | A `wanted` or `failed` row whose content is complete in the store becomes `ready` (a crash between tagging and the state update). A `broken` row stays broken |
-| `spool_removed` | Spool files that no current pin owns are deleted |
+| `spool_removed` | Spool files that no current pin owns are deleted. A sweep that cannot do it logs `utility spool sweep failed` at Warn and `serve` carries on: the leftovers are only disk |
 
 **Garbage collection is restart-only.** After reconciliation, `serve` untags every `utility/*` tag that is not a current entry's, logs `utility garbage collected` with the `untagged` count, and deletes the blobs no tag reaches. The store spares unreferenced blobs written in the last hour. Tags outside `utility/` are never touched. Nothing collects while `serve` runs, so a catalog change frees its disk on the next restart. A collection that fails logs `utility garbage collection failed` at Warn and `serve` carries on: the garbage is only disk. A reconciliation that fails stops `serve` with the error, and so does content the store cannot read (a permission or I/O error): only content the store lacks (an unknown tag, a missing or wrong-sized layer) requeues a `ready` row.
 

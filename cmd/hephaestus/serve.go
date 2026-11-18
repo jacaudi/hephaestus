@@ -345,9 +345,9 @@ func runServe(ctx context.Context, cfg serveConfig, logger *slog.Logger, deps se
 // prepareUtility runs design section 5.7's steps 2 to 5: it reconciles the
 // cache rows, the store and the spool (creating the spool directory) with the
 // catalog, and collects the garbage of tags that are no longer current, logging
-// what each changed. A reconciliation failure is returned; a collection failure
-// is logged at Warn and startup goes on. It returns the fetcher over the same rows, store and
-// spool, not yet started.
+// what each changed. A reconciliation failure is returned; a spool sweep or a
+// collection failure is logged at Warn and startup goes on. It returns the
+// fetcher over the same rows, store and spool, not yet started.
 func prepareUtility(ctx context.Context, logger *slog.Logger, metrics *telemetry.Metrics, rc toolcache.ReconcileConfig, client *http.Client) (*toolcache.Fetcher, error) {
 	rep, err := toolcache.Reconcile(ctx, rc)
 	if err != nil {
@@ -356,6 +356,10 @@ func prepareUtility(ctx context.Context, logger *slog.Logger, metrics *telemetry
 	logger.InfoContext(ctx, "utility reconciled",
 		"interrupted", rep.Interrupted, "deleted", rep.Deleted, "repinned", rep.Repinned,
 		"requeued", rep.Requeued, "restored", rep.Restored, "spool_removed", rep.SpoolRemoved)
+	// Stray spool files are only disk, so a sweep that failed is not worth a stop.
+	if rep.SpoolErr != nil {
+		logger.WarnContext(ctx, "utility spool sweep failed", "error", rep.SpoolErr)
+	}
 	// Garbage is only disk, so a failed collection is not worth a stop.
 	if untagged, err := toolcache.CollectGarbage(ctx, rc.Store, rc.Catalog); err != nil {
 		logger.WarnContext(ctx, "utility garbage collection failed", "untagged", untagged, "error", err)

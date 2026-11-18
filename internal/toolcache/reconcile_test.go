@@ -384,6 +384,39 @@ func TestReconcile_UnreadableContentNotRequeued(t *testing.T) {
 	}
 }
 
+// TestReconcile_SpoolSweepFailureDoesNotFailReconcile pins that stray spool
+// files are only disk: a sweep that cannot remove them is reported in the
+// report, next to the counts of everything else Reconcile did, and is not an
+// error that stops serve.
+func TestReconcile_SpoolSweepFailureDoesNotFailReconcile(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores file modes")
+	}
+	e := newReconcileEnv(t)
+	e.insert(tliveAMD64(), e.pin(tliveAMD64()), fleet.CacheFetching, 0)
+	e.spoolFile("stray")
+	if err := os.Chmod(e.spool, 0o500); err != nil {
+		t.Fatalf("chmod spool dir: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chmod(e.spool, 0o700); err != nil {
+			t.Errorf("restore spool dir mode: %v", err)
+		}
+	})
+
+	rep, err := Reconcile(t.Context(), ReconcileConfig{Repo: e.repo, Store: e.st, Catalog: e.fx.Catalog, SpoolDir: e.spool, At: fetchT0()})
+
+	if err != nil {
+		t.Fatalf("Reconcile = %v, want nil: a sweep failure is the report's", err)
+	}
+	if rep.SpoolErr == nil {
+		t.Error("SpoolErr = nil, want the failure to remove the stray file")
+	}
+	if rep.Interrupted != 1 || rep.SpoolRemoved != 0 {
+		t.Errorf("report = %+v, want the interrupted row counted and nothing removed", rep)
+	}
+}
+
 func TestReconcile_CreatesSpoolDir(t *testing.T) {
 	e := newReconcileEnv(t)
 	e.spool = filepath.Join(t.TempDir(), "spool")

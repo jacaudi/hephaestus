@@ -1111,6 +1111,54 @@ func TestRunServe_FetchFailureDoesNotStopServe(t *testing.T) {
 	}
 }
 
+// TestRunServe_SpoolSweepFailureDoesNotStopServe pins that a spool that cannot
+// be swept is a Warn and not a stop, like a failed garbage collection: stray
+// files are only disk, and serve still comes ready.
+func TestRunServe_SpoolSweepFailureDoesNotStopServe(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores file modes")
+	}
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	var logs bytes.Buffer
+	cfg, root := testServeConfig(t)
+	spool := filepath.Join(cfg.DataDir, "spool")
+	if err := os.MkdirAll(spool, 0o700); err != nil {
+		t.Fatalf("create spool dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(spool, "stray"), []byte("partial"), 0o600); err != nil {
+		t.Fatalf("write stray spool file: %v", err)
+	}
+	if err := os.Chmod(spool, 0o500); err != nil {
+		t.Fatalf("chmod spool dir: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chmod(spool, 0o700); err != nil {
+			t.Errorf("restore spool dir mode: %v", err)
+		}
+	})
+	deps := testDeps(t, root)
+	stop, done := startServe(t, cfg, slog.New(slog.NewJSONHandler(&logs, nil)), deps)
+	waitStatus(t, deps.adminURL()+"/readyz", done)
+
+	stop()
+	if err := waitDone(t, done, 10*time.Second); err != nil {
+		t.Fatalf("runServe after cancel = %v, want nil", err)
+	}
+
+	// runServe has returned, so nothing writes to logs any more.
+	warned := logRecords(logs.Bytes(), "utility spool sweep failed")
+	if len(warned) != 1 {
+		t.Fatalf("%d \"utility spool sweep failed\" lines, want 1\n%s", len(warned), logs.String())
+	}
+	if rec := warned[0]; rec["level"] != "WARN" || rec["error"] == "" || rec["error"] == nil {
+		t.Errorf("record = %v, want level WARN and an error", rec)
+	}
+	if reconciled := logRecords(logs.Bytes(), "utility reconciled"); len(reconciled) != 1 {
+		t.Errorf("%d \"utility reconciled\" lines, want 1: the summary is still logged", len(reconciled))
+	}
+}
+
 // TestRunServe_GarbageCollectionFailureDoesNotStopServe pins that a failed
 // garbage collection is a Warn and not a stop: the garbage is only disk, and
 // serve still comes ready. A store directory nobody may write to makes the
