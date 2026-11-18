@@ -592,19 +592,18 @@ func runUtilitySuite(t *testing.T, open func(testing.TB) *db.DB) {
 		seedCache(t, d, fetching)
 		seedCache(t, d, ready)
 
-		at := t0.Add(time.Minute)
-		if err := r.RecordProgress(t.Context(), FetchProgress{Key: k, Pin: pinTwo, Done: 1, Total: 2, At: at}); err != nil {
+		if err := r.RecordProgress(t.Context(), FetchProgress{Key: k, Pin: pinTwo, Done: 1, Total: 2}); err != nil {
 			t.Fatalf("RecordProgress at another pin: %v", err)
 		}
 		wantCache(t, r, k, fetching)
 
-		if err := r.RecordProgress(t.Context(), FetchProgress{Key: k, Pin: pinOne, Done: 5, Total: 10, At: at}); err != nil {
+		if err := r.RecordProgress(t.Context(), FetchProgress{Key: k, Pin: pinOne, Done: 5, Total: 10}); err != nil {
 			t.Fatalf("RecordProgress: %v", err)
 		}
-		fetching.BytesDone, fetching.BytesTotal, fetching.UpdatedAt = 5, 10, at
+		fetching.BytesDone, fetching.BytesTotal = 5, 10 // updated_at stays at the last state change
 		wantCache(t, r, k, fetching)
 
-		if err := r.RecordProgress(t.Context(), FetchProgress{Key: ready.Key(), Pin: pinOne, Done: 5, Total: 10, At: at}); err != nil {
+		if err := r.RecordProgress(t.Context(), FetchProgress{Key: ready.Key(), Pin: pinOne, Done: 5, Total: 10}); err != nil {
 			t.Fatalf("RecordProgress on a ready row: %v", err)
 		}
 		wantCache(t, r, ready.Key(), ready)

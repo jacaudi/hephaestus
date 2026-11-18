@@ -767,7 +767,7 @@ func TestUtilityList_JSON(t *testing.T) {
 		if _, ok, err := c.repo.ClaimFetch(t.Context(), cliT0); err != nil || !ok {
 			t.Fatalf("ClaimFetch = %v, %v", ok, err)
 		}
-		if err := c.repo.RecordProgress(t.Context(), fleet.FetchProgress{Key: key, Pin: pin, Done: 1 << 20, Total: 4 << 20, At: cliT0}); err != nil {
+		if err := c.repo.RecordProgress(t.Context(), fleet.FetchProgress{Key: key, Pin: pin, Done: 1 << 20, Total: 4 << 20}); err != nil {
 			t.Fatalf("RecordProgress: %v", err)
 		}
 		row := rowFor(t, jsonRows(t, c.mustRun(t, "utility", "list", "--json")), "tlive", "amd64")

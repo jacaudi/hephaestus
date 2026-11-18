@@ -563,6 +563,46 @@ func TestFetcher_ISOToReady(t *testing.T) {
 	r.wantSpool()
 }
 
+// TestFetcher_ProgressIsOfTheCurrentObject pins design §5.3: bytes_done and
+// bytes_total describe the object being fetched, not the sum of the entry's objects.
+func TestFetcher_ProgressIsOfTheCurrentObject(t *testing.T) {
+	iso := readFixture(t)
+	first := map[string][]byte{"boot/vmlinuz": []byte("kernel-fixture\n")}
+	second := map[string][]byte{"live/tool-amd64/tool-amd64.squashfs": seqText(40000)}
+	key := fleet.CacheKey{Entry: "ttwo", Arch: fleet.ArchAMD64}
+	r := runScenario(t, func(t *testing.T, base string) scenario {
+		t.Helper()
+		spec := catalog.Spec{
+			Entry: "ttwo", Arch: "amd64", Version: "1", Recipe: catalog.RecipeLiveBoot, Platforms: []catalog.Platform{catalog.PlatformEFI},
+			Objects: []catalog.ObjectSpec{
+				{URL: base + "/a.iso", Container: catalog.ContainerISO, Signature: catalog.Signature{TOFU: true}, Files: []string{"boot/vmlinuz"}},
+				{URL: base + "/b.iso", Container: catalog.ContainerISO, Signature: catalog.Signature{TOFU: true}, Files: []string{"live/tool-amd64/tool-amd64.squashfs"}},
+			},
+			Boot: catalog.Boot{Kernel: "boot/vmlinuz", Second: "live/tool-amd64/tool-amd64.squashfs"},
+		}
+		var objects []catalog.ObjectPin
+		for i, files := range []map[string][]byte{first, second} {
+			op := catalog.ObjectPin{URL: spec.Objects[i].URL, Size: int64(len(iso)), SHA256: sha(iso)}
+			for _, p := range spec.Objects[i].Files {
+				op.Files = append(op.Files, catalog.FilePin{Path: p, Size: int64(len(files[p])), SHA256: sha(files[p])})
+			}
+			objects = append(objects, op)
+		}
+		pin := catalog.Pin{ID: catalog.PinID(objects), Objects: objects}
+		return scenario{
+			cat: singleCatalog(t, spec, pin), key: key,
+			handler: objectsAt(base, map[string][]byte{spec.Objects[0].URL: iso, spec.Objects[1].URL: iso}),
+		}
+	})
+	r.fetchOnce()
+
+	row := r.wantRow(key, fleet.CacheReady, 0)
+	size := int64(len(iso))
+	if row.BytesDone != size || row.BytesTotal != size {
+		t.Errorf("progress = %d of %d, want the last object's %d of %d", row.BytesDone, row.BytesTotal, size, size)
+	}
+}
+
 func TestFetcher_AlreadyInStoreShortcut(t *testing.T) {
 	var fx catalogtest.Fixture
 	r := runScenario(t, func(t *testing.T, base string) scenario {

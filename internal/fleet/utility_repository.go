@@ -170,11 +170,12 @@ func claimFetch(ctx context.Context, tx bun.IDB, at time.Time) (CacheRow, bool, 
 	return next, true, nil
 }
 
-// RecordProgress stores how much of the row's object is downloaded. It touches
-// only a fetching row at p.Pin, and is not a state change, so it is not audited.
+// RecordProgress stores how much of the object being fetched is downloaded. It
+// touches only a fetching row at p.Pin. It is not a state change, so it is not
+// audited and leaves updated_at, the time of the last state change, alone.
 func (r *Repository) RecordProgress(ctx context.Context, p FetchProgress) error {
 	_, err := updateCache(r.bdb, p.Key, p.Pin).Where("state = ?", CacheFetching).
-		Set("bytes_done = ?", p.Done).Set("bytes_total = ?", p.Total).Set("updated_at = ?", stamp(p.At)).Exec(ctx)
+		Set("bytes_done = ?", p.Done).Set("bytes_total = ?", p.Total).Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("fleet: record progress %s/%s: %w", p.Key.Entry, p.Key.Arch, err)
 	}

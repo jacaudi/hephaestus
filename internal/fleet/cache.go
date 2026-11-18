@@ -105,12 +105,12 @@ type ClearBootNextRequest struct {
 	At               time.Time
 }
 
-// FetchProgress is the fetcher's progress on the row at Key and Pin.
+// FetchProgress is the fetcher's progress on the object it is fetching for the
+// row at Key and Pin: Done of Total bytes.
 type FetchProgress struct {
 	Key         CacheKey
 	Pin         string
 	Done, Total int64
-	At          time.Time
 }
 
 // FetchFailure is a failed fetch of the row at Key and Pin. Integrity marks a

@@ -366,9 +366,6 @@ type fetchJob struct {
 	entry catalog.Entry
 	root  *os.Root
 
-	// total is the pinned size of every object; done is the bytes of objects
-	// complete in their spool so far.
-	total, done int64
 	// downloaded is how many bytes this run received.
 	downloaded int64
 }
@@ -399,9 +396,6 @@ func (j *fetchJob) run(ctx context.Context) error {
 		return nil
 	}
 
-	for _, o := range e.Pin.Objects {
-		j.total += o.Size
-	}
 	var layers []ocispec.Descriptor
 	for n := range e.Pin.Objects {
 		if err := j.download(ctx, n); err != nil {
@@ -444,10 +438,10 @@ func (j *fetchJob) discard(ctx context.Context) {
 	}
 }
 
-// progress records that done of total bytes are in place. It is advisory: a
-// failure goes to the error handler and the fetch goes on.
-func (j *fetchJob) progress(ctx context.Context, done int64) {
-	err := j.f.cfg.Repo.RecordProgress(ctx, fleet.FetchProgress{Key: j.row.Key(), Pin: j.row.Pin, Done: done, Total: j.total, At: j.f.now()})
+// progress records that done of total bytes of the current object are in
+// place. It is advisory: a failure goes to the error handler and the fetch goes on.
+func (j *fetchJob) progress(ctx context.Context, done, total int64) {
+	err := j.f.cfg.Repo.RecordProgress(ctx, fleet.FetchProgress{Key: j.row.Key(), Pin: j.row.Pin, Done: done, Total: total})
 	if err != nil && ctx.Err() == nil {
 		j.f.onError(ctx, err)
 	}
@@ -461,8 +455,7 @@ func (j *fetchJob) download(ctx context.Context, n int) error {
 		return err
 	}
 	if have == obj.Size {
-		j.done += obj.Size
-		j.progress(ctx, j.done)
+		j.progress(ctx, obj.Size, obj.Size)
 		return nil
 	}
 	if err := j.checkSpace(obj.Size); err != nil {
@@ -637,7 +630,7 @@ func (j *fetchJob) write(ctx context.Context, body io.Reader, n int, offset int6
 
 	want := obj.Size - offset
 	w := &spoolWriter{file: file, last: time.Now()}
-	w.tick = func() { j.progress(ctx, j.done+offset+w.n) }
+	w.tick = func() { j.progress(ctx, offset+w.n, obj.Size) }
 	// One byte past the end is enough to see an oversize body.
 	copied, err := io.Copy(w, io.LimitReader(body, want+1))
 	j.downloaded += w.n
@@ -650,8 +643,7 @@ func (j *fetchJob) write(ctx context.Context, body io.Reader, n int, offset int6
 	case copied < want:
 		return fmt.Errorf("the body of object %d ended at byte %d of %d", n, offset+copied, obj.Size)
 	}
-	j.done += obj.Size
-	j.progress(ctx, j.done)
+	j.progress(ctx, obj.Size, obj.Size)
 	return nil
 }
 
