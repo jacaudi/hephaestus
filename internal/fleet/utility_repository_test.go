@@ -326,6 +326,45 @@ func runUtilitySuite(t *testing.T, open func(testing.TB) *db.DB) {
 		wantCache(t, r, k, want)
 	})
 
+	// The due check compares next_attempt_at in SQL, where SQLite holds it as
+	// text whose fractional seconds are as wide as they need to be: a whole
+	// second, one digit and six digits must still order as times.
+	t.Run("ClaimDueMixedFractionWidths", func(t *testing.T) {
+		d := open(t)
+		r := NewRepository(d)
+		for _, row := range []struct {
+			entry string
+			next  time.Duration
+		}{
+			{"ta", 0},
+			{"tb", 500 * time.Millisecond},
+			{"tc", 500*time.Millisecond + time.Microsecond},
+			{"td", time.Second},
+		} {
+			seed := cacheRowIn(CacheKey{Entry: row.entry, Arch: ArchAMD64}, CacheFailed, t0)
+			seed.Attempts, seed.NextAttemptAt = 1, t0.Add(row.next)
+			seedCache(t, d, seed)
+		}
+
+		for _, step := range []struct {
+			at   time.Duration
+			want string // the entry claimed, "" for none
+		}{
+			{499 * time.Millisecond, "ta"},
+			{499 * time.Millisecond, ""},
+			{500 * time.Millisecond, "tb"},
+			{500 * time.Millisecond, ""},
+			{500*time.Millisecond + time.Microsecond, "tc"},
+			{999 * time.Millisecond, ""},
+			{time.Second, "td"},
+		} {
+			got, ok := mustClaim(t, r, t0.Add(step.at))
+			if gotEntry := got.Entry; ok != (step.want != "") || gotEntry != step.want {
+				t.Fatalf("ClaimFetch at t0+%s = %q, %v; want %q", step.at, gotEntry, ok, step.want)
+			}
+		}
+	})
+
 	t.Run("ClaimSkipsOthers", func(t *testing.T) {
 		d := open(t)
 		r := NewRepository(d)
