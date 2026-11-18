@@ -307,7 +307,7 @@ func (h *Handlers) decideAndRecord(ctx context.Context, id fleet.Identity, req R
 		now := h.now() // one read per attempt: the decision and the record agree on it
 		var out bootOutcome
 		out.in = Input{TLS: true, Known: s.found, Machine: s.m, Request: req, UnknownAction: s.unknown, Now: now}
-		if s.found && s.m.BootNext != "" && attempt < bootAttempts-1 {
+		if s.found && s.m.BootNext != "" && attempt < bootAttempts-1 && flagServesMAC(s.m, req.MAC) {
 			var err error
 			out.in.BootNext, out.in.BootNextSetAt, out.in.PlatformKnown = s.m.BootNext, s.m.BootNextSetAt, req.Platform != ""
 			out.in.Utility, out.entry, err = h.utilityFacts(ctx, s.m.BootNext, req.Arch, req.Platform, now)
@@ -349,6 +349,15 @@ func (h *Handlers) decideAndRecord(ctx context.Context, id fleet.Identity, req R
 		// still gets its script, it just is not recorded.
 		return out, noteUnrecorded(ctx, err)
 	}
+}
+
+// flagServesMAC reports whether m's boot-next is for a boot from mac. A junk-pattern
+// machine is known only by the MAC it boots from, and a MAC can move to another
+// machine's record, so its flag is bound to the MAC the operator named and
+// applies only to a boot from it; any other request is decided as if the
+// machine had no flag, which leaves the flag for the right boot.
+func flagServesMAC(m fleet.Machine, mac string) bool {
+	return !m.Junk || m.BootNextMAC == "" || m.BootNextMAC == mac
 }
 
 // countAlert counts one raised uuid_conflict alert.

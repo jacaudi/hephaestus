@@ -1,6 +1,7 @@
 -- +goose Up
 ALTER TABLE machines ADD COLUMN boot_next TEXT;
 ALTER TABLE machines ADD COLUMN boot_next_set_at TEXT CHECK ((boot_next IS NULL) = (boot_next_set_at IS NULL));
+ALTER TABLE machines ADD COLUMN boot_next_mac TEXT CHECK (boot_next_mac IS NULL OR boot_next IS NOT NULL);
 CREATE TABLE utility_cache (
     entry           TEXT NOT NULL,
     arch            TEXT NOT NULL CHECK (arch IN ('amd64', 'arm64')),
@@ -19,5 +20,6 @@ CREATE TABLE utility_cache (
 
 -- +goose Down
 DROP TABLE utility_cache;
+ALTER TABLE machines DROP COLUMN boot_next_mac;
 ALTER TABLE machines DROP COLUMN boot_next_set_at;
 ALTER TABLE machines DROP COLUMN boot_next;

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"fmt"
 	"strconv"
 	"strings"
@@ -34,6 +35,7 @@ type bootNextSet struct {
 	State         string   `json:"state"`
 	PreviousError string   `json:"previous_error"`
 	Warning       string   `json:"warning"`
+	BoundMAC      string   `json:"bound_mac,omitempty"`
 }
 
 func (s bootNextSet) text() string {
@@ -42,7 +44,11 @@ func (s bootNextSet) text() string {
 	if s.Warning != "" {
 		fmt.Fprintf(&b, "WARNING: %s: %s\n", machine, s.Warning)
 	}
-	fmt.Fprintf(&b, "%s\nentry: %s\narch: %s\nexpires: %s\nutility: %s\n", machine, s.Entry, s.Arch, s.ExpiresAt, s.State)
+	fmt.Fprintf(&b, "%s\nentry: %s\narch: %s\n", machine, s.Entry, s.Arch)
+	if s.BoundMAC != "" {
+		fmt.Fprintf(&b, "bound MAC: %s\n", safeText(s.BoundMAC))
+	}
+	fmt.Fprintf(&b, "expires: %s\nutility: %s\n", s.ExpiresAt, s.State)
 	if s.PreviousError != "" {
 		fmt.Fprintf(&b, "previous error: %s\n", safeText(s.PreviousError))
 	}
@@ -65,6 +71,7 @@ type bootNextRow struct {
 	SetAt      string   `json:"set_at"`
 	AgeSeconds int64    `json:"age_seconds"`
 	Status     string   `json:"status"`
+	BoundMAC   string   `json:"bound_mac,omitempty"`
 }
 
 // newBootNextCmd builds the boot-next command group.
@@ -93,7 +100,9 @@ func newBootNextSetCmd(deps cliDeps) *cobra.Command {
 		Short: "Boot a machine into a utility OS on its next boot",
 		Long: fmt.Sprintf(`Arm the machine's boot-next with the utility entry and ask for its content to be fetched.
 The machine must have booted through hephaestus once. A UUID that several machines share is
-refused; name one by MAC. The flag expires %d hours after it was set.
+refused; name one by MAC. A machine with a junk-pattern UUID (empty, all zeros or all Fs) must be
+named by MAC: its flag is bound to that MAC and served only to a boot from it. The flag expires
+%d hours after it was set.
 
 The output shows when the flag expires and the utility's state: wanted, fetching, ready, failed,
 broken or stale_pin. A failed or broken utility is re-armed, and the error it had is shown.`, bootNextTTLHours),
@@ -106,11 +115,15 @@ broken or stale_pin. A failed or broken utility is re-armed, and the error it ha
 				if err != nil {
 					return err
 				}
+				bound, err := boundMAC(m, args[0])
+				if err != nil {
+					return err
+				}
 				e, err := entryFor(cat, args[1], m.Arch)
 				if err != nil {
 					return err
 				}
-				res, err := repo.SetBootNext(cmd.Context(), fleet.SetBootNextRequest{MachineID: m.ID, Entry: e.Entry, Pin: e.Pin.ID, At: deps.now()})
+				res, err := repo.SetBootNext(cmd.Context(), fleet.SetBootNextRequest{MachineID: m.ID, Entry: e.Entry, Pin: e.Pin.ID, BoundMAC: bound, At: deps.now()})
 				if err != nil {
 					return err
 				}
@@ -121,6 +134,7 @@ broken or stale_pin. A failed or broken utility is re-armed, and the error it ha
 					State:         stateAtPin(res.Fetch.Row, e.Pin.ID),
 					PreviousError: res.Fetch.PreviousError,
 					Warning:       e.Warning,
+					BoundMAC:      res.Machine.BootNextMAC,
 				}
 				if asJSON {
 					return writeJSON(cmd, out)
@@ -181,7 +195,7 @@ func newBootNextListCmd(deps cliDeps) *cobra.Command {
 		Use:   "list",
 		Short: "List the machines with a boot-next flag",
 		Long: fmt.Sprintf(`List every machine with a boot-next flag: the entry, when it was set, its age in seconds and
-a status. The status is expired after %d hours, unknown_entry when the catalog no longer has the
+a status, and the MAC a junk-pattern machine's flag is bound to. The status is expired after %d hours, unknown_entry when the catalog no longer has the
 entry, unsupported when it has no build for the machine's architecture, and otherwise the
 utility's state (not_requested, wanted, fetching, ready, failed or broken).`, bootNextTTLHours),
 		Example: `  hephaestus boot-next list
@@ -204,7 +218,7 @@ utility's state (not_requested, wanted, fetching, ready, failed or broken).`, bo
 					rows = append(rows, bootNextRow{
 						MachineID: m.ID, MACs: m.MACs, Entry: m.BootNext, Arch: string(m.Arch),
 						SetAt: formatTime(m.BootNextSetAt), AgeSeconds: int64(now.Sub(m.BootNextSetAt) / time.Second),
-						Status: bootNextStatus(m, now, cat, cached),
+						Status: bootNextStatus(m, now, cat, cached), BoundMAC: m.BootNextMAC,
 					})
 				}
 				if asJSON {
@@ -243,8 +257,24 @@ func writeBootNextRows(cmd *cobra.Command, rows []bootNextRow) error {
 		return writeText(cmd, "no boot-next set on any machine\n")
 	}
 	table := make([][]string, 0, len(rows))
-	for _, r := range rows {
-		table = append(table, []string{r.MachineID, strings.Join(r.MACs, ","), r.Entry, r.Arch, r.SetAt, strconv.FormatInt(r.AgeSeconds, 10), r.Status})
+	for i := range rows {
+		r := &rows[i]
+		table = append(table, []string{r.MachineID, strings.Join(r.MACs, ","), r.Entry, r.Arch, r.SetAt, strconv.FormatInt(r.AgeSeconds, 10), r.Status, cmp.Or(safeText(r.BoundMAC), "-")})
 	}
-	return writeTable(cmd, []string{"MACHINE", "MACS", "ENTRY", "ARCH", "SET_AT", "AGE_SECONDS", "STATUS"}, table)
+	return writeTable(cmd, []string{"MACHINE", "MACS", "ENTRY", "ARCH", "SET_AT", "AGE_SECONDS", "STATUS", "BOUND_MAC"}, table)
+}
+
+// boundMAC is the MAC to bind m's flag to: for a junk-pattern machine, the MAC
+// ref names, because a junk machine is known only by the MAC it boots from and
+// its flag is served only to a boot from that MAC; "" for any other machine. A
+// junk machine named any other way is refused.
+func boundMAC(m fleet.Machine, ref string) (string, error) {
+	if !m.Junk {
+		return "", nil
+	}
+	mac, err := fleet.NormalizeMAC(ref)
+	if err != nil {
+		return "", fmt.Errorf("%s has a junk-pattern UUID; name it by the MAC it boots from", m.ID)
+	}
+	return mac, nil
 }

@@ -38,9 +38,12 @@ type setDetail struct {
 }
 
 // SetBootNextRequest arms a machine's boot-next: the entry its next boot serves
-// and the catalog pin its content must have.
+// and the catalog pin its content must have. BoundMAC, normalized, binds a
+// junk-pattern machine's flag to the MAC it was named by; it is empty for any
+// other machine.
 type SetBootNextRequest struct {
 	MachineID, Entry, Pin string
+	BoundMAC              string
 	At                    time.Time
 }
 
@@ -122,7 +125,8 @@ func setBootNext(ctx context.Context, tx bun.IDB, req SetBootNextRequest) (SetBo
 	}
 
 	at := stamp(req.At)
-	_, err = tx.NewUpdate().Model((*Machine)(nil)).Set("boot_next = ?", req.Entry).Set("boot_next_set_at = ?", at).Where("id = ?", m.ID).Exec(ctx)
+	_, err = tx.NewUpdate().Model((*Machine)(nil)).Set("boot_next = ?", req.Entry).Set("boot_next_set_at = ?", at).
+		Set("boot_next_mac = NULLIF(?, '')", req.BoundMAC).Where("id = ?", m.ID).Exec(ctx)
 	if err != nil {
 		return SetBootNextResult{}, fmt.Errorf("set boot_next of %s: %w", m.ID, err)
 	}
@@ -137,7 +141,7 @@ func setBootNext(ctx context.Context, tx bun.IDB, req SetBootNextRequest) (SetBo
 	if err != nil {
 		return SetBootNextResult{}, err
 	}
-	m.BootNext, m.BootNextSetAt = req.Entry, at
+	m.BootNext, m.BootNextSetAt, m.BootNextMAC = req.Entry, at, req.BoundMAC
 	return SetBootNextResult{Machine: m, Fetch: fetch}, nil
 }
 

@@ -145,6 +145,99 @@ func TestBoot_Row3ServesRecipe(t *testing.T) {
 	}
 }
 
+const (
+	allFUUID = "ffffffff-ffff-ffff-ffff-ffffffffffff"
+	junkMACA = "52:54:00:e2:e0:0a"
+	junkMACB = "52:54:00:e2:e0:0b"
+)
+
+// junkQuery is a boot query of a machine with UUID uuid, serial S and product
+// P, booting from mac with UEFI firmware.
+func junkQuery(uuid, mac string) string {
+	return "uuid=" + uuid + "&mac=" + strings.ReplaceAll(mac, ":", "-") + "&arch=x86_64&serial=S&product=P&platform=efi"
+}
+
+// junkFlagged is a rig holding the junk machines A (all-zero UUID, MAC junkMACA)
+// and V (all-F UUID, MAC junkMACB), the fixture entry ready, and A's boot-next
+// armed with the entry and bound to junkMACA, as "boot-next set <MAC>" does. It
+// returns the rig and A.
+func junkFlagged(t *testing.T) (*rig, fleet.Machine) {
+	t.Helper()
+	g := newRig(t)
+	g.boot(junkQuery(zeroUUID, junkMACA))
+	g.boot(junkQuery(allFUUID, junkMACB))
+	a, ok, err := g.repo.Lookup(t.Context(), fleet.Identity{UUID: zeroUUID, MAC: junkMACA})
+	if err != nil || !ok {
+		t.Fatalf("Lookup(A) = %v, %v", ok, err)
+	}
+	req := fleet.SetBootNextRequest{MachineID: a.ID, Entry: entryName, Pin: g.shell().Pin.ID, BoundMAC: junkMACA, At: testNow().Add(-time.Hour)}
+	if _, err := g.repo.SetBootNext(t.Context(), req); err != nil {
+		t.Fatalf("SetBootNext: %v", err)
+	}
+	g.stock()
+	return g, a
+}
+
+// wantFlagKept fails unless machine id still holds the fixture entry's flag,
+// bound to junkMACA, and nothing was cleared or served.
+func (g *rig) wantFlagKept(id string) {
+	g.t.Helper()
+	got, err := g.repo.Get(g.t.Context(), id)
+	if err != nil || got.BootNext != entryName || got.BootNextMAC != junkMACA {
+		g.t.Errorf("boot-next = %q bound to %q, %v; want %q bound to %q, untouched", got.BootNext, got.BootNextMAC, err, entryName, junkMACA)
+	}
+	if n := g.cleared(""); n != 0 {
+		g.t.Errorf("boot_next.cleared events = %d, want 0", n)
+	}
+	if n := g.count("SELECT count(*) FROM boot_events WHERE decision_row = 3"); n != 0 {
+		g.t.Errorf("row 3 events = %d, want 0", n)
+	}
+}
+
+// A junk machine is known only by the MAC it boots from, and a MAC can move to
+// another machine's record, so its flag is served only to a boot from the MAC it
+// was bound to.
+func TestBoot_Row3JunkFlagServedOnlyToBoundMAC(t *testing.T) {
+	g, a := junkFlagged(t)
+	g.discoverOK(discoverForm("uuid", zeroUUID, "mac", junkMACA, "serial", "S", "product", "P", "nic0_mac", junkMACA, "nic1_mac", junkMACB))
+	if moved, ok, err := g.repo.Lookup(t.Context(), fleet.Identity{UUID: allFUUID, MAC: junkMACB}); err != nil || !ok || moved.ID != a.ID {
+		t.Fatalf("Lookup(V's identity) = %s, %v, %v; want A's record %s, as D4 moves the MAC", moved.ID, ok, err, a.ID)
+	}
+
+	body := g.boot(junkQuery(allFUUID, junkMACB))
+
+	wantReportExit(t, body)
+	g.wantFlagKept(a.ID)
+
+	body = g.boot(junkQuery(zeroUUID, junkMACA))
+
+	if want := g.shell().Script(netip.MustParseAddr(testAddress)); body != want {
+		t.Errorf("body = %q, want the entry's script %q", body, want)
+	}
+	if got, err := g.repo.Get(t.Context(), a.ID); err != nil || got.BootNext != "" || got.BootNextMAC != "" {
+		t.Errorf("boot-next = %q bound to %q, %v; want the flag and its binding cleared", got.BootNext, got.BootNextMAC, err)
+	}
+	if n := g.cleared(reason(fleet.ClearServed)); n != 1 {
+		t.Errorf("served clears = %d, want 1", n)
+	}
+	if n := g.count("SELECT count(*) FROM boot_events WHERE decision_row = 3 AND action = 'utility'"); n != 1 {
+		t.Errorf("row 3 utility events = %d, want 1", n)
+	}
+}
+
+// A junk machine's other NIC resolves to the same record, but the flag was bound
+// to the MAC the operator named: a boot from the other NIC is not served it.
+func TestBoot_Row3JunkFlagKeptForOtherNIC(t *testing.T) {
+	g, a := junkFlagged(t)
+	const secondNIC = "52:54:00:e2:e0:0c"
+	g.discoverOK(discoverForm("uuid", zeroUUID, "mac", junkMACA, "serial", "S", "product", "P", "nic0_mac", junkMACA, "nic1_mac", secondNIC))
+
+	body := g.boot(junkQuery(zeroUUID, secondNIC))
+
+	wantReportExit(t, body)
+	g.wantFlagKept(a.ID)
+}
+
 func TestBoot_Row3NotReadyKeepsFlag(t *testing.T) {
 	g := newRig(t)
 	g.armed()

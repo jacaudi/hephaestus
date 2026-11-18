@@ -345,6 +345,73 @@ func TestBootNextSet_ByUUID(t *testing.T) {
 	}
 }
 
+// junkMAC is the MAC of the junk-UUID machines these tests make.
+const junkMAC = "52:54:00:e2:e0:0a"
+
+func TestBootNextSet_JunkMachineByUUIDIsRefused(t *testing.T) {
+	for _, uuid := range []string{zeroUUID, "ffffffff-ffff-ffff-ffff-ffffffffffff"} {
+		t.Run(uuid, func(t *testing.T) {
+			c := newCLITest(t)
+			m := c.record(t, fleet.Identity{UUID: uuid, MAC: junkMAC, Serial: "S", Product: "P"}, fleet.ArchAMD64)
+
+			_, err := c.run(t, "boot-next", "set", uuid, "tshell")
+
+			if err == nil {
+				t.Fatal("boot-next set by a junk UUID succeeded, want a refusal")
+			}
+			if got := exitCode(err); got != 1 {
+				t.Errorf("exit code = %d, want 1 (%v)", got, err)
+			}
+			if want := m.ID + " has a junk-pattern UUID; name it by the MAC it boots from"; err.Error() != want {
+				t.Errorf("error = %q, want %q", err, want)
+			}
+			if armed, err := c.repo.ListBootNext(t.Context()); err != nil || len(armed) != 0 {
+				t.Errorf("ListBootNext = %v, %v; a refused set arms nothing", armed, err)
+			}
+		})
+	}
+}
+
+func TestBootNextSet_JunkMachineByMACBindsIt(t *testing.T) {
+	c := newCLITest(t)
+	m := c.record(t, fleet.Identity{UUID: zeroUUID, MAC: junkMAC, Serial: "S", Product: "P"}, fleet.ArchAMD64)
+
+	got := jsonObject(t, c.mustRun(t, "boot-next", "set", "52-54-00-E2-E0-0A", "tshell", "--json"))
+
+	if got["bound_mac"] != junkMAC {
+		t.Errorf("bound_mac = %v, want the normalized %s", got["bound_mac"], junkMAC)
+	}
+	if stored, err := c.repo.Get(t.Context(), m.ID); err != nil || stored.BootNext != "tshell" || stored.BootNextMAC != junkMAC {
+		t.Errorf("stored boot-next = %q bound to %q, %v; want tshell bound to %s", stored.BootNext, stored.BootNextMAC, err, junkMAC)
+	}
+
+	out := c.mustRun(t, "boot-next", "set", junkMAC, "tshell")
+	if want := "bound MAC: " + junkMAC + "\n"; !strings.Contains(out, want) {
+		t.Errorf("output lacks %q:\n%s", want, out)
+	}
+}
+
+func TestBootNextSet_NonJunkMachineBindsNothing(t *testing.T) {
+	for _, ref := range []string{cliMAC(1), cliUUID(1)} {
+		t.Run(ref, func(t *testing.T) {
+			c := newCLITest(t)
+			m := c.machine(t, 1, fleet.ArchAMD64)
+
+			got := jsonObject(t, c.mustRun(t, "boot-next", "set", ref, "tshell", "--json"))
+
+			if _, ok := got["bound_mac"]; ok {
+				t.Errorf("output has bound_mac = %v, want the key omitted", got["bound_mac"])
+			}
+			if stored, err := c.repo.Get(t.Context(), m.ID); err != nil || stored.BootNextMAC != "" {
+				t.Errorf("stored bound MAC = %q, %v; want none", stored.BootNextMAC, err)
+			}
+			if out := c.mustRun(t, "boot-next", "set", ref, "tshell"); strings.Contains(out, "bound MAC") {
+				t.Errorf("output mentions a bound MAC with none:\n%s", out)
+			}
+		})
+	}
+}
+
 func TestBootNextSet_Refusals(t *testing.T) {
 	c := newCLITest(t)
 	c.machine(t, 1, fleet.ArchAMD64)
@@ -612,6 +679,39 @@ func TestBootNextList_Text(t *testing.T) {
 	c.arm(t, m, "tshell", cliT0.Add(-2*time.Hour))
 	out = c.mustRun(t, "boot-next", "list")
 	for _, want := range []string{"MACHINE", "STATUS", m.ID, cliMAC(1), "tshell", "amd64", "7200", "wanted"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("list output lacks %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestBootNextList_ShowsBoundMAC(t *testing.T) {
+	c := newCLITest(t)
+	junk := c.record(t, fleet.Identity{UUID: zeroUUID, MAC: junkMAC, Serial: "S", Product: "P"}, fleet.ArchAMD64)
+	plain := c.machine(t, 1, fleet.ArchAMD64)
+	c.mustRun(t, "boot-next", "set", junkMAC, "tshell")
+	c.mustRun(t, "boot-next", "set", cliMAC(1), "tshell")
+
+	rows := jsonRows(t, c.mustRun(t, "boot-next", "list", "--json"))
+
+	if len(rows) != 2 {
+		t.Fatalf("got %d rows, want 2: %v", len(rows), rows)
+	}
+	for _, row := range rows {
+		switch row["machine_id"] {
+		case junk.ID:
+			wantKeys(t, row, "machine_id", "macs", "entry", "arch", "set_at", "age_seconds", "status", "bound_mac")
+			if row["bound_mac"] != junkMAC {
+				t.Errorf("junk machine bound_mac = %v, want %s", row["bound_mac"], junkMAC)
+			}
+		case plain.ID:
+			wantKeys(t, row, "machine_id", "macs", "entry", "arch", "set_at", "age_seconds", "status")
+		default:
+			t.Errorf("row for unknown machine %v", row)
+		}
+	}
+	out := c.mustRun(t, "boot-next", "list")
+	for _, want := range []string{"BOUND_MAC", junkMAC} {
 		if !strings.Contains(out, want) {
 			t.Errorf("list output lacks %q:\n%s", want, out)
 		}

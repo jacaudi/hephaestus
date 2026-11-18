@@ -315,7 +315,7 @@ func clearBrokenFlags(ctx context.Context, tx bun.IDB, key CacheKey, at time.Tim
 // was set at req.SetAt, and audits boot_next.cleared; a flag set again since
 // the caller read it is not the caller's to clear. It reports whether it did.
 func clearBootNext(ctx context.Context, q bun.IDB, req ClearBootNextRequest) (bool, error) {
-	cleared, err := applied(ctx, q.NewUpdate().Model((*Machine)(nil)).Set("boot_next = NULL").Set("boot_next_set_at = NULL").
+	cleared, err := applied(ctx, q.NewUpdate().Model((*Machine)(nil)).Set("boot_next = NULL").Set("boot_next_set_at = NULL").Set("boot_next_mac = NULL").
 		Where("id = ? AND boot_next = ? AND boot_next_set_at = ?", req.MachineID, req.Entry, req.SetAt.UTC()))
 	if err != nil || !cleared {
 		return false, wrapIf("clear boot_next of "+req.MachineID, err)

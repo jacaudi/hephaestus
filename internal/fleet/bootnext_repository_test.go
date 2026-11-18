@@ -504,5 +504,126 @@ func runBootNextSuite(t *testing.T, open func(testing.TB) *db.DB, pair func(test
 		}
 	})
 
+	// A junk-pattern machine is found by the MAC it boots from, so its flag is
+	// bound to the MAC the operator named.
+	junkBootNextMachine := func(t *testing.T, r *Repository) Machine {
+		t.Helper()
+		return firstContact(t, r, Identity{UUID: zeroUUID, MAC: macN(0xa), Serial: "S", Product: "P"}, t0)
+	}
+	setBound := func(t *testing.T, r *Repository, id, mac string, at time.Time) SetBootNextResult {
+		t.Helper()
+		res, err := r.SetBootNext(t.Context(), SetBootNextRequest{MachineID: id, Entry: "tshell", Pin: pinOne, BoundMAC: mac, At: at})
+		if err != nil {
+			t.Fatalf("SetBootNext(%s, bound %q): %v", id, mac, err)
+		}
+		return res
+	}
+
+	t.Run("SetBootNextBindsMAC", func(t *testing.T) {
+		d := open(t)
+		r := NewRepository(d)
+		m := junkBootNextMachine(t, r)
+
+		got := setBound(t, r, m.ID, macN(0xa), t0)
+		if got.Machine.BootNextMAC != macN(0xa) {
+			t.Fatalf("Machine.BootNextMAC = %q, want %q", got.Machine.BootNextMAC, macN(0xa))
+		}
+		if stored := mustGet(t, r, m.ID); stored.BootNextMAC != macN(0xa) {
+			t.Fatalf("Get: BootNextMAC = %q, want %q", stored.BootNextMAC, macN(0xa))
+		}
+		if looked, ok := lookup(t, r, Identity{UUID: zeroUUID, MAC: macN(0xa)}); !ok || looked.BootNextMAC != macN(0xa) {
+			t.Fatalf("Lookup: BootNextMAC = %q (found %v), want %q", looked.BootNextMAC, ok, macN(0xa))
+		}
+		listed, err := r.ListBootNext(t.Context())
+		if err != nil || len(listed) != 1 || listed[0].BootNextMAC != macN(0xa) {
+			t.Fatalf("ListBootNext = %+v, %v; want one machine bound to %s", listed, err, macN(0xa))
+		}
+	})
+
+	t.Run("SetBootNextWithoutMACBindsNothing", func(t *testing.T) {
+		d := open(t)
+		r := NewRepository(d)
+		m := bootNextMachine(t, r, 1, t0)
+
+		if got := mustSetBootNext(t, r, m.ID, "tshell", t0); got.Machine.BootNextMAC != "" {
+			t.Fatalf("Machine.BootNextMAC = %q, want none", got.Machine.BootNextMAC)
+		}
+		if n := scalar[int](t, d, "SELECT count(*) FROM machines WHERE id = ? AND boot_next_mac IS NULL", m.ID); n != 1 {
+			t.Fatal("boot_next_mac is not NULL: an unbound flag must store NULL, not an empty string")
+		}
+	})
+
+	t.Run("SetBootNextReplacesBinding", func(t *testing.T) {
+		r := NewRepository(open(t))
+		m := junkBootNextMachine(t, r)
+
+		setBound(t, r, m.ID, macN(0xa), t0)
+		setBound(t, r, m.ID, macN(0xb), t0.Add(time.Minute))
+		if got := mustGet(t, r, m.ID); got.BootNextMAC != macN(0xb) {
+			t.Fatalf("BootNextMAC = %q after a second set, want %q", got.BootNextMAC, macN(0xb))
+		}
+		mustSetBootNext(t, r, m.ID, "tshell", t0.Add(2*time.Minute))
+		if got := mustGet(t, r, m.ID); got.BootNextMAC != "" {
+			t.Fatalf("BootNextMAC = %q after an unbound set, want none", got.BootNextMAC)
+		}
+	})
+
+	t.Run("EveryClearNullsBoundMAC", func(t *testing.T) {
+		tests := []struct {
+			name  string
+			clear func(t *testing.T, d *db.DB, r *Repository, m Machine)
+		}{
+			{"ClearBootNext", func(t *testing.T, _ *db.DB, r *Repository, m Machine) {
+				t.Helper()
+				req := ClearBootNextRequest{MachineID: m.ID, Entry: "tshell", SetAt: t0, Reason: ClearCLI, Actor: "cli", At: t0.Add(time.Minute)}
+				got, err := r.ClearBootNext(t.Context(), req)
+				wantBool(t, "ClearBootNext", got, err, true)
+			}},
+			{"RecordBoot", func(t *testing.T, _ *db.DB, r *Repository, m Machine) {
+				t.Helper()
+				rec := bootOf(m, 3, "utility", t0.Add(time.Minute))
+				rec.ClearBootNext = &BootNextClear{Entry: "tshell", SetAt: t0, Reason: ClearServed}
+				knownBoot(t, r, rec)
+			}},
+			{"RecordFetchFailure", func(t *testing.T, d *db.DB, r *Repository, _ Machine) {
+				t.Helper()
+				if err := execRaw(t, d, "UPDATE utility_cache SET state = 'fetching', attempts = 9 WHERE entry = ? AND arch = ?", k.Entry, string(k.Arch)); err != nil {
+					t.Fatalf("seed a fetching row at its ninth failure: %v", err)
+				}
+				mustFail(t, r, FetchFailure{Key: k, Pin: pinOne, Cause: "boom", At: t0.Add(time.Minute)})
+			}},
+		}
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				d := open(t)
+				r := NewRepository(d)
+				m := junkBootNextMachine(t, r)
+				setBound(t, r, m.ID, macN(0xa), t0)
+
+				tc.clear(t, d, r, m)
+
+				if !flagCleared(t, d, m.ID) {
+					t.Fatal("the flag is still set")
+				}
+				if n := scalar[int](t, d, "SELECT count(*) FROM machines WHERE id = ? AND boot_next_mac IS NULL", m.ID); n != 1 {
+					t.Fatalf("boot_next_mac = %q after the clear, want NULL", mustGet(t, r, m.ID).BootNextMAC)
+				}
+			})
+		}
+	})
+
+	t.Run("BoundMACNeedsFlag", func(t *testing.T) {
+		d := open(t)
+		r := NewRepository(d)
+		m := junkBootNextMachine(t, r)
+
+		if err := execRaw(t, d, "UPDATE machines SET boot_next_mac = ? WHERE id = ?", macN(0xa), m.ID); err == nil {
+			t.Fatal("a bound MAC on a machine with no boot-next was accepted, want the CHECK to refuse it")
+		}
+		if got := mustGet(t, r, m.ID); got.BootNextMAC != "" {
+			t.Fatalf("BootNextMAC = %q, want none after the refused update", got.BootNextMAC)
+		}
+	})
+
 	t.Run("ConcurrentSetAndServe", func(t *testing.T) { runConcurrentSetAndServe(t, pair) })
 }
