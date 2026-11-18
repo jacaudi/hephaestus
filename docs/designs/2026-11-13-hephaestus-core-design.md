@@ -6,7 +6,7 @@ touch. Also 2026-11-15 (owner): the in-process Let's Encrypt client is dropped. 
 external tool writes and renews, or from a TLS-terminating reverse proxy (§5.10); the data key returns with its consumers
 in M3 (D25). Also 2026-11-16: M2 is now utility boots, and the Talos prefetch, `assets_ready` and the `/v2/` mirror moved to
 M3 (see the M2 design, `2026-11-16-hephaestus-m2-utility-boot-design.md`).
-Research and decision record: [`docs/research/booty-slim/README.md`](../research/booty-slim/README.md) (sources S1–S11
+Research and decision record: [`docs/research/booty-slim/reference.md`](../research/booty-slim/reference.md) (sources S1–S11
 under `docs/research/booty-slim/sources/`).
 - `D<n>` cites a decision from that record.
 - `P<n.n>` cites its feature list (§8).

@@ -23,7 +23,7 @@
 ### Task 1: Disable TLS session tickets on the boot HTTPS listener
 Kind: rewrite
 
-**Files:** Modify `cmd/hephaestus/serve.go`, `cmd/hephaestus/serve_test.go`, `README.md`, `docs/designs/2026-11-13-hephaestus-core-design.md`, `docs/research/booty-slim/README.md`.
+**Files:** Modify `cmd/hephaestus/serve.go`, `cmd/hephaestus/serve_test.go`, `README.md`, `docs/designs/2026-11-13-hephaestus-core-design.md`, `docs/research/booty-slim/reference.md`.
 
 - `serve.go`: set `SessionTicketsDisabled: true` on the boot HTTPS `tls.Config`, with a comment that names the iPXE 9261ebe transcript behaviour. The comment states the behaviour, not a bug ID.
 - Test `TestRunServe_NoSessionTickets`:
@@ -91,7 +91,7 @@ Owner request (2026-11-16): catch at startup and on reload a deployed certificat
 
 **Files:**
 - Create: `internal/boot/ipxe/bin/roots.pem`.
-- Modify: `build/ipxe/build.sh`, `internal/boot/ipxe/ipxe.go`, `internal/boot/ipxe/ipxe_test.go`, `internal/tlscert/loader.go`, `internal/tlscert/loader_test.go`, `internal/tlscert/tlscerttest/selfsigned.go`, `cmd/hephaestus/serve.go`, `cmd/hephaestus/serve_test.go`, `README.md`, `docs/designs/2026-11-13-hephaestus-core-design.md`, `docs/research/booty-slim/README.md`.
+- Modify: `build/ipxe/build.sh`, `internal/boot/ipxe/ipxe.go`, `internal/boot/ipxe/ipxe_test.go`, `internal/tlscert/loader.go`, `internal/tlscert/loader_test.go`, `internal/tlscert/tlscerttest/selfsigned.go`, `cmd/hephaestus/serve.go`, `cmd/hephaestus/serve_test.go`, `README.md`, `docs/designs/2026-11-13-hephaestus-core-design.md`, `docs/research/booty-slim/reference.md`.
 
 Decisions:
 - **`roots.pem`** is a PEM bundle of exactly the certificates the binaries were built with (`CERT=`/`TRUST=`), in `roots.txt` order.

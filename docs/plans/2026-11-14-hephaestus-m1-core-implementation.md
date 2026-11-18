@@ -1726,7 +1726,7 @@ Owner directive (2026-11-15): drop the in-process Let's Encrypt integration. TLS
 **Files:**
 - Delete: `internal/tlsacme/` (whole tree, including `tlsacmetest/`)
 - Create: `internal/tlscert/doc.go`, `loader.go`, `loader_test.go`, `internal/tlscert/tlscerttest/doc.go`, `selfsigned.go`; `internal/boot/proxy.go`, `proxy_test.go`
-- Modify: `internal/boot/guard.go`, `internal/boot/discover.go`, `internal/boot/handlers.go`, the boot tests that cover them; `cmd/hephaestus/config.go`, `config_test.go`, `serve.go`, `serve_test.go`; `internal/db/migrations/sqlite/00001_init.sql`, `internal/db/migrations/postgres/00001_init.sql`; `go.mod`, `go.sum`; `README.md`; `docs/designs/2026-11-13-hephaestus-core-design.md`; `docs/research/booty-slim/README.md`
+- Modify: `internal/boot/guard.go`, `internal/boot/discover.go`, `internal/boot/handlers.go`, the boot tests that cover them; `cmd/hephaestus/config.go`, `config_test.go`, `serve.go`, `serve_test.go`; `internal/db/migrations/sqlite/00001_init.sql`, `internal/db/migrations/postgres/00001_init.sql`; `go.mod`, `go.sum`; `README.md`; `docs/designs/2026-11-13-hephaestus-core-design.md`; `docs/research/booty-slim/reference.md`
 
 **Interfaces:**
 
@@ -1772,7 +1772,7 @@ README:
 
 Design (`docs/designs/2026-11-13-hephaestus-core-design.md`): replace every in-process ACME, Let's Encrypt, Cloudflare DNS-01 and `tlsacme` statement with the two modes as specified here. That covers the §5.1 package table (`tlscert`), §5.9 config, alerts and admin checks, §5.11, §6 trust notes, §10, the Milestones section (the data key returns in M3 with its consumers), and any goal or criterion that names ACME. Do not leave a statement that hephaestus obtains certificates.
 
-Research record (`docs/research/booty-slim/README.md`): append decision `D25 — TLS from externally supplied certificate files or a TLS-terminating reverse proxy; in-process ACME (lego, Cloudflare DNS-01) dropped; HEPHAESTUS_DATA_KEY deferred to M3 (owner, 2026-11-15)`, in the format of the existing D entries.
+Research record (`docs/research/booty-slim/reference.md`): append decision `D25 — TLS from externally supplied certificate files or a TLS-terminating reverse proxy; in-process ACME (lego, Cloudflare DNS-01) dropped; HEPHAESTUS_DATA_KEY deferred to M3 (owner, 2026-11-15)`, in the format of the existing D entries.
 
 - [ ] **Step 1: Write the failing tests.**
   - `internal/tlscert/loader_test.go`:

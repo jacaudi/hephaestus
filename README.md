@@ -10,6 +10,14 @@ does.
 It is not a DHCP server: it runs next to the one you have and only adds the PXE
 options. It does not install anything yet (see What it does).
 
+> [!WARNING]
+> **Agentically generated.** This codebase was produced through agentic,
+> spec-driven development: each feature began as a written design and
+> implementation spec, then a coding agent executed the plan under human
+> review. Tests, code review, and CI gates apply as they would for any
+> project, but the authorship pattern is not a single human contributor —
+> keep that in mind when evaluating fit for your environment.
+
 ## What it does
 
 A machine PXE-boots, chains into iPXE over TFTP, then fetches its boot script
@@ -149,3 +157,7 @@ or root. What the host must provide is in [Run the image](docs/deployment.md).
 
 - [Omni bare-metal infrastructure provider](https://github.com/siderolabs/omni-infra-provider-bare-metal) (v0.15.0, MPL-2.0): the vendored proxyDHCP and TFTP code.
 - [iPXE](https://github.com/ipxe/ipxe) (commit `9261ebe`): the embedded boot binaries.
+
+## License
+
+[MIT](LICENSE) © 2026 jacaudi

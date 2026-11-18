@@ -8,7 +8,7 @@ This page explains an iPXE TLS 1.3 handshake failure, and records it so it can b
 | Affected | commit `9261ebe38af0c0b38ac332adeec125a518845013` (`iPXE 2.0.0+ (g9261e)`), with TLS 1.3 enabled by default since `a040f9579` |
 | Found | 2026-11-16, by the hephaestus e2e spike (QEMU OVMF/SeaBIOS/AAVMF on colima) |
 | Status | **Not filed upstream** (owner decision, 2026-11-16). Recorded here so it can be filed later. |
-| hephaestus workaround | `SessionTicketsDisabled: true` on the boot HTTPS listener (commit `275f131`); proxy mode needs the same at the proxy (Caddy: `apps.tls.session_tickets.disabled`). Decision D26 in `docs/research/booty-slim/README.md`. |
+| hephaestus workaround | `SessionTicketsDisabled: true` on the boot HTTPS listener (commit `275f131`); proxy mode needs the same at the proxy (Caddy: `apps.tls.session_tickets.disabled`). Decision D26 in `docs/research/booty-slim/reference.md`. |
 
 ## Symptom
 
