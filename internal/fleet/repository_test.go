@@ -14,6 +14,9 @@ import (
 
 const (
 	zeroUUID       = "00000000-0000-0000-0000-000000000000"
+	allFUUID       = "ffffffff-ffff-ffff-ffff-ffffffffffff"
+	junkMACA       = "52:54:00:e2:e0:0a"
+	junkMACV       = "52:54:00:e2:e0:0b"
 	conflictReason = "identity conflict: this UUID was seen with another serial/product"
 )
 
@@ -295,6 +298,77 @@ func runRepositorySuite(t *testing.T, open func(testing.TB) *db.DB) {
 			t.Fatalf("MAC owner = %s, want B %s", owner, b.ID)
 		}
 		wantMACs(t, mustGet(t, r, a.ID))
+	})
+
+	// A junk-keyed machine is identified by its MACs alone, so it cannot take a
+	// MAC another junk-keyed machine owns; every other move follows D4.
+	junkMachines := func(t *testing.T, r *Repository) (a, v Machine) {
+		t.Helper()
+		a = firstContact(t, r, Identity{UUID: zeroUUID, MAC: junkMACA, Serial: "S", Product: "P"}, t0)
+		v = firstContact(t, r, Identity{UUID: allFUUID, MAC: junkMACV, Serial: "S", Product: "P"}, t0.Add(time.Second))
+		return a, v
+	}
+
+	t.Run("JunkMachineCannotTakeJunkMachinesMAC", func(t *testing.T) {
+		d := open(t)
+		r := NewRepository(d)
+		a, v := junkMachines(t, r)
+		mustReport(t, r, a.ID, Report{Facts: []byte(`{}`), MACs: []string{junkMACA, junkMACV}, At: t0.Add(time.Minute)})
+		if owner := scalar[string](t, d, "SELECT machine_id FROM machine_macs WHERE mac = ?", junkMACV); owner != v.ID {
+			t.Fatalf("owner of %s = %s, want V %s", junkMACV, owner, v.ID)
+		}
+		wantMACs(t, mustGet(t, r, a.ID), junkMACA)
+		wantMACs(t, mustGet(t, r, v.ID), junkMACV)
+		got, ok := lookup(t, r, Identity{UUID: allFUUID, MAC: junkMACV, Serial: "S", Product: "P"})
+		if !ok || got.ID != v.ID {
+			t.Fatalf("Lookup(V's identity) = %s, %v; want V %s", got.ID, ok, v.ID)
+		}
+	})
+
+	t.Run("JunkMachineRefreshesItsOwnMAC", func(t *testing.T) {
+		d := open(t)
+		r := NewRepository(d)
+		a, _ := junkMachines(t, r)
+		later := t0.Add(time.Minute)
+		mustReport(t, r, a.ID, Report{Facts: []byte(`{}`), MACs: []string{junkMACA}, At: later})
+		row := machineMAC{MAC: junkMACA}
+		if err := d.Bun().NewSelect().Model(&row).WherePK().Scan(t.Context()); err != nil {
+			t.Fatalf("read MAC: %v", err)
+		}
+		if !row.SeenAt.Equal(later) || row.MachineID != a.ID {
+			t.Fatalf("MAC row = %+v, want A %s seen at %v", row, a.ID, later)
+		}
+	})
+
+	t.Run("JunkMachineTakesUnownedMAC", func(t *testing.T) {
+		r := NewRepository(open(t))
+		a, _ := junkMachines(t, r)
+		mustReport(t, r, a.ID, Report{Facts: []byte(`{}`), MACs: []string{junkMACA, macN(0x50)}, At: t0.Add(time.Minute)})
+		wantMACs(t, mustGet(t, r, a.ID), junkMACA, macN(0x50))
+	})
+
+	t.Run("JunkMachineTakesValidMachinesMAC", func(t *testing.T) {
+		d := open(t)
+		r := NewRepository(d)
+		a, _ := junkMachines(t, r)
+		valid := firstContact(t, r, Identity{UUID: fixtureUUID, MAC: macN(0x51), Serial: "S1", Product: "P1"}, t0)
+		mustReport(t, r, a.ID, Report{Facts: []byte(`{}`), MACs: []string{junkMACA, macN(0x51)}, At: t0.Add(time.Minute)})
+		if owner := scalar[string](t, d, "SELECT machine_id FROM machine_macs WHERE mac = ?", macN(0x51)); owner != a.ID {
+			t.Fatalf("owner of %s = %s, want the junk reporter %s", macN(0x51), owner, a.ID)
+		}
+		wantMACs(t, mustGet(t, r, valid.ID))
+	})
+
+	t.Run("ValidMachineTakesJunkMachinesMAC", func(t *testing.T) {
+		d := open(t)
+		r := NewRepository(d)
+		_, v := junkMachines(t, r)
+		valid := firstContact(t, r, Identity{UUID: fixtureUUID, MAC: macN(0x52), Serial: "S1", Product: "P1"}, t0)
+		mustReport(t, r, valid.ID, Report{Facts: []byte(`{}`), MACs: []string{macN(0x52), junkMACV}, At: t0.Add(time.Minute)})
+		if owner := scalar[string](t, d, "SELECT machine_id FROM machine_macs WHERE mac = ?", junkMACV); owner != valid.ID {
+			t.Fatalf("owner of %s = %s, want the valid-UUID reporter %s", junkMACV, owner, valid.ID)
+		}
+		wantMACs(t, mustGet(t, r, v.ID))
 	})
 
 	t.Run("JunkPatternNeverMatchesValidUUIDMachine", func(t *testing.T) {

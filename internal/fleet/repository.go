@@ -648,10 +648,16 @@ func markUUIDJunk(ctx context.Context, q bun.IDB, stored Machine, seen Identity,
 
 // upsertMAC attaches mac to the machine, moving it from any machine that held
 // it, and drops the machine's least recently seen MACs beyond MACsKept. Every
-// MAC write goes through it so the cap always applies.
+// MAC write goes through it so the cap always applies. A machine keyed by a
+// junk-pattern UUID does not take a MAC another junk-keyed machine owns: the
+// MAC stays with its owner.
 func upsertMAC(ctx context.Context, q bun.IDB, machineID, mac string, at time.Time) error {
+	held, err := heldByJunkRival(ctx, q, machineID, mac)
+	if err != nil || held {
+		return err
+	}
 	row := machineMAC{MAC: mac, MachineID: machineID, SeenAt: at.UTC()}
-	_, err := q.NewInsert().Model(&row).
+	_, err = q.NewInsert().Model(&row).
 		On("CONFLICT (mac) DO UPDATE").
 		Set("machine_id = EXCLUDED.machine_id").
 		Set("seen_at = EXCLUDED.seen_at").
@@ -667,6 +673,23 @@ func upsertMAC(ctx context.Context, q bun.IDB, machineID, mac string, at time.Ti
 		return fmt.Errorf("trim MACs: %w", err)
 	}
 	return nil
+}
+
+// heldByJunkRival reports whether mac belongs to another machine while both
+// that machine and machineID are keyed by a junk-pattern UUID. Such machines are
+// told apart by their MACs alone, so a junk machine cannot take one from another.
+func heldByJunkRival(ctx context.Context, q bun.IDB, machineID, mac string) (bool, error) {
+	owner, err := macOwner(ctx, q, mac)
+	if err != nil || owner == "" || owner == machineID {
+		return false, err
+	}
+	var uuids []string
+	err = q.NewSelect().Model((*Machine)(nil)).Column("smbios_uuid").Where("id IN (?, ?)", machineID, owner).Scan(ctx, &uuids)
+	if err != nil {
+		return false, fmt.Errorf("load UUIDs of %s and %s: %w", machineID, owner, err)
+	}
+	notJunk := func(u string) bool { return !JunkPattern(u) }
+	return len(uuids) == 2 && !slices.ContainsFunc(uuids, notJunk), nil
 }
 
 // insertBootEvent stores row and drops the machine's events beyond

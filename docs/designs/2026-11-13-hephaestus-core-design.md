@@ -207,6 +207,8 @@ the double.
 - A UUID is **junk** if it is missing, all-zero, all-F, or reported with two different serial/product pairs.
 - The same UUID reported from different MACs is the **same machine**: multi-NIC machines boot from each NIC in turn. The
   newest 16 MACs seen per machine are recorded, and a MAC belongs to the machine that reported it most recently.
+  A junk-UUID machine does not take a MAC another junk-UUID machine owns, so a NIC moved between two junk boards keeps its
+  old owner until that record ages it out (the 16-MAC cap) or an admin intervenes.
 - Junk-UUID machines are keyed by their MAC set instead.
   - A request whose UUID is a junk pattern (missing, all-zero or all-F) is matched through the MAC it names, and only to a
     machine that is itself keyed by a junk-pattern UUID. It **never matches a machine with a valid UUID**, whatever that
