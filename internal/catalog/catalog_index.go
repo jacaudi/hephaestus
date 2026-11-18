@@ -50,8 +50,8 @@ func Default() (*Catalog, error) { return New(specs, pins) }
 // New returns the catalog of specs that have a pin in pins. It checks every
 // spec, and every pin against its spec: the same URLs and file paths in the
 // same order, sizes above zero, 64-digit hex sha256s, and an ID equal to
-// PinID(Objects). A pin with no spec is an error; a spec with no pin is left
-// out. Every problem found is reported together.
+// PinID(Objects), and no two keys have one id. A pin with no spec is an error;
+// a spec with no pin is left out. Every problem found is reported together.
 func New(specs []Spec, pins map[Key]Pin) (*Catalog, error) {
 	var errs []error
 	bySpec := make(map[Key]Spec, len(specs))
@@ -68,6 +68,7 @@ func New(specs []Spec, pins map[Key]Pin) (*Catalog, error) {
 	}
 
 	c := &Catalog{byKey: make(map[Key]Entry, len(pins))}
+	byPinID := make(map[string]Key, len(pins))
 	for _, k := range slices.SortedFunc(maps.Keys(pins), compareKeys) {
 		spec, ok := bySpec[k]
 		if !ok {
@@ -78,6 +79,13 @@ func New(specs []Spec, pins map[Key]Pin) (*Catalog, error) {
 			errs = append(errs, fmt.Errorf("pin %s/%s: %w", k.Entry, k.Arch, err))
 			continue
 		}
+		// The fetcher names a spool file after the pin id (toolcache.SpoolName), so
+		// two keys with one id would download into one file.
+		if first, dup := byPinID[pins[k].ID]; dup {
+			errs = append(errs, fmt.Errorf("pin %s/%s: its id %s is also the id of %s/%s; two keys must not share a pin id", k.Entry, k.Arch, pins[k].ID, first.Entry, first.Arch))
+			continue
+		}
+		byPinID[pins[k].ID] = k
 		e := Entry{Spec: spec, Pin: pins[k]}.clone()
 		c.entries = append(c.entries, e)
 		c.byKey[k] = e

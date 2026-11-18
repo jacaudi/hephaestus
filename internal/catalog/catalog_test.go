@@ -367,6 +367,56 @@ func TestNew_RejectsBadPins(t *testing.T) {
 	}
 }
 
+// TestNew_PinIDsAreUnique: the fetcher names a spool file after the pin id, so
+// two keys must not share one.
+func TestNew_PinIDsAreUnique(t *testing.T) {
+	tlive := catalog.Key{Entry: "tlive", Arch: "amd64"}
+	arm := catalog.Key{Entry: "tlive", Arch: "arm64"}
+
+	t.Run("distinct pins are accepted", func(t *testing.T) {
+		specs, pins := fixturePins(t)
+		if pins[tlive].ID == pins[arm].ID {
+			t.Fatalf("the fixture's tlive keys share the pin id %s", pins[tlive].ID)
+		}
+		if _, err := catalog.New(specs, pins); err != nil {
+			t.Errorf("New = %v, want nil", err)
+		}
+	})
+	t.Run("two keys with one pin id are refused", func(t *testing.T) {
+		specs, pins := fixturePins(t)
+		for i := range specs {
+			if specs[i].Key() == arm {
+				// The same object and files as amd64: the same pin id.
+				specs[i].Objects = slices.Clone(mustSpec(t, specs, tlive).Objects)
+			}
+		}
+		pins[arm] = pins[tlive]
+
+		_, err := catalog.New(specs, pins)
+
+		if err == nil {
+			t.Fatal("New accepted two keys with one pin id")
+		}
+		for _, want := range []string{"tlive/amd64", "tlive/arm64", pins[tlive].ID} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q does not name %q", err, want)
+			}
+		}
+	})
+}
+
+// mustSpec returns the spec of key from specs.
+func mustSpec(t *testing.T, specs []catalog.Spec, key catalog.Key) catalog.Spec {
+	t.Helper()
+	for i := range specs {
+		if specs[i].Key() == key {
+			return specs[i]
+		}
+	}
+	t.Fatalf("no spec for %v", key)
+	return catalog.Spec{}
+}
+
 func TestNew_LeavesOutUnpinnedSpecs(t *testing.T) {
 	specs, pins := fixturePins(t)
 	delete(pins, catalog.Key{Entry: "tlive", Arch: "arm64"})

@@ -8,7 +8,9 @@ import (
 )
 
 // SpoolName is the file name of a partial download of object n of the pin:
-// pin, a dash and the object's index.
+// pin, a dash and the object's index. The name holds no key, so it is unique
+// to a download only while no two catalog keys share a pin id; catalog.New
+// refuses a catalog in which two do, and concurrent downloads depend on it.
 func SpoolName(pin string, n int) string {
 	return pin + "-" + strconv.Itoa(n)
 }
