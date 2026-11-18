@@ -205,7 +205,7 @@ They are written on state changes only. The CLI's actor is `cli`. `served` means
 **No sweep.** There is no background clearer. Expiry is enforced when the decision is made, and `boot-next list` shows an expired flag as expired. The M1 fallback `utility boot not available (M2)` is removed.
 
 **Artifact route.** `GET /u/{entry}/{arch}/{version}/{path...}` is served on the **plain-HTTP mux only**, under the subnet guard. Every recipe uses plain HTTP.
-- **Resolution.** `{version}` must equal the catalog version. The route resolves `utility/<entry>-<arch>:<current pin>`, finds the file's blob, checks its size, and serves it with `http.ServeContent` (with `Range`, and the blob digest as the ETag).
+- **Resolution.** `{version}` must equal the catalog version. The route resolves `utility/<entry>-<arch>:<current pin>`, finds the file's layer, checks that the layer's digest and size are the ones the catalog pins for that file (anything else is lost content: a 404, and the ready row goes back to `wanted`), checks the blob's size, and serves it with `http.ServeContent` (with `Range`, and the blob digest as the ETag).
 - **Deadlines.** It uses the existing idle-deadline writer (`handlers.go:296-308`), not the one-minute `WriteTimeout`. A unit test holds a response open past a shortened `WriteTimeout` and asserts it is not truncated.
 - **Misses.** Anything unknown returns 404.
 

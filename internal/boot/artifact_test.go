@@ -3,6 +3,8 @@ package boot
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io"
 	"net"
@@ -13,6 +15,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"go.jacaudi.dev/hephaestus/internal/catalog"
 	"go.jacaudi.dev/hephaestus/internal/catalog/catalogtest"
@@ -214,6 +218,67 @@ func TestArtifact_MissingBlobRequeues(t *testing.T) {
 
 	wantStatus(t, rec, http.StatusNotFound)
 	g.wantRequeued()
+}
+
+// stockLiveWithLayer is stockLive for a tag whose layer for file is the given
+// bytes instead of the pinned ones: its blob is whole and its descriptor says
+// what the blob is, so the store's own check passes.
+func (g *rig) stockLiveWithLayer(file string, content []byte) {
+	g.t.Helper()
+	e := g.live()
+	var layers []ocispec.Descriptor
+	for _, fp := range e.Pin.Objects[0].Files {
+		data := g.fix.Files[catalog.Key{Entry: liveEntry, Arch: liveArch}][fp.Path]
+		if fp.Path == file {
+			data = content
+		}
+		sum := sha256.Sum256(data)
+		desc, err := store.Layer(fp.Path, int64(len(data)), hex.EncodeToString(sum[:]))
+		if err != nil {
+			g.t.Fatalf("Layer %s: %v", fp.Path, err)
+		}
+		if err := g.st.PushBlob(g.t.Context(), desc, bytes.NewReader(data)); err != nil {
+			g.t.Fatalf("PushBlob %s: %v", fp.Path, err)
+		}
+		layers = append(layers, desc)
+	}
+	if _, err := g.st.TagArtifact(g.t.Context(), e.Tag(), catalog.ArtifactType, layers); err != nil {
+		g.t.Fatalf("TagArtifact: %v", err)
+	}
+	if _, err := g.repo.RequestFetch(g.t.Context(), liveCacheKey(), e.Pin.ID, 1, testNow()); err != nil {
+		g.t.Fatalf("RequestFetch: %v", err)
+	}
+	if moved, err := g.repo.RestoreReady(g.t.Context(), liveCacheKey(), e.Pin.ID, testNow()); err != nil || !moved {
+		g.t.Fatalf("RestoreReady = %v, %v; want the wanted row moved to ready", moved, err)
+	}
+}
+
+// TestArtifact_LayerNotThePinnedFileRequeues pins that a tag whose layer is not
+// the file the catalog pins (another digest, or another size) is lost content,
+// not something to serve: 404, and the ready row goes back to wanted.
+func TestArtifact_LayerNotThePinnedFileRequeues(t *testing.T) {
+	tests := []struct {
+		name    string
+		content func(pinned []byte) []byte
+	}{
+		{name: "another digest at the pinned size", content: func(pinned []byte) []byte {
+			other := bytes.Clone(pinned)
+			other[0] ^= 0xff
+			return other
+		}},
+		{name: "another size", content: func(pinned []byte) []byte { return pinned[:len(pinned)-1] }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := newRig(t)
+			g.stockLiveWithLayer(liveFile, tt.content(g.liveBytes()))
+
+			rec := g.plain(liveURL)
+
+			wantStatus(t, rec, http.StatusNotFound)
+			g.wantRequeued()
+		})
+	}
 }
 
 // TestArtifact_UntaggedReadyRowRequeues is a store that was set aside and

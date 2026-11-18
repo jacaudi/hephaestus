@@ -19,7 +19,9 @@ import (
 // utility entry, from the layer of the entry's current pin whose title is the
 // path, with Range support and the blob's digest as its ETag. An entry, arch,
 // version or path the catalog does not know is a 404, and so is content the
-// store lacks, which also puts the entry's ready cache row back to wanted.
+// store lacks, which also puts the entry's ready cache row back to wanted. A
+// layer whose digest or size is not the catalog's pin for the file counts as
+// content the store lacks.
 //
 // The copy never watches the request context (plan gate 1, S6): a long transfer
 // ends when the client stops reading, under the write deadline idleWriter
@@ -31,7 +33,8 @@ func (h *Handlers) artifact(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if _, ok := e.File(p); !ok {
+	pin, ok := e.File(p)
+	if !ok {
 		http.NotFound(w, r)
 		return
 	}
@@ -44,6 +47,12 @@ func (h *Handlers) artifact(w http.ResponseWriter, r *http.Request) {
 	i := slices.IndexFunc(layers, func(l ocispec.Descriptor) bool { return l.Annotations[ocispec.AnnotationTitle] == p })
 	if i < 0 {
 		http.NotFound(w, r)
+		return
+	}
+	// The tag must hold the file the catalog pins, not merely a whole blob: a layer
+	// of another digest or size is content the store lacks.
+	if l := layers[i]; l.Digest.String() != "sha256:"+pin.SHA256 || l.Size != pin.Size {
+		h.artifactError(w, r, e, fmt.Errorf("layer %q of %q is %s (%d bytes), not the pinned sha256:%s (%d bytes): %w", p, e.Tag(), l.Digest, l.Size, pin.SHA256, pin.Size, store.ErrLayerMissing))
 		return
 	}
 	blob, err := h.content.OpenBlob(layers[i])
