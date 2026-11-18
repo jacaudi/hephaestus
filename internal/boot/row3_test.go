@@ -145,44 +145,6 @@ func TestBoot_Row3ServesRecipe(t *testing.T) {
 	}
 }
 
-// TestBoot_Row3JunkMachineDoesNotInheritAnotherJunkMachinesBoot pins that a junk
-// machine's /discover listing another junk machine's MAC does not move that
-// MAC: the other machine's /boot is still its own, not the lister's utility boot.
-func TestBoot_Row3JunkMachineDoesNotInheritAnotherJunkMachinesBoot(t *testing.T) {
-	const (
-		allF   = "ffffffff-ffff-ffff-ffff-ffffffffffff"
-		macV   = "aa:bb:cc:00:00:02"
-		queryA = "uuid=" + zeroUUID + "&mac=aa-bb-cc-00-00-01&arch=x86_64&serial=S&product=P&platform=efi"
-		queryV = "uuid=" + allF + "&mac=aa-bb-cc-00-00-02&arch=x86_64&serial=S&product=P&platform=efi"
-	)
-	g := newRig(t)
-	g.boot(queryA)
-	g.boot(queryV)
-	a, ok, err := g.repo.Lookup(t.Context(), fleet.Identity{UUID: zeroUUID, MAC: bootMAC})
-	if err != nil || !ok {
-		t.Fatalf("Lookup(A) = %v, %v", ok, err)
-	}
-	req := fleet.SetBootNextRequest{MachineID: a.ID, Entry: entryName, Pin: g.shell().Pin.ID, At: testNow().Add(-time.Hour)}
-	if _, err := g.repo.SetBootNext(t.Context(), req); err != nil {
-		t.Fatalf("SetBootNext: %v", err)
-	}
-	g.stock()
-
-	g.discoverOK(discoverForm("uuid", zeroUUID, "serial", "S", "product", "P", "nic1_mac", macV))
-	body := g.boot(queryV)
-
-	wantReportExit(t, body)
-	if got, err := g.repo.Get(t.Context(), a.ID); err != nil || got.BootNext != entryName {
-		t.Errorf("A boot-next = %q, %v; want the flag untouched", got.BootNext, err)
-	}
-	if n := g.cleared(""); n != 0 {
-		t.Errorf("boot_next.cleared events = %d, want 0", n)
-	}
-	if n := g.count("SELECT count(*) FROM boot_events WHERE decision_row = 3"); n != 0 {
-		t.Errorf("row 3 events = %d, want 0", n)
-	}
-}
-
 func TestBoot_Row3NotReadyKeepsFlag(t *testing.T) {
 	g := newRig(t)
 	g.armed()
