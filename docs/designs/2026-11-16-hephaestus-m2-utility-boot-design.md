@@ -17,13 +17,13 @@ This is core goal 5's "boot-next for utility OSes" (P1.6, D7), and it is useful 
 
 **Goals**
 1. **Content store.** One oras-go v3 OCI-layout store under `<data>/store`. Only the `serve` process writes to it, and a blob is visible only once it is complete (core §5.6).
-2. **Pinned catalog.** A compiled-in utility catalog holding D7's "verifiable 7": memtest86+, SystemRescue, Clonezilla, GParted, ShredOS, grml and the UEFI Shell. For arm64 that means memtest86+, grml and the UEFI Shell.
+2. **Pinned catalog.** A compiled-in utility catalog holding D7's "verifiable 7": memtest86+, SystemRescue, Clonezilla, GParted, ShredOS, grml and the UEFI Shell. For arm64 that means memtest86+, grml and the UEFI Shell. An entry the pin tool cannot pin is absent: the generated `absent` ledger holds its reason, and the running catalog leaves it out (§5.2).
 3. **Fetcher.** A fetcher in `serve` downloads resumably, checks sizes and hashes, extracts in pure Go, pushes into the store and marks the entry `ready`. Its lifecycle is a total state machine (§5.4).
 4. **Row 3.** Decision row 3 goes live. A one-shot boot-next target that is ready and supported on the machine's arch and firmware boots that tool, and the flag clears. A flag never fires more than 24 h after it was set (§5.5).
 5. **CLI.** An admin CLI in the same binary, run inside the container, sets, clears and lists boot-next flags, and requests and lists fetches (owner, 2026-11-16).
 6. **Artifact routes.** Plain-HTTP artifact routes on the provisioning IP serve the first and second stages, with `Range` support.
 7. **Startup maintenance.** At startup, utility state is reconciled against the store, and utility content is garbage-collected once.
-8. **End-to-end proof.** `task e2e` proves every recipe class on amd64 UEFI, amd64 BIOS and arm64 UEFI.
+8. **End-to-end proof.** `task e2e` proves every iPXE mechanism on amd64 UEFI, amd64 BIOS and arm64 UEFI, where the mechanism exists for that firmware. The mechanisms are `chain` (EFI only, by nature) and `kernel` + `initrd` + `boot`; the recipes map onto them as §3 says.
 
 **Non-goals (M2)**
 - **Talos (to M3).** Talos boot assets, the installer index, prefetch at approval, `assets_ready`, Talos reconciliation and the `/v2/` mirror all move to M3 (owner, 2026-11-16).
@@ -42,7 +42,7 @@ This is core goal 5's "boot-next for utility OSes" (P1.6, D7), and it is useful 
 ## 3. Constraints
 
 - Everything in core §3, plus the owner's standards: go-standards, 12-Factor and WL.
-- **No iPXE rebuild.** The committed iPXE binaries are not rebuilt. The pinned source enables `IMAGE_BZIMAGE` on BIOS, and on EFI it enables `IMAGE_EFI` (EFI-stub kernels, with initrds through `efi_file.c`'s LoadFile2), plus `IMAGE_GZIP` on aarch64 EFI. `task e2e` proves each recipe class on each firmware, using the test-CA build of the same iPXE source and config. A class that fails is marked unsupported for that combination in the catalog.
+- **No iPXE rebuild.** The committed iPXE binaries are not rebuilt. The pinned source enables `IMAGE_BZIMAGE` on BIOS, and on EFI it enables `IMAGE_EFI` (EFI-stub kernels, with initrds through `efi_file.c`'s LoadFile2), plus `IMAGE_GZIP` on aarch64 EFI. `task e2e` proves each iPXE mechanism on each firmware that has it, using the test-CA build of the same iPXE source and config. The e2e classes are mechanisms, not recipe kinds: `chain` (the `chain` recipe) and `kernel` + `initrd` + `boot` (proven through a `live-boot` entry). The `kernel`-only recipe (ShredOS: a kernel and `boot`, no initrd) and the `archiso` recipe (SystemRescue) are lab-proven only. A mechanism that fails on one firmware while another firmware passes the same case is marked unsupported for that combination in the catalog.
 - **Internet only for the first fetch.** The first fetch of a tool needs internet from the hephaestus host. After that, utility boots work offline (core goal 4).
 - **Single owner.** Shell access to the host is the authorization for the CLI.
 - **Both databases.** SQLite and Postgres both work, through goose migration `00002` in both migration sets, with dialect-correct types (`BIGINT` and `TIMESTAMPTZ` on Postgres).
@@ -68,7 +68,7 @@ This is core goal 5's "boot-next for utility OSes" (P1.6, D7), and it is useful 
 
 | Package | Holds |
 |---|---|
-| `store` (new) | The oras-go v3 `content/oci` store, opened with `SyncIndex: true`. Push, tag, untag, resolve, a blob `io.ReadSeekCloser`, a layer size check (`Exists` plus on-disk size against the descriptor), and GC. Only `serve` uses it. |
+| `store` (new) | The oras-go v3 `content/oci` store, opened with `SyncIndex: true`. Push, tag, untag, resolve, a blob `io.ReadSeekCloser`, a layer check (each layer's blob file is `Stat`ed under an `os.Root` against its descriptor, giving `ErrLayerMissing` or `ErrLayerSize`; oras-go's `Exists` is not called), a push that repairs a wrong-sized blob (oras keeps any existing blob file, so `PushBlob` unlinks one at another size and pushes it again, which lets a truncated layer on a repaired host refetch unattended), and GC. Only `serve` uses it. |
 | `catalog` (new) | The compiled-in entries (§5.2). Hand-written fields (URLs, recipes, support) live in `catalog.go`; generated fields (sizes, hashes, extracted paths, key fingerprints, pin id) live in `catalog_pins.go`, written by `task catalog:pin`. It renders recipe scripts and does no I/O. |
 | `toolcache` (new) | The fetcher (§5.4), the extractors (zip and ISO9660, shared with the pin tool; tar+gzip was dropped because no entry uses it), startup reconciliation and GC (§5.7). Runs in `serve` only. The Go package is `toolcache`, not `utility`, because revive bans that name; this design still says "utility" for the feature (the `utility` CLI group, the `/u/` route, `utility_cache`). |
 | `fleet` | `SetBootNext`, `ClearBootNext` (always compare-and-clear), `ListBootNext`, and the `utility_cache` repository with conditional transitions (§5.4). Audit events only for §5.3's closed list. |
@@ -90,23 +90,25 @@ Versions below are as of 2026-11-15. `task catalog:pin` fixes the final values.
 | Entry | Version | Arch / platform | Upstream object | Integrity at pin time | Recipe shape |
 |---|---|---|---|---|---|
 | `memtest86plus` | 9.00 | amd64 efi, arm64 efi; amd64 pcbios once the lab boots it | `mt86plus_9.00.binaries.zip`, files `mt86p_900_x86_64` and `mt86p_900_arm64` (one unified binary per arch) | Upstream SHA-256 list, unsigned: **TOFU** | efi: `chain` the binary. pcbios: `kernel` + `boot`, only after lab test 6 proves it, until then unsupported |
-| `systemrescue` | 13.03 | amd64 pcbios+efi | the amd64 ISO. Files: kernel, initrd(s), `sysresccd/x86_64/airootfs.sfs` and its `.sha512` | SHA-256 + GPG `.asc` | `kernel … archisobasedir=sysresccd ip=dhcp BOOTIF=… archiso_http_srv=http://<prov-ip>/u/systemrescue/amd64/13.03/ checksum` + `initrd`. The base keeps `sysresccd/x86_64/airootfs.sfs` beneath it and ends in `/` |
+| `systemrescue` | 13.03 | amd64 pcbios+efi | the amd64 ISO. Files: kernel, initrd(s), `sysresccd/x86_64/airootfs.sfs` and its `.sha512` | A detached GPG `.asc` signature over the ISO itself; no separate upstream SHA-256 list is read | `kernel … archisobasedir=sysresccd ip=dhcp BOOTIF=… archiso_http_srv=http://<prov-ip>/u/systemrescue/amd64/13.03/ checksum` + `initrd`. The base keeps `sysresccd/x86_64/airootfs.sfs` beneath it and ends in `/` |
 | `clonezilla` | 3.3.3-37 | amd64 pcbios+efi | the amd64 zip. Files: `live/vmlinuz`, `live/initrd.img`, `live/filesystem.squashfs` | CHECKSUMS + GPG | live-boot: `boot=live BOOTIF=… fetch=http://<prov-ip>/u/clonezilla/amd64/<v>/live/filesystem.squashfs` |
 | `gparted` | 1.8.1-6 | amd64 pcbios+efi | the amd64 zip, same layout | CHECKSUMS + GPG | live-boot, as Clonezilla |
-| `shredos` | v2025.11_32_x86-64_0.43.1 | amd64 pcbios and efi (the pin step found an EFI stub in the kernel) | the release's full x86-64 `.iso` asset (not "lite" or "plus-partition"). File: its kernel | GitHub's release-asset `sha256:` digest, cross-checked with upstream `.sha1`. The release is mutable, so **TOFU** | `kernel` + `boot`, with **no `autonuke`** |
+| `shredos` | v2025.11_32_x86-64_0.43.1 | amd64 pcbios and efi (the pin step found an EFI stub in the kernel) | the release's full x86-64 `.iso` asset (not "lite" or "plus-partition"). File: its kernel | Cross-checked at pin time against the release's upstream `.sha1`; GitHub's release-asset `sha256:` digest is not queried. The release is mutable, so **TOFU** | `kernel` + `boot`, with **no `autonuke`** |
 | `grml` | 2026.09 | amd64 pcbios+efi; arm64 efi | the full ISO, one per arch. Files: kernel, initrd, squashfs | SHA256SUMS + GPG | live-boot `BOOTIF=… fetch=http://<prov-ip>/u/grml/<arch>/<v>/<squashfs path>` |
 | `uefishell` | edk2-stable202002 | amd64 efi, arm64 efi | `ShellBinPkg.zip`. Files: `ShellBinPkg/UefiShell/X64/Shell.efi` and `ShellBinPkg/UefiShell/AArch64/Shell.efi` (the full shell, not `MinUefiShell`) | Nothing upstream: **TOFU** (Debian's signed `efi-shell-x64` is a later option) | `chain` the `.efi` |
 
 Every recipe follows these rules:
-- **Substitutions.** A recipe's only substitutions are the provisioning IP, the `/u/` paths, and `BOOTIF=01-${net${idx}/mac:hexhyp}`. That last one is the NIC the machine booted from; `idx` is the embedded script's interface counter, which persists across the chain. No request text ever reaches a script (core §5.2). The pin step records whether each OS honours `BOOTIF` (archiso, live-boot). e2e proves only that iPXE expands it; lab test 6 proves the OS honours it.
+- **Substitutions.** A recipe's only substitutions are the provisioning IP, the `/u/` paths, and `BOOTIF=01-${net${idx}/mac:hexhyp}`. That last one is the NIC the machine booted from; `idx` is the embedded script's interface counter, which persists across the chain. No request text ever reaches a script (core §5.2). Whether an OS honours `BOOTIF` follows the recipe kind: `archiso` and `live-boot` do, `chain` and `kernel` pass none. The pin tool prints it per entry in its report and records nothing about it in the pin. e2e proves only that iPXE expands it; lab test 6 proves the OS honours it.
 - **IP, not FQDN.** First and second stages use `http://<HEPHAESTUS_PROVISIONING_ADDRESS>`, because live-boot's `fetch=` accepts an IP only (live-boot(7)), and in proxy mode the name's `:80` is the proxy.
-- **RAM.** live-boot's `fetch=` copies the squashfs into RAM. `utility list` shows each entry's minimum RAM, computed from the pinned squashfs size.
+- **RAM.** live-boot's `fetch=` copies the squashfs into RAM. `utility list` shows each entry's minimum RAM: the sum of the sizes of the entry's pinned files plus 512 MiB of headroom, rounded up to a multiple of 256 MiB. It is a display value, and every entry has one, squashfs or not.
 
 **`task catalog:pin`** runs inside a pinned container:
 1. Downloads each object, checks its size, and verifies it before parsing anything.
-2. Binds GPG to `VALIDSIG` for the fingerprint committed in `catalog/keys/<entry>.asc`. `catalog/keys/PROVENANCE.md` records where each fingerprint came from, which must be a source separate from the download host. A key that cannot be authenticated stops that entry. It never falls back to TOFU.
+2. Binds GPG to `VALIDSIG` for the fingerprint committed in `catalog/keys/<entry>.asc`. `catalog/keys/PROVENANCE.md` records where each fingerprint came from, which must be a source separate from the download host. A key that cannot be authenticated makes that entry absent (class `signature`). It never falls back to TOFU.
 3. Extracts with `toolcache`'s extractors.
-4. Records every hash, size and path, the pin id, ShredOS's EFI-stub finding, and each entry's `BOOTIF` support.
+4. Records every hash, size and path, the pin id and ShredOS's EFI-stub finding. Its report also prints each entry's `BOOTIF` support, which follows the recipe kind (see the recipe rules above).
+
+**Absent entries.** An entry that cannot be pinned does not fail the run. The tool writes it to the generated `absent` ledger in `catalog_pins.go`, with a reason that starts with a class: `tls13` (a hop did not complete TLS 1.3), `network`, `http-<status>`, `integrity`, `signature` or `checksum`. A download is tried up to three times, 5 s apart, and only for `network` failures and `5xx` or `429` statuses; every other class rules the entry absent at once. `-only <entry,…>` re-pins just those entries and keeps every other entry's compiled-in pin or absent reason. `catalog.New` leaves a spec with no pin out of the running catalog, so row 3 treats a flag naming an absent entry as `unknown_entry`.
 
 CI checks:
 - every object has a size, a hash and an `https` URL;
@@ -131,7 +133,7 @@ A `CHECK` makes them NULL together or set together. The value is validated again
 | `state` | `wanted`, `fetching`, `ready`, `failed` or `broken` |
 | `attempts` | Incremented at each failure; the 10th failure moves the row to `broken` |
 | `next_attempt_at` | When a `failed` row may be retried |
-| `priority` | 1 when a boot-next names the entry, else 0 |
+| `priority` | 1 when `boot-next set` or row 3's "wants it" event has named the entry; 0 for a row `utility fetch` creates. An existing row's priority is only ever raised, and changing it is not a state transition, so an entry whose flag was cleared may still be fetched first |
 | `bytes_done`, `bytes_total` | Progress of the current object |
 | `last_error` | |
 | `updated_at` | Shown as "last change" by `utility list` |
@@ -157,10 +159,10 @@ They are written on state changes only. The CLI's actor is `cli`. `served` means
 | From | Event | To |
 |---|---|---|
 | (no row) | CLI `boot-next set`, CLI `utility fetch`, or row 3 finds the entry not ready | `wanted` (`priority` 1 when a boot-next names it) |
-| `failed` or `broken` | CLI `boot-next set` or CLI `utility fetch`: an explicit admin action | `wanted`, `attempts` reset. The CLI prints the previous `last_error` |
+| `failed` or `broken` | CLI `boot-next set` or CLI `utility fetch`: an explicit admin action | `wanted`, `attempts` reset. The CLI prints the previous `last_error`. A row for another pin than the catalog's is left alone: serve repins it at its next start (§5.7), and the CLI never re-arms it |
 | `failed` or `broken` | row 3 wants it | unchanged. Row 3 never resets backoff or re-arms `broken`, so a held machine re-chaining every 30 s cannot cause a refetch loop |
 | `wanted` | the fetcher claims it (highest `priority` first, then oldest `updated_at`) | `fetching` |
-| `fetching` | push and tag done, every layer's size checked | `ready` |
+| `fetching` | push and tag done, every layer's size checked; or the store already holds the complete tag at the row's pin (the claim-time shortcut, below) | `ready` |
 | `fetching` | **integrity error**: wrong size or hash, a path violation, or a redirect to a non-`https` URL (GPG is checked at pin time only, §5.2; the fetcher holds the pinned size and sha256, not a signature) | `broken`. The spool is deleted. Every `boot_next` naming `(entry, arch)` is compare-and-cleared with reason `broken` |
 | `fetching` | **any other error** (the default class): network, any HTTP status other than the expected one, local I/O, disk full | `failed`. `attempts`+1. `next_attempt_at` backs off from 1 min, doubling, capped at 1 h. On the 10th failure, `broken`, with the same clears |
 | `failed` | `next_attempt_at` reached | `fetching` |
@@ -168,13 +170,16 @@ They are written on state changes only. The CLI's actor is `cli`. `served` means
 
 **Fetching.**
 - **Polling.** The fetcher polls every 10 s. One fetch runs at a time, and armed boot-nexts go first.
+- **Store shortcut.** After claiming a row, the fetcher first checks the store. A complete tag at the row's pin, with every layer passing the size check, makes the row `ready` with no download. This is how a `broken` row that an admin re-arms (its content having arrived meanwhile) becomes ready.
+- **Claim-time failures.** A claimed row whose `(entry, arch)` is not in the catalog, or whose pin is not the catalog's current pin, fails in the default class. This is defensive: startup repins every row, and the CLI shares serve's catalog.
+- **Bookkeeping errors.** When the database refuses to store a fetch's outcome (`ready` or a failure), the fetcher holds the outcome and retries it first on its next poll. If the retry fails too, it resets the `fetching` row to `wanted`, which skips backoff and leaves `attempts` as they were, drops the outcome and emits a `fetching → wanted` event, so a database fault cannot strand a row in `fetching` until the next restart. The reset is a runtime transition the table does not list, because it has no cause in the row itself.
 - **Free space.** Before a fetch: free space on the spool volume must be at least twice the object size plus a fixed 1 GiB reserve. A 10%-of-the-filesystem reserve blocked every fetch on a large volume (99 GB on a 994 GB disk; terabytes on TrueNAS); ruled during Task 7. The fixed reserve still leaves the SQLite database room for its journal and growth.
 - **Spool.** Each object downloads to `<data>/spool/<pin>-<n>`, a name parsed back by an expected-name set.
 - **Size cap.** Bytes beyond the pinned size are refused.
 - **Already complete.** A spool already at the pinned size goes straight to verification, with no request.
 - **Resume.** Resume uses `Range` plus `If-Range`, and only with a strong ETag from the sidecar file (RFC 9110). A weak or absent ETag, or a `200` in reply to a range request, restarts from zero.
 - **Mirror changes.** The pinned hash is the authority, whichever mirror answers.
-- **HTTP client** (go-standards §15.1): no total timeout, a 60 s idle deadline, TLS 1.3 minimum, `https`-only redirects (at most 5), and user agent `hephaestus/<version>`. The response body is read through a context-aware reader, so shutdown abandons it promptly. oras-go v3's `Push` ignores its context.
+- **HTTP client** (go-standards §15.1): no total timeout, a 60 s idle deadline, a 60 s response-header timeout, TLS 1.3 minimum, `https`-only redirects (at most 5), no transparent decompression (the pinned hash is over the bytes as served), the proxy from the environment (`HTTPS_PROXY`, `NO_PROXY`), the `Referer` header removed on every redirect (SourceForge answers a request carrying one with a 200 HTML interstitial, which would break the entry), and user agent `hephaestus/<version>`. An `http://` proxy hop is a plaintext `CONNECT` to the proxy, and the TLS 1.3 session to the upstream runs inside the tunnel. The response body is read through a context-aware reader, so shutdown abandons it promptly. oras-go v3's `Push` ignores its context.
 - **Verify, then extract.** The object's size and sha256 must match before anything parses it. Extraction takes only the named files: no absolute paths, no `..`, and no links followed. Each file is capped at its pinned size, and its sha256 must match.
 - **Push.** Each file goes in as a blob, with one manifest per `(entry, arch, pin)`. The manifest's artifact type is `application/vnd.hephaestus.utility.v1`, and it is tagged `utility/<entry>-<arch>:<pin>`. The row becomes `ready` only after the tag resolves and every layer passes the size check. Then the spool is deleted.
 - **Shutdown.** An in-flight fetch is abandoned. The spool and its sidecar stay for resume.
@@ -212,9 +217,9 @@ They are written on state changes only. The CLI's actor is `cli`. `served` means
 |---|---|
 | `boot-next set <mac\|uuid> <entry>` | Requires a machine hephaestus has seen. A UUID shared by junk records is ambiguous: the CLI refuses and lists the MACs. It refuses an entry the machine's arch cannot boot. It judges architecture only: the firmware platform is known only at boot, so `serve` may still clear the flag as `unsupported` (row 3) for a platform the entry lacks. Otherwise it sets the flag and its time, applies §5.4's CLI event, audits, and prints readiness and the 24 h expiry. For `shredos` it prints a warning naming the machine |
 | `boot-next clear <mac\|uuid>` | Compare-and-clear with `cli` |
-| `boot-next list` | Every flag: machine, entry, age, and readiness or "expired". Its `unsupported` status, like `set`'s refusal, judges architecture only |
+| `boot-next list` | Every flag: machine, entry, age, and a status in row 3's order: `expired`, `unknown_entry` (the catalog lost the entry), `unsupported`, then the cache row's state, or `not_requested` when the entry has no row at the catalog's pin. Its `unsupported` status, like `set`'s refusal, judges architecture only |
 | `utility fetch <entry> [--arch …]` | §5.4's CLI event |
-| `utility list` | Per `(entry, arch)`: version, platforms, state, progress, last error, last change, TOFU mark, minimum RAM |
+| `utility list` | Per `(entry, arch)`: version, platforms, state, progress, last error, last change, TOFU mark, minimum RAM. State is the cache row's state, `not_requested` when no row exists, or `stale_pin` when the row is for an older pin than the catalog's (serve repins it at its next start) |
 
 The CLI loads the same bootstrap config as `serve` and opens the same database. It never touches the store.
 
@@ -231,7 +236,7 @@ The listeners are bound first. That is M1's order, and a second `serve` therefor
    - A row for an entry no longer in the catalog is deleted.
    - A row whose `pin` differs from the catalog's current pin is reset to `wanted` at the new pin.
    - A `ready` row whose tag or any layer is missing or wrong-sized becomes `wanted`. That re-queues it, as core §5.6 does for a missing blob, so a restored or repaired host refetches its offline cache unattended.
-   - A tag at the current pin whose layers all pass the size check makes its row `ready`. This repairs a crash between tagging and the state update.
+   - A tag at the current pin whose layers all pass the size check makes a `wanted` or `failed` row `ready`. This repairs a crash between tagging and the state update. A `broken` row stays `broken`: it needs an admin action, which then takes the fetcher's store shortcut (§5.4). No row is created: content with no row stays unused until something requests the entry.
 4. **Spool.** Any file outside the expected-name set is removed.
 5. **GC.** Untag every `utility/*` tag that is not at a current pin, then run `Store.GC()`. oras-go spares unreachable blobs younger than an hour, and nothing is served yet. The untag is scoped to `utility/`, so M3's pins stay additive. A `CollectGarbage` failure logs Warn `utility garbage collection failed` and `serve` continues: garbage is only disk.
 
@@ -241,7 +246,10 @@ The listeners are bound first. That is M1's order, and a second `serve` therefor
 
 - **Metrics:** `hephaestus.utility.fetch.bytes`, `hephaestus.utility.fetch.failures{class}`, `hephaestus.utility.boots{entry}`.
 - **Health:** `/health` gains `store:readable` (critical, the name core §5.9 uses) and `store:bytes`.
-- **Logs:** every fetch state change logs a wide event.
+- **Logs:** every state change the fetcher makes logs one Info `utility fetch` event (the wide event): the claim, `ready`, `failed`, `broken`, and the runtime reset to `wanted`. Other changes do not:
+  - startup reconciliation logs one `utility reconciled` summary that gives counts only (interrupted, deleted, repinned, requeued, restored, spool files removed), with no per-row event;
+  - row 3's `(no row) → wanted` is part of the boot request and is not a fetch event;
+  - a requeue from row 3 or `/u/` (lost content) reaches the error handler, which logs it at Error.
 
 ### 5.9 Verification
 
@@ -255,8 +263,8 @@ The listeners are bound first. That is M1's order, and a second `serve` therefor
 - the idle writer past a shortened `WriteTimeout`.
 
 **`task e2e`** gains utility boots against a **local fake upstream**, an HTTP container in the harness.
-- **Build.** The e2e image is built as in M1, from the temporary copy, with `catalog.go` and `catalog_pins.go` **overlaid** by test entries pointing at that upstream. The overlay is compiled by the image build. There is no build tag and no change to the production Dockerfile.
-- **Fixtures.** The fixture kernel and initrd come from a pinned base image, by digest. Their hashes are generated into the overlay by the harness.
+- **Build.** The e2e image is built as in M1, from the temporary copy, with `catalog.go` **overlaid** by test entries pointing at that upstream. `catalog_pins.go` is not overlaid but generated: the harness builds the pin tool and runs it in a container against the fake upstream, inside the temporary tree, which single-sources the pin id. The result is compiled by the image build. There is no build tag and no change to the production Dockerfile.
+- **Fixtures.** The fixture kernel and busybox come from `apt-get download` against the M1 Debian snapshot, for both arches, on a `debian:trixie-slim` base pinned by digest; the fixture build assembles the initrd. The UEFI Shell zip is upstream's real `ShellBinPkg.zip`, fetched over TLS 1.3 and checked against a pinned sha256. Their hashes reach the catalog through the generated pin, not by hand.
 - **Cases:**
   1. An EFI-chain entry (shaped like the UEFI Shell, delivered in a zip) on amd64 UEFI and arm64 UEFI.
   2. A kernel + initrd + squashfs entry on amd64 UEFI, amd64 BIOS and arm64 UEFI, delivered as an ISO for one arch and a zip for another. Its initrd fetches the second stage by IP from `/u/…`, using the expanded `BOOTIF`, and prints a marker on the serial console. On BIOS the evidence is the second-stage request in the server log.
@@ -264,7 +272,7 @@ The listeners are bound first. That is M1's order, and a second `serve` therefor
 
 **Before the plan:** a spike chooses the pure-Go ISO9660 library. `kdomanski/iso9660` treats Rock Ridge as experimental; `go-diskfs` is the alternative. The spike runs against the real SystemRescue, grml and ShredOS ISOs.
 
-**Lab:** the real catalog entries, memtest86+ on BIOS, and each OS honouring `BOOTIF` are proven by lab test 6 (core §11), extended to one real boot per entry on matching hardware and recorded in `docs/lab/`.
+**Lab:** the real catalog entries, memtest86+ on BIOS, and each OS honouring `BOOTIF` are proven by lab test 6 (core §11), extended to one real boot per entry on matching hardware. The checklist is committed with M2 (`docs/lab/m2-utility-boots.md`); it is an owner action on real hardware after the merge, and the results are pasted back into it after the lab run. Until then memtest86+ BIOS support stays off (§5.2).
 
 ## 6. Left to the builder (decided in the plan)
 
