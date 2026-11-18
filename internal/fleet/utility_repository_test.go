@@ -92,29 +92,36 @@ func mustFail(t *testing.T, r *Repository, f FetchFailure) CacheRow {
 	return row
 }
 
-// claimLosingRace runs claimFetch in a transaction in which another worker's
-// claim of lost lands between the select and the update, and returns its result.
-func claimLosingRace(t *testing.T, d *db.DB, at time.Time, lost CacheKey) (CacheRow, bool) {
+// claimBetween runs claimFetch in a transaction in which between runs, on the
+// same transaction, after the select of the candidates and before the update:
+// another worker's write landing in the race window. It returns claimFetch's result.
+func claimBetween(t *testing.T, d *db.DB, at time.Time, between func(ctx context.Context, q bun.IDB)) (CacheRow, bool) {
 	t.Helper()
 	var (
 		got CacheRow
 		ok  bool
 	)
 	err := d.Bun().RunInTx(t.Context(), nil, func(ctx context.Context, tx bun.Tx) error {
-		takeLost := func() {
-			_, err := updateCache(tx, lost, pinOne).Where("state = ?", CacheWanted).Set("state = ?", CacheFetching).Exec(ctx)
-			if err != nil {
-				t.Fatalf("take %s: %v", lost.Entry, err)
-			}
-		}
 		var err error
-		got, ok, err = claimFetch(ctx, tx, at, takeLost)
+		got, ok, err = claimFetch(ctx, tx, at, func() { between(ctx, tx) })
 		return err
 	})
 	if err != nil {
 		t.Fatalf("claimFetch: %v", err)
 	}
 	return got, ok
+}
+
+// claimLosingRace is claimBetween where another worker's claim of lost lands
+// in the window; it fails unless that claim moved the row.
+func claimLosingRace(t *testing.T, d *db.DB, at time.Time, lost CacheKey) (CacheRow, bool) {
+	t.Helper()
+	return claimBetween(t, d, at, func(ctx context.Context, q bun.IDB) {
+		taken, err := applied(ctx, updateCache(q, lost, pinOne).Where("state = ?", CacheWanted).Set("state = ?", CacheFetching))
+		if err != nil || !taken {
+			t.Fatalf("take %s = %v, %v; want it moved to fetching", lost.Entry, taken, err)
+		}
+	})
 }
 
 // wantBool fails unless got is want and err is nil.
@@ -442,6 +449,56 @@ func runUtilitySuite(t *testing.T, open func(testing.TB) *db.DB) {
 		if got, ok := claimLosingRace(t, d, t0.Add(time.Hour), k); ok {
 			t.Fatalf("claimFetch after losing the only row = %+v, true; want false", got)
 		}
+	})
+
+	// A failed candidate failed again between the select and the update, its backoff
+	// now running: it is not due at at, so the claim must skip it.
+	t.Run("ClaimSkipsCandidateBackedOffMeanwhile", func(t *testing.T) {
+		d := open(t)
+		k1, k2 := CacheKey{Entry: "ta", Arch: ArchAMD64}, CacheKey{Entry: "tb", Arch: ArchAMD64}
+		failed := cacheRowIn(k1, CacheFailed, t0)
+		failed.Attempts, failed.NextAttemptAt = 1, t0
+		row2 := cacheRowIn(k2, CacheWanted, t0.Add(time.Minute))
+		seedCache(t, d, failed)
+		seedCache(t, d, row2)
+
+		at := t0.Add(time.Hour)
+		got, ok := claimBetween(t, d, at, func(ctx context.Context, q bun.IDB) {
+			_, err := updateCache(q, k1, pinOne).Where("state = ?", CacheFailed).
+				Set("attempts = 2").Set("next_attempt_at = ?", at.Add(time.Hour)).Exec(ctx)
+			if err != nil {
+				t.Fatalf("fail %s again: %v", k1.Entry, err)
+			}
+		})
+		want := row2
+		want.State, want.UpdatedAt = CacheFetching, at
+		if !ok || !sameCacheRow(got, want) {
+			t.Fatalf("claimFetch = %+v, %v; want %+v, the row not backed off", got, ok, want)
+		}
+		backedOff := failed
+		backedOff.Attempts, backedOff.NextAttemptAt = 2, at.Add(time.Hour)
+		wantCache(t, NewRepository(d), k1, backedOff)
+	})
+
+	// The candidate changes between the select and the update without leaving its
+	// state: the claim returns the row as stored, not as the select saw it.
+	t.Run("ClaimReturnsRowAsStored", func(t *testing.T) {
+		d := open(t)
+		seedCache(t, d, cacheRowIn(k, CacheWanted, t0))
+
+		at := t0.Add(time.Hour)
+		got, ok := claimBetween(t, d, at, func(ctx context.Context, q bun.IDB) {
+			_, err := updateCache(q, k, pinOne).Set("bytes_done = 500").Set("bytes_total = 900").Exec(ctx)
+			if err != nil {
+				t.Fatalf("progress %s: %v", k.Entry, err)
+			}
+		})
+		want := cacheRowIn(k, CacheFetching, at)
+		want.BytesDone, want.BytesTotal = 500, 900
+		if !ok || !sameCacheRow(got, want) {
+			t.Fatalf("claimFetch = %+v, %v; want %+v", got, ok, want)
+		}
+		wantCache(t, NewRepository(d), k, want)
 	})
 
 	t.Run("ResetFetchingRowOnlyItsOwn", func(t *testing.T) {

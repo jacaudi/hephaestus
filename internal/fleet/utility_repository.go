@@ -175,19 +175,25 @@ func claimFetch(ctx context.Context, tx bun.IDB, at time.Time, afterSelect func(
 		return cmp.Or(cmp.Compare(b.Priority, a.Priority), a.UpdatedAt.Compare(b.UpdatedAt), cmp.Compare(a.Entry, b.Entry), cmp.Compare(a.Arch, b.Arch))
 	})
 
-	// Another worker may take a candidate first: the update that moves nothing
-	// means it did, and the next candidate is tried.
+	// Another worker may take a candidate first, or move it on (fail it into a new
+	// backoff): the update that moves nothing means the candidate is no longer
+	// claimable as selected, and the next is tried. The claimed row is read back
+	// from the update, so it is the row as stored, not as the select saw it.
 	for i := range rows {
-		next := rows[i].utc()
-		moved, err := applied(ctx, updateCache(tx, next.Key(), next.Pin).Where("state = ?", next.State).
-			Set("state = ?", CacheFetching).Set("updated_at = ?", at))
+		c := &rows[i]
+		up := updateCache(tx, c.Key(), c.Pin).Where("state = ?", c.State)
+		if c.State == CacheFailed {
+			up = up.Where("next_attempt_at <= ?", at)
+		}
+		var claimed CacheRow
+		err := up.Set("state = ?", CacheFetching).Set("updated_at = ?", at).Returning("*").Scan(ctx, &claimed)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
 		if err != nil {
-			return CacheRow{}, false, wrapIf("claim "+next.Entry+"/"+string(next.Arch), err)
+			return CacheRow{}, false, wrapIf("claim "+c.Entry+"/"+string(c.Arch), err)
 		}
-		if moved {
-			next.State, next.UpdatedAt = CacheFetching, at
-			return next, true, nil
-		}
+		return claimed.utc(), true, nil
 	}
 	return CacheRow{}, false, nil
 }

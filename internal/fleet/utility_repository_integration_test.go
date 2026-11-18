@@ -158,7 +158,8 @@ func claimTogether(t *testing.T, repos []*Repository, at time.Time) (rows []Cach
 
 // Two fetchers claim at once from one database. The one that loses the row lock
 // finds its candidate taken and must take the next row, not report none. It is
-// repeated so the claims overlap on some rounds.
+// repeated so the claims overlap on some rounds. The overlap is probabilistic:
+// the deterministic proof is the ClaimSkipsRowTakenMeanwhile hook test.
 func TestClaimFetch_ConcurrentClaims_Postgres(t *testing.T) {
 	t0 := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
 	d := dbtest.Postgres(t)
