@@ -83,6 +83,12 @@ func requestFetch(ctx context.Context, q bun.IDB, w FetchWant, priority int, at 
 	if err := insertWanted(ctx, q, w, priority, at); err != nil {
 		return FetchRequest{}, err
 	}
+	// Lock the row before reading its state, so the state this decides on is the
+	// one it writes over (a no-op write, as SQLite has no FOR UPDATE). Machines
+	// were locked first by the caller, the order every transaction takes.
+	if _, err := updateCache(q, w.Key, w.Pin).Set("state = state").Exec(ctx); err != nil {
+		return FetchRequest{}, fmt.Errorf("lock cache row %s/%s: %w", w.Key.Entry, w.Key.Arch, err)
+	}
 	row, err := mustLoadCacheRow(ctx, q, w.Key)
 	if err != nil {
 		return FetchRequest{}, err

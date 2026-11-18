@@ -16,9 +16,10 @@ func TestUtilityRepository_Postgres(t *testing.T) { runUtilitySuite(t, dbtest.Po
 
 // raceCacheRow stands in for another process: it opens a transaction that
 // runs update (which must lock a cache row), starts act in a goroutine, waits
-// until the database shows a statement blocked on a lock, then commits. act
-// must not call t.Fatal; it records its result in variables the caller reads.
-func raceCacheRow(t *testing.T, d *db.DB, update string, args []any, act func()) {
+// until the database shows a statement blocked on a lock, runs the statements
+// in then on the same transaction, and commits. act must not call t.Fatal; it
+// records its result in variables the caller reads.
+func raceCacheRow(t *testing.T, d *db.DB, update string, args []any, act func(), then ...string) {
 	t.Helper()
 	tx, err := d.Bun().BeginTx(t.Context(), nil)
 	if err != nil {
@@ -47,6 +48,11 @@ func raceCacheRow(t *testing.T, d *db.DB, update string, args []any, act func())
 		}
 		if time.Now().After(deadline) {
 			t.Fatal("the action never blocked on the held row")
+		}
+	}
+	for _, stmt := range then {
+		if _, err := tx.ExecContext(t.Context(), stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
 		}
 	}
 	if err := tx.Commit(); err != nil {
@@ -86,5 +92,42 @@ func TestRecordFetchFailure_RowMovedUnderTx_Postgres(t *testing.T) {
 	}
 	if audits := auditRows(t, d); len(audits) != 0 {
 		t.Fatalf("audit = %+v, want none", audits)
+	}
+}
+
+// Another process holds a read lock on the row and then breaks it (its tenth
+// failure) while SetBootNext asks for the entry. SetBootNext must lock the row
+// before it reads the state, so it decides on the row the other process left,
+// not on the state it read before: a broken row that an admin sets a boot-next
+// for is re-armed, never left broken with the flag armed.
+func TestSetBootNext_RowBrokenUnderTx_Postgres(t *testing.T) {
+	t0 := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
+	k := CacheKey{Entry: "tshell", Arch: ArchAMD64}
+	d := dbtest.Postgres(t)
+	r := NewRepository(d)
+	seed := cacheRowIn(k, CacheFetching, t0)
+	seed.Attempts = 9
+	seedCache(t, d, seed)
+	seedFlagged(t, d, "m1", ArchAMD64, "other", t0)
+
+	var (
+		got SetBootNextResult
+		err error
+	)
+	raceCacheRow(t, d, "SELECT 1 FROM utility_cache WHERE entry = ? AND arch = ? FOR SHARE", []any{k.Entry, string(k.Arch)}, func() {
+		got, err = r.SetBootNext(t.Context(), SetBootNextRequest{MachineID: "m1", Entry: k.Entry, Pin: pinOne, At: t0.Add(time.Minute)})
+	}, "UPDATE utility_cache SET state = 'broken', attempts = 10 WHERE entry = 'tshell' AND arch = 'amd64'")
+	if err != nil {
+		t.Fatalf("SetBootNext: %v", err)
+	}
+	if !got.Fetch.Rearmed {
+		t.Errorf("Fetch = %+v, want the broken row re-armed", got.Fetch)
+	}
+	row, ok, err := r.CacheRow(t.Context(), k)
+	if err != nil || !ok {
+		t.Fatalf("CacheRow = %v, %v", ok, err)
+	}
+	if row.State != CacheWanted || row.Attempts != 0 {
+		t.Errorf("row = %s with %d attempts, want wanted with none", row.State, row.Attempts)
 	}
 }
