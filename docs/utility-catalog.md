@@ -1,4 +1,4 @@
-# Utility catalog
+# Utility Catalog
 
 This page is the reference for the utility catalog and the task guide for re-pinning it with `task catalog:pin`.
 

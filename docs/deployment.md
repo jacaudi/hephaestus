@@ -1,4 +1,4 @@
-# Run the image
+# Run the Image
 
 This is the task guide for running the hephaestus container image: what the host must provide, the ports it binds, and the `docker run` command.
 
@@ -12,7 +12,7 @@ docker run --rm --network host --stop-timeout 60 -v hephaestus-data:/var/lib/hep
 
 Ports 67, 69, 80 and 443 (proxyDHCP, TFTP, HTTP, HTTPS) are privileged; proxyDHCP also listens on 4011. The container image grants the binary `cap_net_bind_service`, which covers them, so it runs as UID 65532; a bare binary needs the same capability or root. The admin listener is on `HEPHAESTUS_ADMIN_ADDRESS` (default `127.0.0.1:9090`).
 
-## What the host must provide
+## What the Host Must Provide
 
 - `CAP_NET_BIND_SERVICE` kept. The image fails under `--cap-drop ALL` unless you also pass `--cap-add NET_BIND_SERVICE`.
 - Host networking, on the provisioning VLAN interface. proxyDHCP binds that interface (UDP 67 and 4011); TFTP, HTTP and, in `file` mode, HTTPS bind its primary address, `HEPHAESTUS_PROVISIONING_ADDRESS`.

@@ -44,7 +44,7 @@ export HEPHAESTUS_TLS_KEY_FILE=/etc/hephaestus/certs/privkey.pem
 ./bin/hephaestus serve
 ```
 
-## Exit codes
+## Exit Codes
 
 `hephaestus` exits 0 on success, 1 on failure and 2 on a usage error (an unknown command or flag, or a stray argument).
 

@@ -1,4 +1,4 @@
-# M1 lab bring-up: TrueNAS + one amd64 node + the MS-R1
+# M1 Lab Bring-Up: TrueNAS + One amd64 Node + the MS-R1
 
 This is a task guide to the lab checks that `task e2e` cannot cover (design §11):
 
@@ -10,7 +10,7 @@ File mode is used throughout. Proxy mode is optional (step 9). Fill in every `<�
 
 Time: about 60 minutes once the certificate exists.
 
-## 0. Preconditions (check before you start)
+## 0. Preconditions (Check Before You Start)
 
 | # | Check | Command or place | Expected |
 |---|---|---|---|
@@ -21,7 +21,7 @@ Time: about 60 minutes once the certificate exists.
 | 0.5 | LAN DNS: `<fqdn>` → `<prov-ip>` | from a VLAN host: `dig +short <fqdn>` | `<prov-ip>` |
 | 0.6 | The VLAN's normal DHCP server still hands out addresses | gateway or UniFi | a lease range on the VLAN (hephaestus is proxyDHCP only) |
 
-## 1. Certificate (outside hephaestus)
+## 1. Certificate (Outside hephaestus)
 
 hephaestus never obtains a certificate (D25). Get one for `<fqdn>` from Let's Encrypt with certbot or lego (DNS-01 suits a private VLAN name), then put it on TrueNAS at `<cert-dir>`.
 
@@ -30,7 +30,7 @@ hephaestus never obtains a certificate (D25). Get one for `<fqdn>` from Let's En
 - The files must be readable by UID 65532, e.g. `chown -R 65532:65532 <cert-dir>`, or group-readable with the container's group added.
 - Renewal: the tool rewrites the files in place or by symlink. hephaestus re-reads them every minute, and keeps serving the old pair if the new one fails its checks.
 
-## 2. Image onto TrueNAS (no registry yet)
+## 2. Image Onto TrueNAS (No Registry Yet)
 
 On the Mac, in the repo:
 
@@ -43,7 +43,7 @@ docker save hephaestus:dev | ssh <truenas> docker load
 
 On TrueNAS: `docker image inspect hephaestus:dev --format '{{.Config.User}} {{.Architecture}}'` → `65532:65532 amd64`.
 
-## 3. TrueNAS pre-flight (lab test 7)
+## 3. TrueNAS Pre-Flight (Lab Test 7)
 
 Record each answer in Results; none of them is a pass/fail gate yet.
 
@@ -52,7 +52,7 @@ docker info --format '{{json .SecurityOptions}}'      # does the daemon default 
 sysctl net.ipv4.ip_unprivileged_port_start            # host netns (host networking): 1024 means the capability is exercised
 ```
 
-## 4. The app
+## 4. The App
 
 TrueNAS 24.10+ runs custom apps from Compose YAML. `user`, `cap_drop`/`cap_add`, the network mode and the stop grace are the parts that matter. `stop_grace_period` is set above `HEPHAESTUS_SHUTDOWN_GRACE` (60 s).
 
@@ -82,7 +82,7 @@ volumes:
   hephaestus-data: {}
 ```
 
-## 5. Start and readiness
+## 5. Start and Readiness
 
 ```sh
 docker logs -f <container> 2>&1 | jq -c '{time,level,msg,path,status,tls,decision_row,action,error}'
@@ -99,7 +99,7 @@ docker logs -f <container> 2>&1 | jq -c '{time,level,msg,path,status,tls,decisio
 
 A `permission denied` on a bind means the capability did not take effect: TrueNAS dropped it, or `no-new-privileges` blocked the file capability. Record which. Design §10's documented fallback is running as root.
 
-## 6. Let unknown machines hold, not boot local disk (only for the test)
+## 6. Let Unknown Machines Hold, Not Boot Local Disk (Only for the Test)
 
 The default `unknown_action=local` sends unknown machines to their own disk (row 7 `exit`) without a `/discover`. M1 has no UI, so switch it in the database. **Every** unknown PXE-booting machine on the VLAN then holds until you switch it back (step 10).
 
@@ -110,7 +110,7 @@ docker run --rm --user 65532:65532 -v hephaestus-data:/d alpine:3 sh -c \
 
 Expected output: `hold`. The unpinned `alpine:3` plus `apk` is acceptable for a one-off lab command.
 
-## 7. Boot A: an amd64 node, UEFI network boot (lab tests 1 and 2)
+## 7. Boot A: An amd64 Node, UEFI Network Boot (Lab Tests 1 and 2)
 
 1. **Block internet egress for the VLAN** at the gateway for the length of the boot. The ISRG chain must validate from what hephaestus sends plus the roots built into iPXE.
 2. Network-boot the node and watch the log from step 5. Expected, in order:
@@ -129,7 +129,7 @@ Expected output: `hold`. The unpinned `alpine:3` plus `apk` is acceptable for a 
 
    Expected: `discovered|0|amd64|…` for its MAC.
 
-## 8. Boot B: the MS-R1 through its shim media (lab test 2)
+## 8. Boot B: The MS-R1 Through Its Shim Media (Lab Test 2)
 
 The shim media carries hephaestus's static arm64 `snp.efi`, from `http://<prov-ip>/tftp/arm64/snp.efi` (design §10, "MS-R1 shim"). Boot it with egress still blocked. Expected:
 
@@ -139,7 +139,7 @@ The shim media carries hephaestus's static arm64 `snp.efi`, from `http://<prov-i
 
 **Record exactly what the console shows** around DHCP. The open question is whether `${proxydhcp/next-server}` is populated on this firmware path, because the embedded script uses it. If `/start` never arrives, photograph the iPXE screen.
 
-## 9. Optional: proxy mode
+## 9. Optional: Proxy Mode
 
 Only if you plan to front hephaestus with Caddy, Traefik or Envoy:
 
@@ -155,7 +155,7 @@ docker run --rm --user 65532:65532 -v hephaestus-data:/d alpine:3 sh -c "apk add
 
 Unblock egress. Leave the app running or stop it; booty stays dormant either way.
 
-## Results (paste back)
+## Results (Paste Back)
 
 | Item | Result | Evidence (one line) |
 |---|---|---|

@@ -8,7 +8,7 @@ HTTP and HTTPS, records each machine that boots, and decides what each boot
 does.
 
 It is not a DHCP server: it runs next to the one you have and only adds the PXE
-options. It does not install anything yet (see What it does).
+options. It does not install anything yet (see What It Does).
 
 > [!WARNING]
 > **Agentically generated.** This codebase was produced through agentic,
@@ -18,7 +18,7 @@ options. It does not install anything yet (see What it does).
 > project, but the authorship pattern is not a single human contributor —
 > keep that in mind when evaluating fit for your environment.
 
-## What it does
+## What It Does
 
 A machine PXE-boots, chains into iPXE over TFTP, then fetches its boot script
 from hephaestus over HTTP and HTTPS. hephaestus records the machine and answers
@@ -43,7 +43,7 @@ row 8 and re-checks every 30 seconds.
   utility cache; `/readyz`, `/health` and `/metrics` are served off the VLAN.
 - **SQLite or Postgres** — SQLite in the data directory by default.
 
-## Quick start
+## Quick Start
 
 hephaestus runs as a container on the host that holds the provisioning VLAN.
 You build the image from this repository.
@@ -103,7 +103,7 @@ To run the binary without a container, build it with `task build`, export the
 same variables and run `./bin/hephaestus serve`. It needs `CAP_NET_BIND_SERVICE`
 or root. What the host must provide is in [Run the image](docs/deployment.md).
 
-## How it works
+## How It Works
 
 ![A booting machine on the provisioning VLAN reaches four hephaestus services in boot order (proxyDHCP, TFTP, HTTP :80 and HTTPS :443), and the HTTPS service gets its TLS from certificate files or a TLS-terminating proxy. The services and an admin listener off the VLAN use the data directory, where a fetcher fills the content store from upstream mirrors over TLS 1.3.](docs/images/architecture.svg)
 

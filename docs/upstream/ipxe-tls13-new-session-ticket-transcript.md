@@ -1,4 +1,4 @@
-# iPXE: a TLS 1.3 NewSessionTicket sent before the client Finished corrupts the handshake transcript
+# iPXE: A TLS 1.3 NewSessionTicket Sent Before the Client Finished Corrupts the Handshake Transcript
 
 This page explains an iPXE TLS 1.3 handshake failure, and records it so it can be filed upstream later.
 
@@ -20,7 +20,7 @@ An iPXE client cannot complete a TLS 1.3 handshake with a Go `crypto/tls` server
 
 The certificate and CA are not involved. The same thing happens behind Caddy with its default session tickets on.
 
-## Evidence (wire)
+## Evidence (Wire)
 
 Decrypted with a Go `KeyLogWriter` key log and tshark:
 
@@ -32,7 +32,7 @@ Decrypted with a Go `KeyLogWriter` key log and tshark:
 
 HelloRetryRequest and the cipher suite were ruled out. Restricting Go to X25519/P-256 changed nothing, and the negotiated suite is SHA-256.
 
-## Root cause
+## Root Cause
 
 `src/net/tls.c` at 9261ebe, in the handshake dispatch loop (lines 3647–3699):
 
@@ -58,7 +58,7 @@ RFC 8446 classes NewSessionTicket as a **post-handshake message** (§4.6). The t
 
 How the evidence was obtained: the cause is inferred from the source above and confirmed by an A/B test. The only variable was server-side session tickets. Off, every firmware boots; on, every boot fails.
 
-## Suggested upstream fix
+## Suggested Upstream Fix
 
 In TLS 1.3, never add a NewSessionTicket (or any other post-handshake message such as KeyUpdate) to the transcript digest. Skip `tls_add_handshake()` for those types, as is already done for HelloRequest. Process the ticket only for resumption, after the client Finished has been computed. A regression test would be a TLS 1.3 server that sends NewSessionTicket in the same flight as its Finished.
 
@@ -70,13 +70,13 @@ From the hephaestus repo, on colima or any Linux Docker daemon:
 2. Run `task e2e`. Expected: the TLS and boot checks FAIL. The hephaestus or Caddy log shows `invalid client finished hash`, then `invalid PSK binder`.
 3. With the shipped code, `task e2e` passes (71 checks).
 
-## Not verified
+## Not Verified
 
 - Whether OpenSSL-based servers avoid this by sending tickets after the client Finished. It is plausible but was not tested.
 - Whether Traefik and Envoy send tickets early by default and so need the same setting. Not tested.
 - Physical NIC firmware. The reproduction used QEMU's OVMF, SeaBIOS and AAVMF, chaining into the iPXE 9261ebe build.
 
-## Evidence files
+## Evidence Files
 
 In the main checkout, under `.superpowers/sdd/2026-11-16-e2e-harness-implementation/`:
 

@@ -1,4 +1,4 @@
-# Licensing of bundled code
+# Licensing of Bundled Code
 
 This page explains the copyleft code that the hephaestus image contains and what that means for publishing an image.
 

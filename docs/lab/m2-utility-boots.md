@@ -1,4 +1,4 @@
-# M2 lab bring-up: one real boot per utility entry
+# M2 Lab Bring-Up: One Real Boot Per Utility Entry
 
 This is a task guide to the lab checks that `task e2e` cannot cover (core design §11, M2 design §5.9):
 
@@ -11,7 +11,7 @@ Run [M1's bring-up](m1-bring-up.md) first: hephaestus must be running in file mo
 
 Time: about 3 hours once hephaestus runs and the machines are discovered. The first fetch downloads about 5.3 GB.
 
-## 0. Preconditions (check before you start)
+## 0. Preconditions (Check Before You Start)
 
 | # | Check | Command or place | Expected |
 |---|---|---|---|
@@ -27,7 +27,7 @@ Time: about 3 hours once hephaestus runs and the machines are discovered. The fi
 
 Boot order on each machine: network first, for the length of the test. Console: a monitor on the machine's display, or its serial console where it has one.
 
-## 1. Fetch every entry
+## 1. Fetch Every Entry
 
 `boot-next set` fetches its own entry, but a first fetch takes minutes. Fetch all of them first, from the container:
 
@@ -44,7 +44,7 @@ docker logs -f <container> 2>&1 | jq -c 'select(.msg=="utility fetch") | {time,e
 
 Expected: two lines for each row: `wanted` → `fetching`, then `fetching` → `ready`. The exception is a row the volume has no room for beside the fetches in flight: it logs `fetching` → `wanted` with the reason in `error` and no `class`, and `wanted` → `fetching` again a poll (10 s) later, so a few extra line pairs while the big ISOs run are waiting, not failures, and its `attempts` stays 0. A `failed` or `broken` row names its error: record it, then `utility fetch <entry>` re-arms it. Then record the free space again (`df -h <data-dir>`), and the store size: `curl -s http://127.0.0.1:9090/health | jq '.checks'` shows `store:readable` pass and `store:bytes`.
 
-## 2. How to read one utility boot
+## 2. How to Read One Utility Boot
 
 For each boot below, in one terminal keep this running:
 
@@ -73,7 +73,7 @@ If the boot did not happen, the `/boot` line says why:
 | no `boot_next` on the `/boot` line, and `boot-next list` no longer shows the flag | the fetch went broken and cleared the flag; `utility list` shows the error |
 | no `/boot` request at all | the machine did not network-boot: a firmware setting, not hephaestus |
 
-## 3. The entries: command, requests, console
+## 3. The Entries: Command, Requests, Console
 
 Every `/u/` path starts with `/u/<entry>/<arch>/<version>/`; the lists below give the rest. The version is the one in the heading.
 
@@ -112,7 +112,7 @@ Every `/u/` path starts with `/u/<entry>/<arch>/<version>/`; the lists below giv
 - Requests: `ShellBinPkg/UefiShell/X64/Shell.efi` on amd64, `ShellBinPkg/UefiShell/AArch64/Shell.efi` on arm64.
 - Console: `UEFI Interactive Shell` and its prompt.
 
-## 4. UEFI pass
+## 4. UEFI Pass
 
 Boot each entry once with the steps of section 2:
 
@@ -123,13 +123,13 @@ Boot each entry once with the steps of section 2:
 
 ShredOS on UEFI is step 7. For the arm64 machine, boot through the shim media as in M1 step 8. Record, per boot, the console result and whether every `/u/` request was 200 or 206.
 
-## 5. BIOS pass
+## 5. BIOS Pass
 
 The entries that list `pcbios` boot once on the amd64 BIOS machine (`<bios-mac>`), with the steps of section 2: systemrescue, clonezilla, gparted, shredos, grml. memtest86plus and uefishell do not list `pcbios`: see step 8 for memtest86+.
 
 Judge each BIOS boot by the display and by the second-stage request in the log (the last file in each entry's request list).
 
-## 6. `BOOTIF` honoured (multi-NIC)
+## 6. `BOOTIF` Honoured (Multi-NIC)
 
 archiso (SystemRescue) and live-boot (Clonezilla, GParted, grml) take `BOOTIF=01-<MAC with hyphens>`, which the recipe fills in as the NIC iPXE booted from. Repeat for one entry of each family: `systemrescue` and `grml`.
 
@@ -170,7 +170,7 @@ The catalog lists memtest86+ for amd64 on `efi` only. Per M2 design §5.2, its B
 4. Revert the edit (`git checkout -- internal/catalog/catalog.go`), rebuild, and reload the real image.
 5. Outcome. **Pass:** a later change adds `pcbios` to the amd64 spec with a `kernel` recipe for it (the EFI boot stays `chain`; a `Spec` has a single `Recipe` today, so that change also needs per-platform recipes); this checklist's result row records the pass. **Fail:** record the last console lines and leave it unsupported.
 
-## 9. grml signer key: expires 2028-04-21
+## 9. grml Signer Key: Expires 2028-04-21
 
 `internal/catalog/keys/grml.asc` authenticates the grml pins and expires on **2028-04-21** (`internal/catalog/keys/PROVENANCE.md`). The grml pins already in the binary keep working after that date: GPG is checked at pin time only. A **re-pin** after it fails with an `EXPKEYSIG` result, and the entry goes absent with a `signature:` reason, until the key is refreshed: fetch the new copy from keys.openpgp.org by fingerprint `33CCB136401AFEC843A3876396A87872B7EA3737`, check it against the independent sources in PROVENANCE.md, replace `grml.asc` and update the table there.
 
@@ -183,7 +183,7 @@ docker run --rm --entrypoint gpg -e HOME=/tmp -v "$PWD/internal/catalog/keys:/k:
 
 Expected: `1839938358`, which `date -u -r 1839938358 +%F` prints as `2028-04-21`. Record today's date beside it.
 
-## 10. Entries the pin left absent
+## 10. Entries the Pin Left Absent
 
 The last pin run (Task 15, after the pin-tool fixes in 2983b4d) ended `PINNED 10 ABSENT 0`: every entry is pinned, so the `absent` ledger in `internal/catalog/catalog_pins.go` is empty and no entry is skipped in this checklist. Confirm it still is:
 
@@ -193,7 +193,7 @@ grep -n 'var absent' internal/catalog/catalog_pins.go
 
 Expected: `var absent = map[Key]string{}`. If an entry is listed after a later re-pin, skip its boots, and record the entry with its reason's class (`tls13:`, `network:`, `http-<status>:`, `integrity:`, `signature:` or `checksum:`, from the README table) in the Results table.
 
-## Results (paste back)
+## Results (Paste Back)
 
 | Item | Result | Evidence (one line) |
 |---|---|---|
