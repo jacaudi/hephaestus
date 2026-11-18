@@ -1,32 +1,24 @@
 <svg viewBox="0 0 1010 760" xmlns="http://www.w3.org/2000/svg" role="img"
      aria-label="Architecture: a booting machine on the provisioning VLAN talks, in boot order, to four hephaestus services on the provisioning interface: proxyDHCP on UDP 67 and 4011, TFTP serving the embedded iPXE binaries, HTTP on port 80 for /start, /boot, /tftp and /u/ utility files, and HTTPS on port 443 for /boot and /discover over TLS 1.3. The HTTPS service gets its certificate from files written by an external tool in file mode, or from a TLS-terminating proxy in proxy mode. An admin listener on port 9090, on a management address off the VLAN, serves the health and metrics routes. The services and the admin listener use the data directory, which holds the SQLite or Postgres fleet state and the content store. A fetcher, running four parallel downloads by default, fills the content store from upstream mirrors over TLS 1.3.">
   <defs>
-    <!-- swept arrowheads -->
-    <marker id="arrow" viewBox="0 0 10 10" refX="9.2" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-      <path d="M0,0.4 L10,5 L0,9.6 L2.9,5 Z" class="arrowhead"/>
+    <!-- Swept arrowheads. markerUnits are user units, so every head is the same size: 13 wide at scale 1.3.
+         refX is the notch (x=2.9), so a line ends at the base of its head; the tip lands 9.23 units
+         (7.1 marker units x 1.3) past the line's end, on the target edge. -->
+    <marker id="arrow" viewBox="0 0 10 10" refX="2.9" refY="5" markerUnits="userSpaceOnUse" markerWidth="13" markerHeight="13" orient="auto-start-reverse">
+      <path d="M0,0.4 L10,5 L0,9.6 L2.9,5 Z" fill="var(--arrowhead)"/>
     </marker>
-    <marker id="arrow-server" viewBox="0 0 10 10" refX="9.2" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <marker id="arrow-server" viewBox="0 0 10 10" refX="2.9" refY="5" markerUnits="userSpaceOnUse" markerWidth="13" markerHeight="13" orient="auto-start-reverse">
       <path d="M0,0.4 L10,5 L0,9.6 L2.9,5 Z" fill="var(--server)"/>
     </marker>
-    <marker id="arrow-mgmt" viewBox="0 0 10 10" refX="9.2" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <marker id="arrow-mgmt" viewBox="0 0 10 10" refX="2.9" refY="5" markerUnits="userSpaceOnUse" markerWidth="13" markerHeight="13" orient="auto-start-reverse">
       <path d="M0,0.4 L10,5 L0,9.6 L2.9,5 Z" fill="var(--mgmt)"/>
     </marker>
-    <marker id="arrow-db" viewBox="0 0 10 10" refX="9.2" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <marker id="arrow-db" viewBox="0 0 10 10" refX="2.9" refY="5" markerUnits="userSpaceOnUse" markerWidth="13" markerHeight="13" orient="auto-start-reverse">
       <path d="M0,0.4 L10,5 L0,9.6 L2.9,5 Z" fill="var(--db)"/>
     </marker>
-    <!-- flows that cross a zone border carry the colour of where they come from and go to -->
-    <linearGradient id="flow-boot" gradientUnits="userSpaceOnUse" x1="220" y1="240" x2="318" y2="240">
-      <stop offset="0" stop-color="var(--client)"/>
-      <stop offset="1" stop-color="var(--server)"/>
-    </linearGradient>
-    <linearGradient id="flow-tls" gradientUnits="userSpaceOnUse" x1="700" y1="414" x2="642" y2="414">
-      <stop offset="0" stop-color="var(--tls)"/>
-      <stop offset="1" stop-color="var(--server)"/>
-    </linearGradient>
-    <linearGradient id="flow-fetch" gradientUnits="userSpaceOnUse" x1="455" y1="690" x2="455" y2="642">
-      <stop offset="0" stop-color="var(--arrow)"/>
-      <stop offset="1" stop-color="var(--db)"/>
-    </linearGradient>
+    <marker id="arrow-tls" viewBox="0 0 10 10" refX="2.9" refY="5" markerUnits="userSpaceOnUse" markerWidth="13" markerHeight="13" orient="auto-start-reverse">
+      <path d="M0,0.4 L10,5 L0,9.6 L2.9,5 Z" fill="var(--tls)"/>
+    </marker>
     <filter id="shadow" x="-30%" y="-30%" width="160%" height="160%">
       <feDropShadow dx="0" dy="1.5" stdDeviation="3" flood-color="#000000" flood-opacity="0.16"/>
     </filter>
@@ -70,8 +62,12 @@
       .tls-box { fill: var(--tls-fill); stroke: var(--tls); stroke-width: 1.75; }
       .db-box { fill: var(--db-fill); stroke: var(--db); stroke-width: 1.5; }
       .badge { fill: var(--box-fill); stroke: var(--server); stroke-width: 1.5; }
-      .arrow { stroke: var(--arrow); stroke-width: 1.9; fill: none; marker-end: url(#arrow); stroke-linecap: round; stroke-linejoin: round; }
-      .flow { fill: none; stroke-width: 2.4; stroke-linecap: round; }
+      .arrow { stroke: var(--arrow); stroke-width: 2; fill: none; marker-end: url(#arrow); stroke-linecap: butt; stroke-linejoin: round; }
+      .a-server { stroke: var(--server); marker-end: url(#arrow-server); }
+      .a-both { marker-start: url(#arrow-server); }
+      .a-mgmt { stroke: var(--mgmt); marker-end: url(#arrow-mgmt); }
+      .a-db { stroke: var(--db); marker-end: url(#arrow-db); }
+      .a-tls { stroke: var(--tls); marker-end: url(#arrow-tls); }
       .arrowhead { fill: var(--arrowhead); }
       .icon { fill: none; stroke: var(--icon); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
       .center { text-anchor: middle; }
@@ -109,7 +105,7 @@
   <text class="b" x="368" y="146">UDP 67 and 4011</text>
   <text class="b" x="368" y="162">offers the PXE boot file</text>
 
-  <line class="arrow" x1="480" y1="172" x2="480" y2="194"/>
+  <line class="arrow" x1="480" y1="172" x2="480" y2="186.77"/>
 
   <!-- 2 TFTP -->
   <rect class="server-box" x="320" y="196" width="320" height="68" rx="10" filter="url(#shadow)"/>
@@ -119,7 +115,7 @@
   <text class="b" x="368" y="238">UDP 69</text>
   <text class="b" x="368" y="254">serves the embedded iPXE binaries</text>
 
-  <line class="arrow" x1="480" y1="264" x2="480" y2="286"/>
+  <line class="arrow" x1="480" y1="264" x2="480" y2="278.77"/>
 
   <!-- 3 HTTP -->
   <rect class="server-box" x="320" y="288" width="320" height="68" rx="10" filter="url(#shadow)"/>
@@ -129,7 +125,7 @@
   <text class="b" x="368" y="330">/start · /boot (chain to HTTPS)</text>
   <text class="b" x="368" y="346">/tftp · /u/ utility files</text>
 
-  <line class="arrow" x1="480" y1="356" x2="480" y2="378"/>
+  <line class="arrow" x1="480" y1="356" x2="480" y2="370.77"/>
 
   <!-- 4 HTTPS -->
   <rect class="server-box" x="320" y="380" width="320" height="68" rx="10" filter="url(#shadow)"/>
@@ -141,10 +137,10 @@
 
   <!-- the machine talks to each service, in boot order -->
   <g>
-    <path class="flow" stroke="url(#flow-boot)" marker-end="url(#arrow-server)" d="M220,240 C 262,240 282,138 318,138"/>
-    <path class="flow" stroke="url(#flow-boot)" marker-end="url(#arrow-server)" d="M220,240 C 262,240 282,230 318,230"/>
-    <path class="flow" stroke="url(#flow-boot)" marker-end="url(#arrow-server)" d="M220,240 C 262,240 282,322 318,322"/>
-    <path class="flow" stroke="url(#flow-boot)" marker-end="url(#arrow-server)" d="M220,240 C 262,240 282,414 318,414"/>
+    <path class="arrow a-server" d="M220,240 C 262,240 282,138 310.77,138"/>
+    <path class="arrow a-server" d="M220,240 C 262,240 282,230 310.77,230"/>
+    <path class="arrow a-server" d="M220,240 C 262,240 282,322 310.77,322"/>
+    <path class="arrow a-server" d="M220,240 C 262,240 282,414 310.77,414"/>
   </g>
 
   <!-- ===================== RIGHT: ADMIN AND TLS ===================== -->
@@ -169,7 +165,7 @@
   <text class="b" x="718" y="421">and forwards plain HTTP to</text>
   <text class="b" x="718" y="437">HEPHAESTUS_PROXY_ADDRESS</text>
 
-  <path class="flow" stroke="url(#flow-tls)" marker-end="url(#arrow-server)" d="M700,414 H642"/>
+  <path class="arrow a-tls" d="M700,414 H649.23"/>
 
   <!-- ===================== BOTTOM: DATA DIRECTORY ===================== -->
   <rect class="zone" x="20" y="510" width="970" height="150" rx="18"/>
@@ -181,33 +177,33 @@
   <text class="b" x="58" y="600">utility OS files in an OCI</text>
   <text class="b" x="58" y="616">image layout, served at /u/</text>
 
-  <rect class="server-box" x="340" y="556" width="230" height="84" rx="10" filter="url(#shadow)"/>
-  <text class="h" x="358" y="582">Fetcher</text>
-  <text class="b" x="358" y="600">4 parallel downloads by</text>
-  <text class="b" x="358" y="616">default (1 to 16)</text>
+  <rect class="server-box" x="390" y="556" width="230" height="84" rx="10" filter="url(#shadow)"/>
+  <text class="h" x="408" y="582">Fetcher</text>
+  <text class="b" x="408" y="600">4 parallel downloads by</text>
+  <text class="b" x="408" y="616">default (1 to 16)</text>
 
-  <line class="arrow" x1="340" y1="598" x2="272" y2="598" style="marker-end: url(#arrow-db)"/>
+  <line class="arrow a-db" x1="390" y1="598" x2="279.23" y2="598"/>
 
-  <g transform="translate(700,552)" filter="url(#shadow)">
-    <path class="db-box" d="M0,12 L0,80 A135,12 0 0 0 270,80 L270,12 Z"/>
-    <ellipse cx="135" cy="12" rx="135" ry="12" class="db-box"/>
+  <g transform="translate(740,556)" filter="url(#shadow)">
+    <path class="db-box" d="M0,12 L0,72 A115,12 0 0 0 230,72 L230,12 Z"/>
+    <ellipse cx="115" cy="12" rx="115" ry="12" class="db-box"/>
   </g>
-  <text class="h center" x="835" y="594">SQLite or Postgres</text>
-  <text class="b center" x="835" y="612">fleet state</text>
-  <text class="b center" x="835" y="628">SQLite file in the data dir by default</text>
+  <text class="h center" x="855" y="596">SQLite or Postgres</text>
+  <text class="b center" x="855" y="613">fleet state</text>
+  <text class="b center" x="855" y="630">SQLite file by default</text>
 
   <!-- the boot services and the admin listener use the data directory -->
-  <line class="arrow" x1="480" y1="468" x2="480" y2="508" style="stroke: var(--server); marker-start: url(#arrow-server); marker-end: url(#arrow-server)"/>
+  <line class="arrow a-server a-both" x1="480" y1="477.23" x2="480" y2="500.77"/>
   <text class="lbl" x="492" y="494">fleet state and utility files</text>
-  <line class="arrow" x1="960" y1="190" x2="960" y2="508" style="stroke: var(--mgmt); marker-end: url(#arrow-mgmt)"/>
+  <line class="arrow a-mgmt" x1="960" y1="190" x2="960" y2="500.77"/>
   <text class="lbl end" x="948" y="494">health checks</text>
 
   <!-- ===================== BELOW: UPSTREAM ===================== -->
-  <rect class="box" x="340" y="690" width="230" height="70" rx="10" filter="url(#shadow)"/>
-  <text class="h" x="358" y="718">Upstream Mirrors</text>
-  <text class="b" x="358" y="737">utility OS downloads</text>
-  <path class="flow" stroke="url(#flow-fetch)" marker-end="url(#arrow-db)" d="M455,690 V642"/>
-  <text class="lbl" x="470" y="678">downloaded over TLS 1.3</text>
+  <rect class="box" x="390" y="690" width="230" height="70" rx="10" filter="url(#shadow)"/>
+  <text class="h" x="408" y="718">Upstream Mirrors</text>
+  <text class="b" x="408" y="737">utility OS downloads</text>
+  <path class="arrow a-db" d="M505,690 V649.23"/>
+  <text class="lbl" x="520" y="678">downloaded over TLS 1.3</text>
 
   </g>
 </svg>
