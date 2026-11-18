@@ -20,7 +20,7 @@ Time: about 3 hours once hephaestus runs and the machines are discovered. The fi
 | 0.3 | An arm64 UEFI machine, discovered (the MS-R1) | M1 step 8 | `arch` `arm64`, MAC `<arm-mac>` |
 | 0.4 | A machine with two NICs on the provisioning VLAN, discovered from its second NIC | M1 step 7 | two rows in `machine_macs` for one machine; `<nic2-mac>` is the second NIC's MAC. It may be the amd64 UEFI machine in 0.1 |
 | 0.5 | Enough RAM for the live images | `utility list` (step 1), minimum RAM column | each machine has at least the minimum RAM of every entry you boot on it: live-boot copies the whole squashfs into RAM |
-| 0.6 | Free space on the data volume | `df -h <data-dir>` | at least 8 GB: the extracted files of all ten pins stay in the store (about 5.2 GB), and each fetch also needs twice its object plus 1 GiB free at that moment (SystemRescue's 1.4 GB ISO needs about 3.9 GB) |
+| 0.6 | Free space on the data volume | `df -h <data-dir>` | at least 8 GB: the extracted files of all ten pins stay in the store (about 5.2 GB), and the fetches running at once need twice each of their objects plus 1 GiB free at that moment (SystemRescue's 1.4 GB ISO alone needs about 3.9 GB). A fetch that does not fit beside the others waits for them; `HEPHAESTUS_FETCH_WORKERS=1` runs one at a time |
 | 0.7 | Internet egress for hephaestus | the VLAN gateway | open for the fetches in step 1. After step 1 you may block it again: a `ready` entry boots with no upstream |
 | 0.8 | An amd64 UEFI machine with no disk you care about, for ShredOS | the machine | ShredOS erases disks. Disconnect every disk you want to keep, or use a machine with none |
 | 0.9 | A local checkout of this repository on the Mac | `git status --short` | clean; step 8 edits `catalog.go` temporarily |
@@ -42,7 +42,7 @@ Repeat `utility list` until every row's state is `ready`. Expected: ten rows (me
 docker logs -f <container> 2>&1 | jq -c 'select(.msg=="utility fetch") | {time,entry,arch,from,to,attempts,class,error,bytes,duration_ms}'
 ```
 
-Expected: two lines for each row: `wanted` → `fetching`, then `fetching` → `ready`. A `failed` or `broken` row names its error: record it, then `utility fetch <entry>` re-arms it. Then record the free space again (`df -h <data-dir>`), and the store size: `curl -s http://127.0.0.1:9090/health | jq '.checks'` shows `store:readable` pass and `store:bytes`.
+Expected: two lines for each row: `wanted` → `fetching`, then `fetching` → `ready`. The exception is a row the volume has no room for beside the fetches in flight: it logs `fetching` → `wanted` with the reason in `error` and no `class`, and `wanted` → `fetching` again a poll (10 s) later, so a few extra line pairs while the big ISOs run are waiting, not failures, and its `attempts` stays 0. A `failed` or `broken` row names its error: record it, then `utility fetch <entry>` re-arms it. Then record the free space again (`df -h <data-dir>`), and the store size: `curl -s http://127.0.0.1:9090/health | jq '.checks'` shows `store:readable` pass and `store:bytes`.
 
 ## 2. How to read one utility boot
 

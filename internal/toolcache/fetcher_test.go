@@ -1804,7 +1804,9 @@ func (h *harness) waitRow(key fleet.CacheKey, state fleet.CacheState) {
 // cancelled and every worker loop is gone; it is safe to call twice.
 func (h *harness) startRun() (stop func()) {
 	h.t.Helper()
-	h.f.poll = 20 * time.Millisecond
+	if h.f.poll == PollInterval { // a test may set its own
+		h.f.poll = 20 * time.Millisecond
+	}
 	ctx, cancel := context.WithCancel(h.t.Context())
 	done := make(chan error, 1)
 	go func() { done <- h.f.Run(ctx) }()
@@ -1907,17 +1909,105 @@ func TestFetcher_PoolSharedBlob(t *testing.T) {
 }
 
 // oneNeed is the free space that holds exactly one of the fixture's live
-// downloads: its need, twice its size and spaceReserve.
+// downloads: twice its size, and spaceReserve left free.
 func oneNeed(fx catalogtest.Fixture, base string) uint64 {
 	return 2*uint64(max(len(fx.Objects[base+"/tlive-amd64.zip"]), len(fx.Objects[base+"/tlive-arm64.zip"]))) + spaceReserve
 }
 
-// TestFetcher_ReservationBlocksSecond has room for one download. While the
-// first is in flight its reservation holds the room, so the second fails its
-// space check; once the first is done a retry of the second passes.
-func TestFetcher_ReservationBlocksSecond(t *testing.T) {
+// TestFetcher_SpaceReserveCountedOnce has room for the large download's need,
+// the need of each of two small downloads and one spaceReserve: the margin the
+// volume keeps is counted once, not once per download in flight, so all three
+// run together.
+func TestFetcher_SpaceReserveCountedOnce(t *testing.T) {
 	release := make(chan struct{})
 	r := runScenario(t, func(t *testing.T, base string) scenario {
+		t.Helper()
+		sc := poolScenario(3, func(base string, objects map[string][]byte) http.Handler {
+			return blockingAt(objectsAt(base, objects), release, "/tlive-amd64.zip")
+		})(t, base)
+		large, small := uint64(len(sc.fx.Objects[base+"/tlive-amd64.zip"])), uint64(len(sc.fx.Objects[base+"/tshell.zip"]))
+		free := 2*large + 2*(2*small) + spaceReserve
+		sc.tune = func(f *Fetcher) {
+			f.cfg.Workers = 3
+			f.statfs = func(string) (uint64, error) { return free, nil }
+		}
+		return sc
+	})
+	r.request("tshell", "amd64", 0)
+	r.request("tshell", "arm64", 0)
+	stop := r.startRun()
+	defer stop()
+	r.waitRow(tliveAMD64(), fleet.CacheFetching)
+
+	r.waitRow(tshellAMD64(), fleet.CacheReady)
+	r.waitRow(fleet.CacheKey{Entry: "tshell", Arch: fleet.ArchARM64}, fleet.CacheReady)
+
+	r.wantRow(tliveAMD64(), fleet.CacheFetching, 0)
+	close(release)
+	r.waitRow(tliveAMD64(), fleet.CacheReady)
+	if got := r.counter(failuresCounter, classOther); got != 0 {
+		t.Errorf("%s{class=other} = %d, want 0", failuresCounter, got)
+	}
+}
+
+// claimsOf is how many times the fetcher claimed key.
+func (h *harness) claimsOf(key fleet.CacheKey) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var n int
+	for i := range h.events {
+		if h.events[i].Key == key && h.events[i].To == fleet.CacheFetching {
+			n++
+		}
+	}
+	return n
+}
+
+// givenBack is the key of a row a worker gave back to wanted without settling it.
+func (h *harness) givenBack() (fleet.CacheKey, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for i := range h.events {
+		if h.events[i].From == fleet.CacheFetching && h.events[i].To == fleet.CacheWanted {
+			return h.events[i].Key, true
+		}
+	}
+	return fleet.CacheKey{}, false
+}
+
+// TestFetcher_DeferredRowWaitsAPoll has room for one live download and a pool
+// of two whose poll is an hour. The row that does not fit beside the other is
+// claimed once, not again and again: its worker waits a poll. When the first
+// download ends, the worker that finished it claims the deferred row.
+func TestFetcher_DeferredRowWaitsAPoll(t *testing.T) {
+	release := make(chan struct{})
+	r := runScenario(t, oneAtATime(release))
+	r.request("tlive", "arm64", 0)
+	r.f.poll = time.Hour
+	stop := r.startRun()
+	defer stop()
+	var deferred fleet.CacheKey
+	r.waitFor("a row to be given back", func() bool {
+		key, ok := r.givenBack()
+		deferred = key
+		return ok
+	})
+
+	time.Sleep(300 * time.Millisecond)
+
+	if got := r.claimsOf(deferred); got != 1 {
+		t.Errorf("%v was claimed %d times in the poll, want 1", deferred, got)
+	}
+	close(release)
+	r.waitRow(tliveAMD64(), fleet.CacheReady)
+	r.waitRow(tliveARM64(), fleet.CacheReady)
+}
+
+// oneAtATime is the scenario of two live downloads and a volume with room for
+// one of them: the second fits alone but not beside the first, which release
+// holds up.
+func oneAtATime(release <-chan struct{}) func(t *testing.T, base string) scenario {
+	return func(t *testing.T, base string) scenario {
 		t.Helper()
 		sc := poolScenario(2, func(base string, objects map[string][]byte) http.Handler {
 			return blockingAt(objectsAt(base, objects), release, "/tlive-amd64.zip", "/tlive-arm64.zip")
@@ -1928,38 +2018,53 @@ func TestFetcher_ReservationBlocksSecond(t *testing.T) {
 			f.statfs = func(string) (uint64, error) { return free, nil }
 		}
 		return sc
-	})
-	r.request("tlive", "arm64", 0)
-	stop := r.startRun()
-	defer stop()
-
-	var refused, first fleet.CacheKey
-	r.waitFor("one download to be refused", func() bool {
-		for _, key := range []fleet.CacheKey{tliveAMD64(), tliveARM64()} {
-			if r.row(key).State == fleet.CacheFailed {
-				refused = key
-				first = tliveAMD64()
-				if key == first {
-					first = tliveARM64()
-				}
-				return true
-			}
-		}
-		return false
-	})
-
-	row := r.row(refused)
-	if !strings.Contains(row.LastError, "free space") || !strings.Contains(row.LastError, "reserved") {
-		t.Errorf("last_error = %q, want a free space refusal that names what is reserved", row.LastError)
 	}
-	r.wantRow(first, fleet.CacheFetching, 0)
-	close(release)
-	r.waitRow(first, fleet.CacheReady)
-	stop()
+}
 
-	r.f.now = func() time.Time { return fetchT0().Add(time.Hour) } // the retry is due
+// TestFetcher_SecondThatFitsAloneIsDeferred has room for one download. While
+// the first is in flight the second does not fit beside it, but it would fit
+// alone: it goes back to wanted with no attempt, no backoff and no failure, and
+// downloads once the first is done.
+func TestFetcher_SecondThatFitsAloneIsDeferred(t *testing.T) {
+	release := make(chan struct{})
+	r := runScenario(t, oneAtATime(release))
+	r.request("tlive", "arm64", 0)
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := r.w.runOnce(t.Context())
+		firstDone <- err
+	}()
+	r.waitFor("the first download to be requested", func() bool { return len(r.up.seen()) == 1 })
+	second := &worker{f: r.f}
+
+	claimed, err := second.runOnce(t.Context())
+
+	if !claimed || !errors.Is(err, errSpaceBusy) {
+		t.Fatalf("runOnce = %v, %v; want true and errSpaceBusy", claimed, err)
+	}
+	row := r.wantRow(tliveARM64(), fleet.CacheWanted, 0)
+	if row.LastError != "" || !row.NextAttemptAt.IsZero() {
+		t.Errorf("the deferred row holds last_error %q and next_attempt_at %v, want neither", row.LastError, row.NextAttemptAt)
+	}
+	if ev := r.lastEvent(); ev.Key != tliveARM64() || ev.From != fleet.CacheFetching || ev.To != fleet.CacheWanted || ev.Class != "" || ev.Err == nil || ev.Attempts != 0 {
+		t.Errorf("last event = %+v, want tlive/arm64 fetching to wanted, no class, no attempt and the reason", ev)
+	}
+	for _, class := range []string{classOther, classIntegrity} {
+		if got := r.counter(failuresCounter, class); got != 0 {
+			t.Errorf("%s{class=%s} = %d, want 0", failuresCounter, class, got)
+		}
+	}
+	if got := len(r.up.seen()); got != 1 {
+		t.Errorf("the upstream saw %d requests, want only the first download's", got)
+	}
+
+	close(release)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("the first runOnce: %v", err)
+	}
+	r.wantRow(tliveAMD64(), fleet.CacheReady, 0)
 	r.fetchOnce()
-	r.wantRow(refused, fleet.CacheReady, 0)
+	r.wantRow(tliveARM64(), fleet.CacheReady, 0)
 }
 
 // TestFetcher_ReservationReleasedOnFailure has room for one download. However
@@ -2029,8 +2134,8 @@ func TestFetcher_SpooledObjectReservesItsExtraction(t *testing.T) {
 		t.Helper()
 		sc := poolScenario(1, objectsAt)(t, base)
 		spooled, other := uint64(len(sc.fx.Objects[base+"/tlive-amd64.zip"])), uint64(len(sc.fx.Objects[base+"/tlive-arm64.zip"]))
-		// Room for the spooled job's extraction and, but for it, the other job's whole need.
-		free := spooled + spaceReserve + 2*other + spaceReserve - 1
+		// Room for the other job's whole need, but for the byte the spooled job's extraction holds.
+		free := spooled + 2*other + spaceReserve - 1
 		sc.seed = func(t *testing.T, h *harness, e catalog.Entry) {
 			t.Helper()
 			seedSpool(t, h, e, sc.fx.Objects[base+"/tlive-amd64.zip"], "")
@@ -2055,11 +2160,11 @@ func TestFetcher_SpooledObjectReservesItsExtraction(t *testing.T) {
 		t.Fatalf("download of the spooled object: %v", err)
 	}
 
-	if want := uint64(r.e.Pin.Objects[0].Size) + spaceReserve; r.f.reserved != want {
-		t.Errorf("reserved = %d, want %d: the extraction share and spaceReserve", r.f.reserved, want)
+	if want := uint64(r.e.Pin.Objects[0].Size); r.f.reserved != want {
+		t.Errorf("reserved = %d, want %d: the extraction share", r.f.reserved, want)
 	}
-	if err := otherJob.download(t.Context(), 0); err == nil || !strings.Contains(err.Error(), "reserved") {
-		t.Errorf("the other job's download = %v, want a free space refusal that names what is reserved", err)
+	if err := otherJob.download(t.Context(), 0); !errors.Is(err, errSpaceBusy) {
+		t.Errorf("the other job's download = %v, want errSpaceBusy: it fits alone, not beside the extraction", err)
 	}
 }
 
@@ -2070,8 +2175,8 @@ func TestFetcher_SpooledObjectReservesItsExtraction(t *testing.T) {
 func TestFetchJob_ReserveSpaceSwaps(t *testing.T) {
 	h := newHarness(t, catalogtest.New(t, "https://example.test").Catalog, NewHTTPClient(testUserAgent, nil))
 	const first, second = int64(1 << 20), int64(2 << 20)
-	need2 := 2*uint64(second) + spaceReserve
-	h.f.statfs = func(string) (uint64, error) { return need2, nil } // room for one of them
+	need2 := 2 * uint64(second)
+	h.f.statfs = func(string) (uint64, error) { return need2 + spaceReserve, nil } // room for one of them
 	j := &fetchJob{f: h.f}
 
 	if err := j.reserveSpace(first, 2); err != nil {
@@ -2087,6 +2192,51 @@ func TestFetchJob_ReserveSpaceSwaps(t *testing.T) {
 	j.close(t.Context())
 	if h.f.reserved != 0 {
 		t.Errorf("reserved after close = %d, want 0", h.f.reserved)
+	}
+}
+
+// TestFetchJob_ReserveSpaceRefusals pins the two refusals apart: a download
+// that fits on the volume alone but not beside the others in flight is
+// errSpaceBusy, and one the volume cannot hold even alone is an ordinary
+// failure, however much the others hold.
+func TestFetchJob_ReserveSpaceRefusals(t *testing.T) {
+	const size = int64(1 << 20)
+	need, other := 2*uint64(size), uint64(1<<20) // other is what another download holds
+	tests := []struct {
+		name         string
+		free, others uint64
+		wantBusy     bool
+		wantErr      bool
+	}{
+		{"room beside the others", other + need + spaceReserve, other, false, false},
+		{"one byte short beside the others", other + need + spaceReserve - 1, other, true, true},
+		{"fits alone, the others hold the rest", need + spaceReserve, other, true, true},
+		{"one byte short of fitting alone", need + spaceReserve - 1, 0, false, true},
+		{"one byte short of fitting alone, beside others", need + spaceReserve - 1, other, false, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHarness(t, catalogtest.New(t, "https://example.test").Catalog, NewHTTPClient(testUserAgent, nil))
+			h.f.statfs = func(string) (uint64, error) { return tt.free, nil }
+			h.f.reserved = tt.others
+			j := &fetchJob{f: h.f}
+
+			err := j.reserveSpace(size, 2)
+
+			if (err != nil) != tt.wantErr || errors.Is(err, errSpaceBusy) != tt.wantBusy {
+				t.Fatalf("reserveSpace = %v, want an error: %t, errSpaceBusy: %t", err, tt.wantErr, tt.wantBusy)
+			}
+			if err != nil && !strings.Contains(err.Error(), "free space") {
+				t.Errorf("reserveSpace = %v, want it to mention free space", err)
+			}
+			want := tt.others // a refusal holds nothing
+			if err == nil {
+				want += need
+			}
+			if h.f.reserved != want {
+				t.Errorf("reserved = %d after %v, want %d", h.f.reserved, err, want)
+			}
+		})
 	}
 }
 

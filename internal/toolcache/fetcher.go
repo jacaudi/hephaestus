@@ -74,6 +74,11 @@ const locationParseFailure = "failed to parse Location header"
 // never reaches an event, a handler or a stored error.
 var errUnparsableLocation = errors.New("unparsable Location header")
 
+// errSpaceBusy is why a download was given up for now: the spool volume has
+// room for it alone, but not beside the downloads in flight. It is not a
+// failure and is never recorded as one; the worker gives the row back to wanted.
+var errSpaceBusy = errors.New("the spool volume has no room for the download beside those in flight")
+
 // errIdle is why a download was cancelled: no data arrived within the idle
 // timeout.
 var errIdle = errors.New("idle timeout: no data from the upstream")
@@ -108,7 +113,9 @@ type FetchEvent struct {
 	// Attempts is the row's failed attempts after the change.
 	Attempts int
 	// Class is "" for a change that is not a failure, "integrity" for a failure
-	// no retry can fix and "other" for any other failure.
+	// no retry can fix and "other" for any other failure. A row given back to
+	// wanted because the spool volume has no room for it beside the other
+	// downloads is not a failure: its Class is "" and its Err says why.
 	Class string
 	// Err is the failure's cause as printable text, with the userinfo, query and fragment of any URL removed.
 	Err error
@@ -238,12 +245,15 @@ type worker struct {
 }
 
 // run settles rows until ctx is done. After a row it claims again at once; when
-// nothing was claimed, or an outcome could not be stored, it waits one poll
-// interval, so a failing database is not asked again in a tight loop.
+// nothing was claimed, an outcome could not be stored, or the row was given back
+// for want of room, it waits one poll interval. That way a failing database is
+// not asked again in a tight loop, and a row that does not fit is not claimed
+// again before the downloads it waits for have had time to end. A row given
+// back is not an error and is not reported as one.
 func (w *worker) run(ctx context.Context) {
 	for ctx.Err() == nil {
 		claimed, err := w.runOnce(ctx)
-		if err != nil && ctx.Err() == nil {
+		if err != nil && !errors.Is(err, errSpaceBusy) && ctx.Err() == nil {
 			w.f.onError(ctx, err)
 		}
 		if claimed && err == nil {
@@ -256,10 +266,13 @@ func (w *worker) run(ctx context.Context) {
 	}
 }
 
-// outcome is how one claimed row ended: ready, or a failure to record.
+// outcome is how one claimed row ended: ready, given back, or a failure to record.
 type outcome struct {
 	ready bool
-	fail  fleet.FetchFailure
+	// deferred is a row to give back to wanted, with no attempt and no failure,
+	// because the spool volume has no room for it beside the downloads in flight.
+	deferred bool
+	fail     fleet.FetchFailure
 	// ev is the event to emit once the outcome is stored, less To and Attempts.
 	ev FetchEvent
 }
@@ -276,9 +289,11 @@ type heldOutcome struct {
 
 // runOnce settles one row. It reports false when nothing was claimed, and true
 // when a row was: with a nil error when its outcome (ready or a recorded
-// failure) was stored, with ctx's error when ctx ended the fetch, which leaves
-// the row fetching and its spool in place, and otherwise with the repository
-// error that kept the outcome from being stored.
+// failure) was stored, with errSpaceBusy when the row was given back to wanted
+// for want of room beside the other downloads (its spool is kept), with ctx's
+// error when ctx ended the fetch, which leaves the row fetching and its spool in
+// place, and otherwise with the repository error that kept the outcome from
+// being stored.
 func (w *worker) runOnce(ctx context.Context) (bool, error) {
 	if w.held != nil {
 		return w.retryHeld(ctx)
@@ -298,12 +313,18 @@ func (w *worker) runOnce(ctx context.Context) (bool, error) {
 	defer job.close(ctx)
 	err = job.run(ctx)
 	o := outcome{ev: FetchEvent{Key: row.Key(), Pin: row.Pin, From: fleet.CacheFetching, Bytes: job.downloaded}}
-	if err == nil {
+	switch {
+	case err == nil:
 		o.ready = true
-	} else {
-		if ctx.Err() != nil {
-			return true, ctx.Err()
-		}
+	case ctx.Err() != nil:
+		return true, ctx.Err()
+	case errors.Is(err, errSpaceBusy):
+		// Not a failure: no attempt, no backoff, no class and no failures count. The
+		// event says why the row went back, as the held-reset event does.
+		o.deferred = true
+		o.ev.Attempts = row.Attempts
+		o.ev.Err = errors.New(fleet.PrintableText(err.Error()))
+	default:
 		o.ev.Class = classOf(err)
 		cause := fleet.PrintableText(err.Error())
 		o.ev.Err = errors.New(cause)
@@ -320,6 +341,9 @@ func (w *worker) runOnce(ctx context.Context) (bool, error) {
 		job.discard(ctx)
 	}
 	if recordErr == nil {
+		if o.deferred {
+			return true, err
+		}
 		return true, nil
 	}
 	if ctx.Err() != nil {
@@ -343,6 +367,17 @@ func claimedFrom(row fleet.CacheRow) fleet.CacheState {
 // record stores o and emits its event. A failure that could not be stored
 // carries its cause along, for the error handler.
 func (f *Fetcher) record(ctx context.Context, o outcome) error {
+	if o.deferred {
+		moved, err := f.cfg.Repo.ResetFetchingRow(ctx, o.ev.Key, o.ev.Pin, f.now())
+		if err != nil {
+			return err
+		}
+		if moved {
+			o.ev.To = fleet.CacheWanted
+			f.events(ctx, o.ev)
+		}
+		return nil
+	}
 	if o.ready {
 		moved, err := f.cfg.Repo.MarkReady(ctx, o.ev.Key, o.ev.Pin, f.now())
 		if err != nil {
@@ -594,19 +629,26 @@ func (j *fetchJob) keepETag(n int, etag string) error {
 }
 
 // reserveSpace refuses a download the spool volume has no room for, and
-// otherwise holds the room for the job until close. The need is copies times
-// the object (2: the spool and its extracted copy; 1 when the spool is already
-// whole and only the extraction is left) and spaceReserve, and it must fit in
-// what is free less what the other downloads in flight hold, because their
-// bytes are not all on the disk yet. A job that reserved for an earlier object
-// swaps that reservation for this one: those bytes are on the disk by now.
+// otherwise holds the room for the job until close. The job's need is copies
+// times the object (2: the spool and its extracted copy; 1 when the spool is
+// already whole and only the extraction is left), and that is all it holds.
+// spaceReserve is the margin the volume keeps whatever runs on it, so it is
+// counted once, not once per download. The need must fit in what is free less
+// the margin and less what the other downloads in flight hold, because their
+// bytes are not all on the disk yet.
+//
+// A need that does not fit even alone, that is, without the others' holds, is
+// an ordinary error: no wait would change it. One that fits alone but not beside
+// the others is errSpaceBusy, which the worker does not count as a failure.
+// A job that reserved for an earlier object swaps that reservation for this
+// one: those bytes are on the disk by now.
 func (j *fetchJob) reserveSpace(size int64, copies uint64) error {
 	f := j.f
 	// Past this, the need below does not fit in a uint64; no volume holds it.
 	if uint64(max(size, 0)) > (math.MaxUint64-spaceReserve)/copies {
 		return fmt.Errorf("free space on the spool volume cannot hold a %d byte object", size)
 	}
-	need := copies*uint64(max(size, 0)) + spaceReserve
+	need := copies * uint64(max(size, 0))
 
 	// ponytail: statfs runs under the lock so check and reserve are one step;
 	// a slow volume delays only other reservations, and a measured delay can move it out.
@@ -616,9 +658,13 @@ func (j *fetchJob) reserveSpace(size int64, copies uint64) error {
 	if err != nil {
 		return fmt.Errorf("free space on the spool volume: %w", err)
 	}
+	if free < need+spaceReserve {
+		return fmt.Errorf("free space on the spool volume is %d bytes, a %d byte object needs %d and the %d byte margin", free, size, need, spaceReserve)
+	}
 	others := f.reserved - j.reserved
-	if free-min(free, others) < need {
-		return fmt.Errorf("free space on the spool volume is %d bytes with %d reserved by other downloads, a %d byte object needs %d", free, others, size, need)
+	if free-min(free, others) < need+spaceReserve {
+		return fmt.Errorf("%w: free space is %d bytes with %d reserved by other downloads, a %d byte object needs %d and the %d byte margin",
+			errSpaceBusy, free, others, size, need, spaceReserve)
 	}
 	f.reserved, j.reserved = others+need, need
 	return nil
