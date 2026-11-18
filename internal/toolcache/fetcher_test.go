@@ -15,10 +15,12 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -174,6 +176,7 @@ type harness struct {
 	storeDir string
 	spool    string
 	f        *Fetcher
+	w        *worker // the worker the tests drive with runOnce
 	reader   *sdkmetric.ManualReader
 
 	mu     sync.Mutex
@@ -191,7 +194,7 @@ func newHarness(t *testing.T, cat *catalog.Catalog, client *http.Client) *harnes
 	}
 	h.store = st
 	f, err := NewFetcher(
-		FetcherConfig{Repo: h.repo, Store: st, Catalog: cat, Client: client, SpoolDir: h.spool},
+		FetcherConfig{Repo: h.repo, Store: st, Catalog: cat, Client: client, SpoolDir: h.spool, Workers: 1},
 		WithClock(fetchT0),
 		WithMeter(sdkmetric.NewMeterProvider(sdkmetric.WithReader(h.reader)).Meter("test")),
 		WithEvents(func(_ context.Context, ev FetchEvent) {
@@ -211,12 +214,13 @@ func newHarness(t *testing.T, cat *catalog.Catalog, client *http.Client) *harnes
 	// The default statfs reads the host's disk, whose free space the test must not depend on.
 	f.statfs = func(string) (uint64, error) { return 1 << 40, nil }
 	h.f = f
+	h.w = &worker{f: f}
 	return h
 }
 
 func (h *harness) once() (bool, error) {
 	h.t.Helper()
-	return h.f.runOnce(h.t.Context())
+	return h.w.runOnce(h.t.Context())
 }
 
 // fetchOnce runs one fetch that must claim a row and store its outcome.
@@ -1199,7 +1203,9 @@ func TestFetcher_BookkeepingFailsTwiceResetsRow(t *testing.T) {
 }
 
 // TestFetcher_ResetOfAMovedRowIsSilent moves the held row before the poll that
-// resets it: the reset did not move that row at that pin, so no event says it did.
+// resets it: the reset did not move that row at that pin, so no event says it
+// did. The reset is of the held row at its pin only, so a row that was claimed
+// again at another pin is left to the worker that holds it.
 func TestFetcher_ResetOfAMovedRowIsSilent(t *testing.T) {
 	const newPin = "repinned"
 	repin := func(t *testing.T, r *run) {
@@ -1209,25 +1215,26 @@ func TestFetcher_ResetOfAMovedRowIsSilent(t *testing.T) {
 		}
 	}
 	tests := []struct {
-		name    string
-		move    func(t *testing.T, r *run)
-		wantPin func(r *run) string
+		name      string
+		move      func(t *testing.T, r *run)
+		wantPin   func(r *run) string
+		wantState fleet.CacheState
 	}{
 		{"another reset moved the row first", func(t *testing.T, r *run) {
 			t.Helper()
 			if n, err := r.repo.ResetFetching(t.Context(), fetchT0()); err != nil || n != 1 {
 				t.Fatalf("ResetFetching = %d, %v; want 1, nil", n, err)
 			}
-		}, func(r *run) string { return r.e.Pin.ID }},
-		{"the row was repinned", repin, func(*run) string { return newPin }},
+		}, func(r *run) string { return r.e.Pin.ID }, fleet.CacheWanted},
+		{"the row was repinned", repin, func(*run) string { return newPin }, fleet.CacheWanted},
 		{"the row was repinned and claimed again", func(t *testing.T, r *run) {
 			t.Helper()
 			repin(t, r)
-			// As another process's claim would; the reset then moves a row, at another pin.
+			// As another worker's claim would; its row, at another pin, is not the held one.
 			if _, ok, err := r.repo.ClaimFetch(t.Context(), fetchT0()); err != nil || !ok {
 				t.Fatalf("ClaimFetch = %v, %v; want true, nil", ok, err)
 			}
-		}, func(*run) string { return newPin }},
+		}, func(*run) string { return newPin }, fleet.CacheFetching},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1254,13 +1261,69 @@ func TestFetcher_ResetOfAMovedRowIsSilent(t *testing.T) {
 				t.Fatalf("runOnce = %v, want nil", err)
 			}
 
-			if row, want := r.wantRow(tliveAMD64(), fleet.CacheWanted, 0), tt.wantPin(r); row.Pin != want {
+			if row, want := r.wantRow(tliveAMD64(), tt.wantState, 0), tt.wantPin(r); row.Pin != want {
 				t.Errorf("row pin = %q, want %q", row.Pin, want)
 			}
 			if got, want := r.transitions(), []string{"wanted>fetching"}; !slices.Equal(got, want) {
 				t.Errorf("events = %v, want %v", got, want)
 			}
 		})
+	}
+}
+
+// TestFetcher_HeldResetOnlyOwnRow gives a worker whose outcome the database
+// refused twice its own row back to wanted, and leaves a row another worker
+// holds fetching.
+func TestFetcher_HeldResetOnlyOwnRow(t *testing.T) {
+	r := injectedRun(t)
+	r.request("tshell", "amd64", 1)
+	// Another worker holds tshell: it claimed the row, and never settles it here.
+	other, ok, err := r.repo.ClaimFetch(t.Context(), fetchT0())
+	if err != nil || !ok || other.Key() != tshellAMD64() {
+		t.Fatalf("ClaimFetch = %v, %v, %v; want the tshell row, true, nil", other.Key(), ok, err)
+	}
+
+	for i := range 2 {
+		if _, err := r.once(); err == nil {
+			t.Fatalf("runOnce %d succeeded, want the injected error", i+1)
+		}
+	}
+
+	r.wantRow(tliveAMD64(), fleet.CacheWanted, 0)
+	r.wantRow(tshellAMD64(), fleet.CacheFetching, 0)
+}
+
+// TestFetcher_HeldResetEventIsPrintable pins that the reset event's Err is
+// printable text, like every FetchEvent's: the database error that kept the
+// outcome from being stored may hold control and format runes.
+func TestFetcher_HeldResetEventIsPrintable(t *testing.T) {
+	r := runScenario(t, func(t *testing.T, base string) scenario {
+		t.Helper()
+		return liveOf(t, base, serveObject)
+	})
+	trigger := "CREATE TRIGGER inject BEFORE UPDATE OF state ON utility_cache WHEN NEW.state = 'ready' BEGIN SELECT RAISE(ABORT, 'inj\x1b\u202eected'); END"
+	if _, err := r.d.Bun().ExecContext(t.Context(), trigger); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+	for i := range 2 {
+		if _, err := r.once(); err == nil {
+			t.Fatalf("runOnce %d succeeded, want the injected error", i+1)
+		}
+	}
+
+	ev := r.lastEvent()
+
+	if ev.To != fleet.CacheWanted || ev.Err == nil {
+		t.Fatalf("last event = %+v, want the reset to wanted with an Err", ev)
+	}
+	if got := ev.Err.Error(); !strings.Contains(got, "inj") || !strings.Contains(got, "ected") {
+		t.Errorf("event Err = %q, want it to keep the printable text", got)
+	}
+	for _, c := range ev.Err.Error() {
+		if !unicode.IsGraphic(c) {
+			t.Errorf("event Err = %q holds the non-printable rune %U", ev.Err, c)
+			break
+		}
 	}
 }
 
@@ -1283,15 +1346,29 @@ func TestFetcher_ShutdownAbandons(t *testing.T) {
 	})
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
+	spool := filepath.Join(r.spool, SpoolName(r.e.Pin.ID, 0))
 	go func() {
 		select {
 		case <-chunk:
-			cancel()
 		case <-ctx.Done():
+			return
+		}
+		// The handler having flushed is not the client having the chunk: cancelled
+		// before the response arrives, the fetch leaves no spool at all.
+		for {
+			if fi, err := os.Stat(spool); err == nil && fi.Size() >= 64<<10 {
+				cancel()
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Millisecond):
+			}
 		}
 	}()
 
-	_, err := r.f.runOnce(ctx)
+	_, err := r.w.runOnce(ctx)
 
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("runOnce = %v, want context.Canceled", err)
@@ -1664,6 +1741,315 @@ func TestFetcher_FreeSpaceBoundary(t *testing.T) {
 				t.Errorf("the upstream saw %d requests, want 0", got)
 			}
 		})
+	}
+}
+
+// blockingAt serves next, except that a request for one of paths first waits
+// for release, or for the client to give up.
+func blockingAt(next http.Handler, release <-chan struct{}, paths ...string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if slices.Contains(paths, r.URL.Path) {
+			select {
+			case <-release:
+			case <-r.Context().Done():
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// meetingOf serves next once n requests are waiting, so n downloads start together.
+func meetingOf(next http.Handler, n int32) http.Handler {
+	var arrived atomic.Int32
+	all := make(chan struct{})
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if arrived.Add(1) == n {
+			close(all)
+		}
+		select {
+		case <-all:
+		case <-r.Context().Done():
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// waitFor polls cond until it holds, and fails the test after 10 seconds.
+func (h *harness) waitFor(what string, cond func() bool) {
+	h.t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			h.t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func (h *harness) waitRow(key fleet.CacheKey, state fleet.CacheState) {
+	h.t.Helper()
+	h.waitFor(fmt.Sprintf("%v to be %s", key, state), func() bool { return h.row(key).State == state })
+}
+
+// startRun runs the fetcher's pool, polling every 20 ms. The returned function
+// cancels it and fails the test unless Run returned nil only once it was
+// cancelled and every worker loop is gone; it is safe to call twice.
+func (h *harness) startRun() (stop func()) {
+	h.t.Helper()
+	h.f.poll = 20 * time.Millisecond
+	ctx, cancel := context.WithCancel(h.t.Context())
+	done := make(chan error, 1)
+	go func() { done <- h.f.Run(ctx) }()
+	return sync.OnceFunc(func() {
+		select {
+		case err := <-done:
+			h.t.Errorf("Run returned %v before its context was done", err)
+			return
+		default:
+		}
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				h.t.Errorf("Run = %v, want nil on a done context", err)
+			}
+		case <-time.After(10 * time.Second):
+			h.t.Error("Run did not return after its context was cancelled")
+			return
+		}
+		// goleak retries until the goroutines are gone, which would hide a Run
+		// that returned too soon: look once, the moment Run has returned.
+		stacks := make([]byte, 1<<20)
+		if bytes.Contains(stacks[:runtime.Stack(stacks, true)], []byte("toolcache.(*worker).run")) {
+			h.t.Error("Run returned while a worker loop was still running")
+		}
+	})
+}
+
+// poolScenario is the fixture catalog, with the upstream serve builds from its
+// objects, fetched by a pool of workers.
+func poolScenario(workers int, serve func(base string, objects map[string][]byte) http.Handler) func(t *testing.T, base string) scenario {
+	return func(t *testing.T, base string) scenario {
+		t.Helper()
+		fx := catalogtest.New(t, base)
+		return scenario{
+			cat: fx.Catalog, key: tliveAMD64(), fx: fx, handler: serve(base, fx.Objects),
+			tune: func(f *Fetcher) { f.cfg.Workers = workers },
+		}
+	}
+}
+
+// TestFetcher_PoolSlowDoesNotBlockFast is the stall the pool exists to end: one
+// upstream that does not answer must not hold back a download from another.
+func TestFetcher_PoolSlowDoesNotBlockFast(t *testing.T) {
+	release := make(chan struct{})
+	r := runScenario(t, poolScenario(2, func(base string, objects map[string][]byte) http.Handler {
+		return blockingAt(objectsAt(base, objects), release, "/tlive-amd64.zip")
+	}))
+	r.request("tshell", "amd64", 0)
+	stop := r.startRun()
+	defer stop()
+
+	r.waitRow(tshellAMD64(), fleet.CacheReady)
+
+	r.wantRow(tliveAMD64(), fleet.CacheFetching, 0)
+	close(release)
+	r.waitRow(tliveAMD64(), fleet.CacheReady)
+}
+
+// TestFetcher_PoolShutdownLeavesNoGoroutines cancels a pool of four with two
+// downloads in flight: Run returns nil once every loop has, and nothing is left running.
+func TestFetcher_PoolShutdownLeavesNoGoroutines(t *testing.T) {
+	r := runScenario(t, poolScenario(4, func(base string, objects map[string][]byte) http.Handler {
+		return blockingAt(objectsAt(base, objects), nil, "/tlive-amd64.zip", "/tlive-arm64.zip")
+	}))
+	r.request("tlive", "arm64", 0)
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	defer r.f.cfg.Client.CloseIdleConnections()
+	stop := r.startRun()
+	defer stop()
+	r.waitFor("both downloads to be requested", func() bool { return len(r.up.seen()) == 2 })
+
+	stop()
+
+	r.wantRow(tliveAMD64(), fleet.CacheFetching, 0)
+	r.wantRow(tliveARM64(), fleet.CacheFetching, 0)
+}
+
+// TestFetcher_PoolSharedBlob fetches two entries whose files include one blob
+// of the same digest, both downloads at the same moment.
+func TestFetcher_PoolSharedBlob(t *testing.T) {
+	r := runScenario(t, poolScenario(2, func(base string, objects map[string][]byte) http.Handler {
+		return meetingOf(objectsAt(base, objects), 2)
+	}))
+	arm := r.request("tlive", "arm64", 0)
+	stop := r.startRun()
+	defer stop()
+
+	r.waitRow(tliveAMD64(), fleet.CacheReady)
+	r.waitRow(tliveARM64(), fleet.CacheReady)
+
+	if got := r.handlerErrors(); len(got) != 0 {
+		t.Errorf("the error handler got %v", got)
+	}
+	r.wantStored(r.e, r.files())
+	r.wantStored(arm, r.sc.fx.Files[catalog.Key{Entry: "tlive", Arch: "arm64"}])
+}
+
+// oneNeed is the free space that holds exactly one of the fixture's live
+// downloads: its need, twice its size and spaceReserve.
+func oneNeed(fx catalogtest.Fixture, base string) uint64 {
+	return 2*uint64(max(len(fx.Objects[base+"/tlive-amd64.zip"]), len(fx.Objects[base+"/tlive-arm64.zip"]))) + spaceReserve
+}
+
+// TestFetcher_ReservationBlocksSecond has room for one download. While the
+// first is in flight its reservation holds the room, so the second fails its
+// space check; once the first is done a retry of the second passes.
+func TestFetcher_ReservationBlocksSecond(t *testing.T) {
+	release := make(chan struct{})
+	r := runScenario(t, func(t *testing.T, base string) scenario {
+		t.Helper()
+		sc := poolScenario(2, func(base string, objects map[string][]byte) http.Handler {
+			return blockingAt(objectsAt(base, objects), release, "/tlive-amd64.zip", "/tlive-arm64.zip")
+		})(t, base)
+		free := oneNeed(sc.fx, base)
+		sc.tune = func(f *Fetcher) {
+			f.cfg.Workers = 2
+			f.statfs = func(string) (uint64, error) { return free, nil }
+		}
+		return sc
+	})
+	r.request("tlive", "arm64", 0)
+	stop := r.startRun()
+	defer stop()
+
+	var refused, first fleet.CacheKey
+	r.waitFor("one download to be refused", func() bool {
+		for _, key := range []fleet.CacheKey{tliveAMD64(), tliveARM64()} {
+			if r.row(key).State == fleet.CacheFailed {
+				refused = key
+				first = tliveAMD64()
+				if key == first {
+					first = tliveARM64()
+				}
+				return true
+			}
+		}
+		return false
+	})
+
+	row := r.row(refused)
+	if !strings.Contains(row.LastError, "free space") || !strings.Contains(row.LastError, "reserved") {
+		t.Errorf("last_error = %q, want a free space refusal that names what is reserved", row.LastError)
+	}
+	r.wantRow(first, fleet.CacheFetching, 0)
+	close(release)
+	r.waitRow(first, fleet.CacheReady)
+	stop()
+
+	r.f.now = func() time.Time { return fetchT0().Add(time.Hour) } // the retry is due
+	r.fetchOnce()
+	r.wantRow(refused, fleet.CacheReady, 0)
+}
+
+// TestFetcher_ReservationReleasedOnFailure has room for one download. However
+// the first ends, the second is not refused for room that is no longer in use.
+func TestFetcher_ReservationReleasedOnFailure(t *testing.T) {
+	tests := []struct {
+		name string
+		// first serves the first download's object; cancel ends its context.
+		first func(object []byte, cancel context.CancelFunc) http.Handler
+	}{
+		{"integrity failure", func(object []byte, _ context.CancelFunc) http.Handler {
+			bad := slices.Clone(object)
+			bad[0] ^= 0xff
+			return serveObject(bad)
+		}},
+		{"other failure", func([]byte, context.CancelFunc) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusServiceUnavailable) })
+		}},
+		{"cancelled", func(_ []byte, cancel context.CancelFunc) http.Handler {
+			return http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+				cancel()
+				<-r.Context().Done()
+			})
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			r := runScenario(t, func(t *testing.T, base string) scenario {
+				t.Helper()
+				sc := poolScenario(1, func(base string, objects map[string][]byte) http.Handler {
+					mux := http.NewServeMux()
+					mux.Handle("GET /tlive-amd64.zip", tt.first(objects[base+"/tlive-amd64.zip"], cancel))
+					mux.Handle("GET /", objectsAt(base, objects))
+					return mux
+				})(t, base)
+				free := oneNeed(sc.fx, base)
+				sc.tune = func(f *Fetcher) { f.statfs = func(string) (uint64, error) { return free, nil } }
+				return sc
+			})
+			r.request("tlive", "arm64", 0)
+
+			if claimed, _ := r.w.runOnce(ctx); !claimed {
+				t.Fatal("the first runOnce claimed nothing")
+			}
+			r.fetchOnce()
+
+			r.wantRow(tliveARM64(), fleet.CacheReady, 0)
+		})
+	}
+}
+
+func TestNewFetcher_Workers(t *testing.T) {
+	d := dbtest.SQLite(t)
+	st, _, err := store.Open(t.Context(), filepath.Join(t.TempDir(), "store"), fetchT0)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	full := FetcherConfig{
+		Repo: fleet.NewRepository(d), Store: st, Catalog: catalogtest.New(t, "https://example.test").Catalog,
+		Client: NewHTTPClient(testUserAgent, nil), SpoolDir: filepath.Join(t.TempDir(), "spool"),
+	}
+	tests := []struct {
+		name    string
+		workers int
+		want    int // the worker count Run starts, when NewFetcher accepts it
+		wantErr bool
+	}{
+		{"zero is the default", 0, 4, false},
+		{"one", 1, 1, false},
+		{"the maximum", 16, 16, false},
+		{"one over the maximum", 17, 0, true},
+		{"negative", -1, 0, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := full
+			cfg.Workers = tt.workers
+
+			f, err := NewFetcher(cfg)
+
+			if tt.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "1 to 16") {
+					t.Fatalf("NewFetcher = %v, %v; want an error that names the range 1 to 16", f, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("NewFetcher: %v", err)
+			}
+			if f.cfg.Workers != tt.want {
+				t.Errorf("workers = %d, want %d", f.cfg.Workers, tt.want)
+			}
+		})
+	}
+	if DefaultFetchWorkers != 4 || MaxFetchWorkers != 16 {
+		t.Errorf("DefaultFetchWorkers, MaxFetchWorkers = %d, %d; want 4, 16", DefaultFetchWorkers, MaxFetchWorkers)
 	}
 }
 

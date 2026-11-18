@@ -1,6 +1,7 @@
 package toolcache
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -13,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -34,6 +36,12 @@ const (
 	// abandoned. It restarts on every read that makes progress; it is not a
 	// total timeout.
 	IdleTimeout = 60 * time.Second
+
+	// DefaultFetchWorkers is how many downloads run at once when
+	// FetcherConfig.Workers is 0.
+	DefaultFetchWorkers = 4
+	// MaxFetchWorkers is the most downloads FetcherConfig.Workers may ask for at once.
+	MaxFetchWorkers = 16
 
 	// progressEvery bounds how often a download records its progress.
 	progressEvery = 5 * time.Second
@@ -63,7 +71,7 @@ var errUnparsableLocation = errors.New("unparsable Location header")
 // timeout.
 var errIdle = errors.New("idle timeout: no data from the upstream")
 
-// FetcherConfig is what a Fetcher works on. Every field is required.
+// FetcherConfig is what a Fetcher works on. Every field but Workers is required.
 type FetcherConfig struct {
 	// Repo holds the utility_cache rows the fetcher claims and settles.
 	Repo *fleet.Repository
@@ -75,6 +83,9 @@ type FetcherConfig struct {
 	Client *http.Client
 	// SpoolDir holds the partial downloads. It is created when missing.
 	SpoolDir string
+	// Workers is how many downloads run at once, from 1 to MaxFetchWorkers. 0
+	// means DefaultFetchWorkers.
+	Workers int
 }
 
 // FetchEvent is one state change of a cache row the fetcher made.
@@ -110,15 +121,15 @@ func WithEvents(fn func(context.Context, FetchEvent)) FetcherOption {
 
 // WithErrorHandler sets the function called with every error the fetcher
 // cannot settle on a row: an unrecorded repository error, a progress record
-// that failed, a row it could not read back after resetting it, or a spool file
-// or the spool directory it could not remove or close.
+// that failed, or a spool file or the spool directory it could not remove or
+// close.
 func WithErrorHandler(fn func(context.Context, error)) FetcherOption {
 	return func(f *Fetcher) { f.onError = fn }
 }
 
 // Fetcher downloads the objects of wanted cache rows, verifies them against
 // the catalog's pins, extracts their files into the store and settles each
-// row. Run it once; runOnce is not safe for concurrent use.
+// row. Run it once: its workers fetch rows concurrently, each row by one worker.
 type Fetcher struct {
 	cfg      FetcherConfig
 	now      func() time.Time
@@ -133,8 +144,10 @@ type Fetcher struct {
 	idle   time.Duration
 	statfs func(path string) (free uint64, err error)
 
-	// held is an outcome the database refused to take, retried on the next poll.
-	held *heldOutcome
+	// spaceMu guards reserved: the free space on the spool volume that the
+	// downloads in flight have claimed.
+	spaceMu  sync.Mutex
+	reserved uint64
 }
 
 // NewFetcher returns a Fetcher over cfg and creates cfg.SpoolDir if it is
@@ -152,9 +165,13 @@ func NewFetcher(cfg FetcherConfig, opts ...FetcherOption) (*Fetcher, error) {
 			errs = append(errs, fmt.Errorf("toolcache: fetcher config has no %s", missing.name))
 		}
 	}
+	if cfg.Workers < 0 || cfg.Workers > MaxFetchWorkers {
+		errs = append(errs, fmt.Errorf("toolcache: fetcher config Workers is %d, want 1 to %d (0 means %d)", cfg.Workers, MaxFetchWorkers, DefaultFetchWorkers))
+	}
 	if err := errors.Join(errs...); err != nil {
 		return nil, err
 	}
+	cfg.Workers = cmp.Or(cfg.Workers, DefaultFetchWorkers)
 
 	f := &Fetcher{
 		cfg:     cfg,
@@ -187,20 +204,41 @@ func NewFetcher(cfg FetcherConfig, opts ...FetcherOption) (*Fetcher, error) {
 	return f, nil
 }
 
-// Run fetches one claimed row now and then every poll interval, until ctx is
-// done, and then returns nil. It never returns an error: each runOnce error
-// other than ctx's own goes to the error handler and polling continues.
+// Run starts Workers fetch loops and returns nil once ctx is done and every
+// loop has returned. It never returns an error: each runOnce error other than
+// ctx's own goes to the error handler and the loop goes on.
 func (f *Fetcher) Run(ctx context.Context) error {
-	tick := time.NewTicker(f.poll)
-	defer tick.Stop()
-	for {
-		if _, err := f.runOnce(ctx); err != nil && ctx.Err() == nil {
-			f.onError(ctx, err)
+	var wg sync.WaitGroup
+	for range f.cfg.Workers {
+		wg.Go(func() { (&worker{f: f}).run(ctx) })
+	}
+	wg.Wait()
+	return nil
+}
+
+// worker is one fetch loop. It owns the outcome the database refused it, so it
+// only ever resets the row it claimed itself.
+type worker struct {
+	f *Fetcher
+	// held is an outcome the database refused, retried on the next poll.
+	held *heldOutcome
+}
+
+// run settles rows until ctx is done. After a row it claims again at once; when
+// nothing was claimed, or an outcome could not be stored, it waits one poll
+// interval, so a failing database is not asked again in a tight loop.
+func (w *worker) run(ctx context.Context) {
+	for ctx.Err() == nil {
+		claimed, err := w.runOnce(ctx)
+		if err != nil && ctx.Err() == nil {
+			w.f.onError(ctx, err)
+		}
+		if claimed && err == nil {
+			continue
 		}
 		select {
 		case <-ctx.Done():
-			return nil
-		case <-tick.C:
+		case <-time.After(w.f.poll):
 		}
 	}
 }
@@ -228,10 +266,11 @@ type heldOutcome struct {
 // failure) was stored, with ctx's error when ctx ended the fetch, which leaves
 // the row fetching and its spool in place, and otherwise with the repository
 // error that kept the outcome from being stored.
-func (f *Fetcher) runOnce(ctx context.Context) (bool, error) {
-	if f.held != nil {
-		return f.retryHeld(ctx)
+func (w *worker) runOnce(ctx context.Context) (bool, error) {
+	if w.held != nil {
+		return w.retryHeld(ctx)
 	}
+	f := w.f
 	row, ok, err := f.cfg.Repo.ClaimFetch(ctx, f.now())
 	if err != nil {
 		return false, err
@@ -273,14 +312,14 @@ func (f *Fetcher) runOnce(ctx context.Context) (bool, error) {
 	if ctx.Err() != nil {
 		return true, ctx.Err()
 	}
-	f.held = &heldOutcome{outcome: o, cause: recordErr}
+	w.held = &heldOutcome{outcome: o, cause: recordErr}
 	return true, recordErr
 }
 
 // claimedFrom is the state a claimed row was in. ClaimFetch returns it already
 // fetching. A failure sets next_attempt_at and every way back to wanted clears
-// it except ResetFetching, so a set value means failed; a row ResetFetching gave
-// back after a failed claim is reported as failed too.
+// it except ResetFetching and ResetFetchingRow, so a set value means failed; a
+// row either gave back after a failed claim is reported as failed too.
 func claimedFrom(row fleet.CacheRow) fleet.CacheState {
 	if row.NextAttemptAt.IsZero() {
 		return fleet.CacheWanted
@@ -315,49 +354,40 @@ func (f *Fetcher) record(ctx context.Context, o outcome) error {
 
 // retryHeld tries the held outcome once more. When that fails too, or when an
 // earlier reset did, it gives the row back to wanted and drops the outcome, so
-// no row stays fetching because the database refused its settlement.
-func (f *Fetcher) retryHeld(ctx context.Context) (bool, error) {
-	h := f.held
+// no row stays fetching because the database refused its settlement. Only the
+// held row is reset: another worker's fetching row is its own to settle.
+func (w *worker) retryHeld(ctx context.Context) (bool, error) {
+	f, h := w.f, w.held
 	firstRetry := !h.retried
 	if firstRetry {
 		err := f.record(ctx, h.outcome)
 		switch {
 		case err == nil:
-			f.held = nil
+			w.held = nil
 			return true, nil
 		case ctx.Err() != nil:
 			return true, ctx.Err()
 		}
 		h.retried, h.cause = true, err
 	}
-	moved, err := f.cfg.Repo.ResetFetching(ctx, f.now())
+	// The row may have been repinned or settled since it was claimed; the reset
+	// then moves nothing, and no event says it did.
+	moved, err := f.cfg.Repo.ResetFetchingRow(ctx, h.ev.Key, h.ev.Pin, f.now())
 	if err != nil {
 		if ctx.Err() != nil {
 			return true, ctx.Err()
 		}
 		return true, errors.Join(h.cause, err)
 	}
-	f.held = nil
-	if moved > 0 {
-		f.resetEvent(ctx, h)
+	w.held = nil
+	if moved {
+		// The cause is a database error, which may hold control runes: like every event's Err, it is printable text.
+		f.events(ctx, FetchEvent{Key: h.ev.Key, Pin: h.ev.Pin, From: fleet.CacheFetching, To: fleet.CacheWanted, Err: errors.New(fleet.PrintableText(h.cause.Error()))})
 	}
 	if !firstRetry {
 		return true, nil // the error was returned when the retry failed
 	}
 	return true, fmt.Errorf("the outcome of %s/%s could not be stored twice and the row went back to wanted: %w", h.ev.Key.Entry, h.ev.Key.Arch, h.cause)
-}
-
-// resetEvent emits fetching -> wanted for h's row when a reset left it wanted at
-// h's pin. The reset moves every fetching row, and the row may have been
-// repinned since it was claimed, so the count alone does not say it was this one.
-func (f *Fetcher) resetEvent(ctx context.Context, h *heldOutcome) {
-	row, ok, err := f.cfg.Repo.CacheRow(ctx, h.ev.Key)
-	switch {
-	case err != nil:
-		f.onError(ctx, fmt.Errorf("read %s/%s back after resetting it: %w", h.ev.Key.Entry, h.ev.Key.Arch, err))
-	case ok && row.Pin == h.ev.Pin && row.State == fleet.CacheWanted:
-		f.events(ctx, FetchEvent{Key: h.ev.Key, Pin: h.ev.Pin, From: fleet.CacheFetching, To: fleet.CacheWanted, Err: h.cause})
-	}
 }
 
 // fetchJob is the work on one claimed row.
@@ -369,9 +399,17 @@ type fetchJob struct {
 
 	// downloaded is how many bytes this run received.
 	downloaded int64
+	// reserved is the free space on the spool volume this job holds, counted in
+	// f.reserved until close.
+	reserved uint64
 }
 
+// close releases what the job holds: its free space reservation, whichever way
+// the job ended, and its handle on the spool directory.
 func (j *fetchJob) close(ctx context.Context) {
+	j.f.spaceMu.Lock()
+	j.f.reserved -= j.reserved
+	j.f.spaceMu.Unlock()
 	if j.root != nil {
 		if err := j.root.Close(); err != nil {
 			j.f.onError(ctx, fmt.Errorf("close the spool dir: %w", err))
@@ -464,7 +502,7 @@ func (j *fetchJob) download(ctx context.Context, n int) error {
 		j.progress(ctx, obj.Size, obj.Size)
 		return nil
 	}
-	if err := j.checkSpace(obj.Size); err != nil {
+	if err := j.reserveSpace(obj.Size); err != nil {
 		return err
 	}
 	return j.transfer(ctx, n, have, etag)
@@ -537,21 +575,33 @@ func (j *fetchJob) keepETag(n int, etag string) error {
 	return nil
 }
 
-// checkSpace refuses a download the spool volume has no room for: twice the
-// object (the spool and its extracted copy) and spaceReserve.
-func (j *fetchJob) checkSpace(size int64) error {
-	free, err := j.f.statfs(j.f.cfg.SpoolDir)
-	if err != nil {
-		return fmt.Errorf("free space on the spool volume: %w", err)
-	}
+// reserveSpace refuses a download the spool volume has no room for, and
+// otherwise holds the room for the job until close. The need is twice the
+// object (the spool and its extracted copy) and spaceReserve, and it must fit in
+// what is free less what the other downloads in flight hold, because their
+// bytes are not all on the disk yet. A job that reserved for an earlier object
+// swaps that reservation for this one: those bytes are on the disk by now.
+func (j *fetchJob) reserveSpace(size int64) error {
+	f := j.f
 	// Past this, the need below does not fit in a uint64; no volume holds it.
 	if size > (math.MaxUint64-spaceReserve)/2 {
 		return fmt.Errorf("free space on the spool volume cannot hold a %d byte object", size)
 	}
 	need := 2*uint64(max(size, 0)) + spaceReserve
-	if free < need {
-		return fmt.Errorf("free space on the spool volume is %d bytes, a %d byte object needs %d", free, size, need)
+
+	// ponytail: statfs runs under the lock so check and reserve are one step;
+	// a slow volume delays only other reservations, and a measured delay can move it out.
+	f.spaceMu.Lock()
+	defer f.spaceMu.Unlock()
+	free, err := f.statfs(f.cfg.SpoolDir)
+	if err != nil {
+		return fmt.Errorf("free space on the spool volume: %w", err)
 	}
+	others := f.reserved - j.reserved
+	if free-min(free, others) < need {
+		return fmt.Errorf("free space on the spool volume is %d bytes with %d reserved by other downloads, a %d byte object needs %d", free, others, size, need)
+	}
+	f.reserved, j.reserved = others+need, need
 	return nil
 }
 
