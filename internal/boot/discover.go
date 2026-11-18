@@ -103,9 +103,9 @@ type discoverInput struct {
 
 // parseDiscoverForm validates a /discover form before any I/O. A value over
 // maxValueBytes, a malformed mac or nic<N>_mac, and a report with neither a
-// valid UUID nor a MAC are errors. Identity text goes through cleanText, as
-// /boot's does, so both routes match a machine the same way. Every other text
-// value must be valid UTF-8 without NUL: Manufacturer is stored raw, and the
+// valid UUID nor a MAC are errors. Identity text goes through fleet.CleanText,
+// as /boot's does, so both routes match a machine the same way. Every other
+// text value must be valid UTF-8 without NUL: Manufacturer is stored raw, and the
 // facts are JSON-encoded, which would silently mangle the rest (NUL escaped,
 // invalid UTF-8 replaced). A NIC without a MAC is left out. memsize "" or "0" is
 // stored as "unknown".
@@ -121,7 +121,7 @@ func parseDiscoverForm(form url.Values) (discoverInput, error) {
 	var in discoverInput
 	f := &in.Facts
 	f.UUID = fleet.NormalizeUUID(form.Get("uuid"))
-	f.Serial, f.Product = cleanText(form.Get("serial")), cleanText(form.Get("product"))
+	f.Serial, f.Product = fleet.CleanText(form.Get("serial")), fleet.CleanText(form.Get("product"))
 	var err error
 	if f.MAC, err = optionalMAC(form.Get("mac")); err != nil {
 		return discoverInput{}, err

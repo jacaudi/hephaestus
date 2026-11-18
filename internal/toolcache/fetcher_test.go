@@ -956,6 +956,32 @@ func TestFetcher_TransientFailures(t *testing.T) {
 			sc.tune = func(f *Fetcher) { f.idle = 100 * time.Millisecond }
 			return sc
 		}},
+		{name: "status text with a NUL byte", want: "502", mk: func(t *testing.T, base string) scenario {
+			t.Helper()
+			return liveOf(t, base, func([]byte) http.Handler {
+				return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					hijackSend(t, w, "HTTP/1.1 502 Bad\x00Gateway\r\nContent-Length: 0\r\n\r\n")
+				})
+			})
+		}, check: func(t *testing.T, h *harness, _ catalog.Entry) {
+			t.Helper()
+			if got := h.row(tliveAMD64()).LastError; strings.ContainsRune(got, 0) {
+				t.Errorf("last_error = %q, want it free of NUL", got)
+			}
+		}},
+		{name: "status text over the cause cap", want: "502", mk: func(t *testing.T, base string) scenario {
+			t.Helper()
+			return liveOf(t, base, func([]byte) http.Handler {
+				return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					hijackSend(t, w, "HTTP/1.1 502 "+strings.Repeat("x", 3*fleet.MaxCauseBytes)+"\r\nContent-Length: 0\r\n\r\n")
+				})
+			})
+		}, check: func(t *testing.T, h *harness, _ catalog.Entry) {
+			t.Helper()
+			if got := h.row(tliveAMD64()).LastError; len(got) > fleet.MaxCauseBytes {
+				t.Errorf("last_error is %d bytes, want at most %d", len(got), fleet.MaxCauseBytes)
+			}
+		}},
 		{name: "free space", want: "free space", noRequest: true, mk: func(t *testing.T, base string) scenario {
 			t.Helper()
 			sc := liveOf(t, base, serveObject)

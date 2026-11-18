@@ -58,3 +58,10 @@ func NormalizeMAC(raw string) (string, error) {
 	}
 	return hw.String(), nil
 }
+
+// CleanText removes NUL bytes and invalid UTF-8 from s. Neither database driver
+// stores a string holding NUL, so text that came from the network goes through
+// it before it is stored.
+func CleanText(s string) string {
+	return strings.ToValidUTF8(strings.ReplaceAll(s, "\x00", ""), "")
+}

@@ -609,7 +609,7 @@ func (j *fetchJob) accept(resp *http.Response, n int, have int64) (int64, error)
 		}
 		return have, nil
 	default:
-		return 0, fmt.Errorf("the upstream answered %s", resp.Status)
+		return 0, fmt.Errorf("the upstream answered %q", resp.Status)
 	}
 }
 

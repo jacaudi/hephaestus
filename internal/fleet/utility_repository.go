@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"slices"
 	"time"
+	"unicode/utf8"
 
 	"github.com/uptrace/bun"
 )
@@ -222,11 +223,14 @@ func markReady(ctx context.Context, tx bun.IDB, w FetchWant, at time.Time, from 
 
 // RecordFetchFailure records a failed fetch of the fetching row at f.Pin and
 // returns the row as stored; any other row is returned unchanged. It adds an
-// attempt and the cause. An integrity failure, or the MaxFetchAttempts-th
+// attempt and the cause, stored clean and cut to MaxCauseBytes: its text comes
+// from the network, and a cause the database refused would leave the attempt
+// unrecorded. An integrity failure, or the MaxFetchAttempts-th
 // attempt, breaks the row: it audits utility.broken and clears every boot-next
 // that names the row, machines first. Otherwise the row is failed, due again
 // after Backoff.
 func (r *Repository) RecordFetchFailure(ctx context.Context, f FetchFailure) (CacheRow, error) {
+	f.Cause = storedCause(f.Cause)
 	var out CacheRow
 	err := r.bdb.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
 		var err error
@@ -440,4 +444,18 @@ func wrapIf(what string, err error) error {
 		return nil
 	}
 	return fmt.Errorf("%s: %w", what, err)
+}
+
+// storedCause is cause as a row keeps it: clean text of at most MaxCauseBytes,
+// cut on a rune boundary.
+func storedCause(cause string) string {
+	cause = CleanText(cause)
+	if len(cause) <= MaxCauseBytes {
+		return cause
+	}
+	n := MaxCauseBytes
+	for !utf8.RuneStart(cause[n]) {
+		n--
+	}
+	return cause[:n]
 }

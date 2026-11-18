@@ -46,6 +46,9 @@ const (
 const (
 	// MaxFetchAttempts is the failure that makes a row broken.
 	MaxFetchAttempts = 10
+	// MaxCauseBytes is the longest failure cause a row stores; a longer one is cut
+	// on a rune boundary.
+	MaxCauseBytes = 1 << 10
 	// BackoffBase is the wait after the first failure; each failure doubles it.
 	BackoffBase = time.Minute
 	// BackoffCap is the longest wait between attempts.

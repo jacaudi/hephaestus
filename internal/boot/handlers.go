@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
-	"strings"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -484,14 +483,9 @@ func parseBootQuery(q url.Values) (Request, error) {
 	return Request{
 		UUID:     fleet.NormalizeUUID(q.Get("uuid")),
 		MAC:      mac,
-		Serial:   cleanText(q.Get("serial")),
-		Product:  cleanText(q.Get("product")),
+		Serial:   fleet.CleanText(q.Get("serial")),
+		Product:  fleet.CleanText(q.Get("product")),
 		Arch:     fleet.ArchFromBuildArch(q.Get("arch")),
 		Platform: platform,
 	}, nil
-}
-
-// cleanText removes NUL bytes and invalid UTF-8 from s.
-func cleanText(s string) string {
-	return strings.ToValidUTF8(strings.ReplaceAll(s, "\x00", ""), "")
 }

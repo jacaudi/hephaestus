@@ -1,6 +1,7 @@
 package fleet
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -397,6 +398,29 @@ func runUtilitySuite(t *testing.T, open func(testing.TB) *db.DB) {
 		}
 		if got := auditRows(t, d); len(got) != 0 {
 			t.Fatalf("audit = %+v, want none before the row breaks", got)
+		}
+	})
+
+	t.Run("FailureCauseStoredClean", func(t *testing.T) {
+		tests := []struct {
+			name, cause, want string
+		}{
+			{name: "NUL removed", cause: "502 Bad\x00Gateway", want: "502 BadGateway"},
+			{name: "invalid UTF-8 removed", cause: "bad \xff\xfe byte", want: "bad  byte"},
+			{name: "capped on a byte count", cause: strings.Repeat("x", 3*MaxCauseBytes), want: strings.Repeat("x", MaxCauseBytes)},
+			{name: "capped on a rune boundary", cause: "x" + strings.Repeat("é", MaxCauseBytes), want: "x" + strings.Repeat("é", (MaxCauseBytes-2)/2)},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				d := open(t)
+				r := NewRepository(d)
+				seedCache(t, d, cacheRowIn(k, CacheFetching, t0))
+
+				got := mustFail(t, r, FetchFailure{Key: k, Pin: pinOne, Cause: tt.cause, At: t0})
+				if got.State != CacheFailed || got.Attempts != 1 || got.LastError != tt.want {
+					t.Errorf("RecordFetchFailure = %s, %d attempts, %q; want failed, 1 attempt, %q", got.State, got.Attempts, got.LastError, tt.want)
+				}
+			})
 		}
 	})
 
