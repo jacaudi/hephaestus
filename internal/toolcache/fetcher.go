@@ -87,7 +87,7 @@ type FetchEvent struct {
 	// Class is "" for a change that is not a failure, "integrity" for a failure
 	// no retry can fix and "other" for any other failure.
 	Class string
-	// Err is the failure's cause, with the userinfo, query and fragment of any URL removed.
+	// Err is the failure's cause as printable text, with the userinfo, query and fragment of any URL removed.
 	Err error
 	// Bytes is how many bytes this run downloaded.
 	Bytes    int64
@@ -253,8 +253,9 @@ func (f *Fetcher) runOnce(ctx context.Context) (bool, error) {
 			return true, ctx.Err()
 		}
 		o.ev.Class = classOf(err)
-		o.ev.Err = err
-		o.fail = fleet.FetchFailure{Key: row.Key(), Pin: row.Pin, Cause: err.Error(), Integrity: o.ev.Class == classIntegrity, At: f.now()}
+		cause := fleet.PrintableText(err.Error())
+		o.ev.Err = errors.New(cause)
+		o.fail = fleet.FetchFailure{Key: row.Key(), Pin: row.Pin, Cause: cause, Integrity: o.ev.Class == classIntegrity, At: f.now()}
 		f.failures.Add(ctx, 1, metric.WithAttributes(attribute.String("class", o.ev.Class)))
 		if o.fail.Integrity {
 			job.discard(ctx)

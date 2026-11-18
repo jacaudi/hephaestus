@@ -463,6 +463,20 @@ func runUtilitySuite(t *testing.T, open func(testing.TB) *db.DB) {
 		}
 	})
 
+	t.Run("FailureCauseIsPrintable", func(t *testing.T) {
+		d := open(t)
+		r := NewRepository(d)
+		seedCache(t, d, cacheRowIn(k, CacheFetching, t0))
+
+		got := mustFail(t, r, FetchFailure{Key: k, Pin: pinOne, Cause: "x\u009by\u202ez\u200b", At: t0})
+		if got.LastError != "xyz" {
+			t.Errorf("RecordFetchFailure LastError = %q, want %q", got.LastError, "xyz")
+		}
+		if row, ok, err := r.CacheRow(t.Context(), k); err != nil || !ok || row.LastError != "xyz" {
+			t.Errorf("stored LastError = %q (found %v, err %v), want %q", row.LastError, ok, err, "xyz")
+		}
+	})
+
 	t.Run("TenthFailureBroken", func(t *testing.T) {
 		d := open(t)
 		r := NewRepository(d)

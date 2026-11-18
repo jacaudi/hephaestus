@@ -1002,8 +1002,8 @@ func TestBootNextSet_RowAtAnotherPinIsStale(t *testing.T) {
 // a screen clear and a tab.
 const hostileCause = "the upstream answered 200 \x1b[2J\x1b[1;1H\tdone"
 
-func TestCLI_TextEscapesUpstreamErrors(t *testing.T) {
-	const escaped = `the upstream answered 200 \x1b[2J\x1b[1;1H\tdone`
+func TestCLI_UpstreamErrorsArePrintable(t *testing.T) {
+	const printable = "the upstream answered 200 [2J[1;1Hdone"
 	tests := []struct {
 		name string
 		args []string
@@ -1023,19 +1023,19 @@ func TestCLI_TextEscapesUpstreamErrors(t *testing.T) {
 			if strings.ContainsAny(out, "\x1b\t") {
 				t.Errorf("output holds a raw ESC or TAB:\n%q", out)
 			}
-			if !strings.Contains(out, escaped) {
-				t.Errorf("output lacks the escaped error %q:\n%s", escaped, out)
+			if !strings.Contains(out, printable) {
+				t.Errorf("output lacks the printable error %q:\n%s", printable, out)
 			}
 		})
 	}
 
-	t.Run("JSON keeps the bytes", func(t *testing.T) {
+	t.Run("JSON holds the printable error", func(t *testing.T) {
 		c := newCLITest(t)
 		c.machine(t, 1, fleet.ArchAMD64)
 		c.breakRow(t, "tshell", fleet.ArchAMD64, hostileCause)
 		got := jsonObject(t, c.mustRun(t, "boot-next", "set", cliMAC(1), "tshell", "--json"))["previous_error"]
-		if got != hostileCause {
-			t.Errorf("previous_error = %q, want %q", got, hostileCause)
+		if got != printable {
+			t.Errorf("previous_error = %q, want %q", got, printable)
 		}
 	})
 }
@@ -1138,5 +1138,22 @@ func TestUtilityList_SignedEntryIsNotTOFU(t *testing.T) {
 		if want := row["entry"] == "tlive"; row["tofu"] != want {
 			t.Errorf("%v/%v: tofu = %v, want %v", row["entry"], row["arch"], row["tofu"], want)
 		}
+	}
+}
+
+// TestUtilityList_JSONCauseIsPrintable stores a cause with a C1 control rune
+// through the repository; the JSON listing carries it without that rune.
+func TestUtilityList_JSONCauseIsPrintable(t *testing.T) {
+	c := newCLITest(t)
+	c.breakRow(t, "tshell", fleet.ArchAMD64, "bad\u009b mirror")
+
+	out := c.mustRun(t, "utility", "list", "--json")
+
+	if strings.Contains(out, "\u009b") {
+		t.Errorf("utility list --json holds the U+009B control rune: %q", out)
+	}
+	row := rowFor(t, jsonRows(t, out), "tshell", "amd64")
+	if row["last_error"] != "bad mirror" {
+		t.Errorf("last_error = %q, want %q", row["last_error"], "bad mirror")
 	}
 }

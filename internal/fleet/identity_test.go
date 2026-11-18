@@ -140,3 +140,27 @@ func FuzzNormalizeUUID(f *testing.F) {
 		}
 	})
 }
+
+func TestPrintableText(t *testing.T) {
+	tests := []struct {
+		name, in, want string
+	}{
+		{name: "plain text", in: "plain text", want: "plain text"},
+		{name: "NUL", in: "a\x00b", want: "ab"},
+		{name: "tab CR LF", in: "a\tb\r\n", want: "ab"},
+		{name: "escape sequence", in: "a\x1b[2Jb", want: "a[2Jb"},
+		{name: "C1 control", in: "a\u009bb", want: "ab"},
+		{name: "bidi override", in: "a\u202eb", want: "ab"},
+		{name: "zero width space", in: "a\u200bb", want: "ab"},
+		{name: "line separator", in: "a\u2028b", want: "ab"},
+		{name: "non-ASCII letters kept", in: "café 世", want: "café 世"},
+		{name: "invalid UTF-8", in: "bad\xffutf8", want: "badutf8"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := PrintableText(tt.in); got != tt.want {
+				t.Errorf("PrintableText(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}

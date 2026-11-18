@@ -387,7 +387,7 @@ func prepareUtility(ctx context.Context, logger *slog.Logger, metrics *telemetry
 func logFetchEvent(ctx context.Context, logger *slog.Logger, ev toolcache.FetchEvent) {
 	var cause string
 	if ev.Err != nil {
-		cause = ev.Err.Error()
+		cause = fleet.PrintableText(ev.Err.Error())
 	}
 	logger.InfoContext(ctx, "utility fetch",
 		"entry", ev.Key.Entry, "arch", string(ev.Key.Arch), "pin", ev.Pin,

@@ -1234,3 +1234,20 @@ func TestBootErrorHandler_Level(t *testing.T) {
 		})
 	}
 }
+
+// TestLogFetchEvent_ErrorIsPrintable logs an event whose error holds control
+// and format runes; the logged error carries printable text only.
+func TestLogFetchEvent_ErrorIsPrintable(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+
+	logFetchEvent(t.Context(), logger, toolcache.FetchEvent{Err: errors.New("reset\u009b by\u202e peer\x1b[2J")})
+
+	var rec map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &rec); err != nil {
+		t.Fatalf("log line %q is not JSON: %v", buf.Bytes(), err)
+	}
+	if got, want := rec["error"], "reset by peer[2J"; got != want {
+		t.Errorf("logged error = %q, want %q", got, want)
+	}
+}

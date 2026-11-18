@@ -22,6 +22,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unicode"
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"go.opentelemetry.io/otel/attribute"
@@ -1673,5 +1674,35 @@ func TestDiskFree(t *testing.T) {
 	}
 	if _, err := diskFree(filepath.Join(t.TempDir(), "missing")); err == nil {
 		t.Error("diskFree of a missing path succeeded, want an error")
+	}
+}
+
+// TestFetcher_FailureCauseIsPrintable fails the transfer with an error whose
+// text holds control, format and invalid UTF-8 content. The stored last_error
+// and the emitted event carry printable text only.
+func TestFetcher_FailureCauseIsPrintable(t *testing.T) {
+	client := &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("reset\u009b by\u202e peer\u200b\x00\xff")
+	})}
+	h := newHarness(t, catalogtest.New(t, "https://example.test").Catalog, client)
+	h.request("tlive", "amd64", 0)
+
+	h.fetchOnce()
+
+	row := h.wantRow(tliveAMD64(), fleet.CacheFailed, 1)
+	ev := h.lastEvent()
+	if ev.Err == nil {
+		t.Fatal("event Err = nil, want the failure")
+	}
+	for name, text := range map[string]string{"last_error": row.LastError, "event Err": ev.Err.Error()} {
+		if !strings.Contains(text, "reset by peer") {
+			t.Errorf("%s = %q, want it to keep the printable text", name, text)
+		}
+		for _, r := range text {
+			if !unicode.IsGraphic(r) && r != ' ' {
+				t.Errorf("%s = %q holds the non-printable rune %U", name, text, r)
+				break
+			}
+		}
 	}
 }

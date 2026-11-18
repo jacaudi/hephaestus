@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net"
 	"strings"
+	"unicode"
 )
 
 // uuidLen is the length of a canonical 8-4-4-4-12 UUID.
@@ -64,4 +65,17 @@ func NormalizeMAC(raw string) (string, error) {
 // it before it is stored.
 func CleanText(s string) string {
 	return strings.ToValidUTF8(strings.ReplaceAll(s, "\x00", ""), "")
+}
+
+// PrintableText returns s without invalid UTF-8 and without any rune that
+// unicode.IsGraphic rejects: control, format and separator runes, tab, CR and
+// LF included. The ASCII space stays. Text that came from the network goes
+// through it before it reaches a log, a database row or a terminal.
+func PrintableText(s string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsGraphic(r) {
+			return r
+		}
+		return -1
+	}, strings.ToValidUTF8(s, ""))
 }

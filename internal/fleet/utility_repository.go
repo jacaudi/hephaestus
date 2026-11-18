@@ -452,10 +452,10 @@ func wrapIf(what string, err error) error {
 	return fmt.Errorf("%s: %w", what, err)
 }
 
-// storedCause is cause as a row keeps it: clean text of at most MaxCauseBytes,
+// storedCause is cause as a row keeps it: printable text of at most MaxCauseBytes,
 // cut on a rune boundary.
 func storedCause(cause string) string {
-	cause = CleanText(cause)
+	cause = PrintableText(cause)
 	if len(cause) <= MaxCauseBytes {
 		return cause
 	}
