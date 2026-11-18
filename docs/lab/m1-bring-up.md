@@ -1,6 +1,6 @@
 # M1 lab bring-up: TrueNAS + one amd64 node + the MS-R1
 
-Covers what `task e2e` cannot (design §11):
+This is a task guide to the lab checks that `task e2e` cannot cover (design §11):
 
 - **Lab test 1 (rest):** iPXE 9261ebe validating a real ISRG-rooted chain with internet egress blocked.
 - **Lab test 2:** `${proxydhcp/next-server}` on physical NIC firmware and on the MS-R1 shim path.
@@ -171,3 +171,5 @@ Unblock egress. Leave the app running or stop it; booty stays dormant either way
 | 8 MS-R1: `${proxydhcp/next-server}` populated | | |
 | 8 MS-R1: reaches hold, arch `arm64` | | |
 | 9 proxy mode (optional) | | |
+
+[← Back to README](../../README.md)

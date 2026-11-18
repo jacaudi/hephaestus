@@ -1,5 +1,7 @@
 # iPXE: a TLS 1.3 NewSessionTicket sent before the client Finished corrupts the handshake transcript
 
+This page explains an iPXE TLS 1.3 handshake failure, and records it so it can be filed upstream later.
+
 | | |
 |---|---|
 | Project | iPXE (`github.com/ipxe/ipxe`) |
@@ -80,3 +82,5 @@ In the main checkout, under `.superpowers/sdd/2026-11-16-e2e-harness-implementat
 
 - `SPIKE.md`, the spike report ("Key finding");
 - `progress.final.md`, the ledger.
+
+[← Back to README](../../README.md)

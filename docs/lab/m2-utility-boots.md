@@ -1,6 +1,6 @@
 # M2 lab bring-up: one real boot per utility entry
 
-Covers what `task e2e` cannot (core design §11, M2 design §5.9):
+This is a task guide to the lab checks that `task e2e` cannot cover (core design §11, M2 design §5.9):
 
 - **Lab test 6:** one real boot per catalog entry on matching hardware. e2e proves the mechanism against fixtures in QEMU; only a real boot proves the real kernels, initrds and firmware.
 - **`BOOTIF`:** the operating systems that take it use the NIC the machine booted from. e2e proves only that iPXE expands it.
@@ -221,3 +221,5 @@ Expected: `var absent = map[Key]string{}`. If an entry is listed after a later r
 | 9 grml key expiry read from `grml.asc` | | |
 | 10 `absent` ledger empty (else entry and class) | | |
 | Every `/u/` request 200 or 206, none 404 (systemrescue: list any 404) | | |
+
+[← Back to README](../../README.md)
