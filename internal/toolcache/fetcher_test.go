@@ -2177,3 +2177,196 @@ func TestFetcher_FailureCauseIsPrintable(t *testing.T) {
 		}
 	}
 }
+
+// simClock is a clock the tests move by hand; it is safe for concurrent use.
+type simClock struct{ elapsed atomic.Int64 }
+
+func (c *simClock) Now() time.Time          { return fetchT0().Add(time.Duration(c.elapsed.Load())) }
+func (c *simClock) advance(d time.Duration) { c.elapsed.Add(int64(d)) }
+
+// linkTransport simulates a link of rate bytes per second: every Read of a
+// response body moves the clock on by the time its bytes would take, whatever
+// the real speed of the loopback.
+type linkTransport struct {
+	next http.RoundTripper
+	clk  *simClock
+	rate int64
+}
+
+func (l linkTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := l.next.RoundTrip(req)
+	if err == nil {
+		resp.Body = linkBody{ReadCloser: resp.Body, clk: l.clk, rate: l.rate}
+	}
+	return resp, err
+}
+
+type linkBody struct {
+	io.ReadCloser
+
+	clk  *simClock
+	rate int64
+}
+
+func (b linkBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	b.clk.advance(time.Duration(n) * time.Second / time.Duration(b.rate))
+	return n, err
+}
+
+// simulateLink makes f's downloads run at rate bytes per simulated second, on a
+// clock that moves only with the bytes read.
+func simulateLink(f *Fetcher, rate int64) {
+	clk := &simClock{}
+	f.now = clk.Now
+	f.cfg.Client.Transport = linkTransport{next: f.cfg.Client.Transport, clk: clk, rate: rate}
+}
+
+// floorRun is a fetch of one raw object of size bytes over a link of rate
+// bytes per simulated second, from a spool that holds the object's first
+// spooled bytes.
+func floorRun(t *testing.T, rate int64, size, spooled int) *run {
+	t.Helper()
+	key := fleet.CacheKey{Entry: "tbig", Arch: fleet.ArchAMD64}
+	return runScenario(t, func(t *testing.T, base string) scenario {
+		t.Helper()
+		object := make([]byte, size)
+		for i := range object {
+			object[i] = byte(i % 251)
+		}
+		spec := catalog.Spec{
+			Entry: "tbig", Arch: "amd64", Version: "1", Recipe: catalog.RecipeChain, Platforms: []catalog.Platform{catalog.PlatformEFI},
+			Objects: []catalog.ObjectSpec{{URL: base + "/big.bin", Container: catalog.ContainerRaw, Signature: catalog.Signature{TOFU: true}, Files: []string{"live/vmlinuz"}}},
+			Boot:    catalog.Boot{Kernel: "live/vmlinuz"},
+		}
+		sc := scenario{
+			cat: singleCatalog(t, spec, pinOf(spec, object, map[string][]byte{"live/vmlinuz": object})), key: key, object: object,
+			handler: serveObject(object),
+			tune:    func(f *Fetcher) { simulateLink(f, rate) },
+		}
+		if spooled > 0 {
+			sc.seed = func(t *testing.T, h *harness, e catalog.Entry) {
+				t.Helper()
+				seedSpool(t, h, e, object[:spooled], testETag)
+			}
+		}
+		return sc
+	})
+}
+
+// wantCutOff fails unless the fetch ended in one failed attempt for being too slow.
+func wantCutOff(r *run) {
+	r.t.Helper()
+	row := r.wantRow(r.sc.key, fleet.CacheFailed, 1)
+	if ev := r.lastEvent(); ev.Class != classOther || ev.Err == nil || !strings.Contains(ev.Err.Error(), "32 KiB/s") {
+		r.t.Errorf("last event = %+v, want class %q and an error naming 32 KiB/s", ev, classOther)
+	}
+	if !strings.Contains(row.LastError, "32 KiB/s") {
+		r.t.Errorf("LastError = %q, want it to name 32 KiB/s", row.LastError)
+	}
+}
+
+const floorObject = 8 << 20 // at 64 KiB/s, 128 s: longer than the window
+
+func TestFetcher_FloorCutsTrickle(t *testing.T) {
+	r := floorRun(t, 1<<10, floorObject, 0)
+
+	r.fetchOnce()
+
+	wantCutOff(r)
+}
+
+func TestFetcher_FloorAllowsSteady(t *testing.T) {
+	r := floorRun(t, 64<<10, floorObject, 0)
+
+	r.fetchOnce()
+
+	r.wantRow(r.sc.key, fleet.CacheReady, 0)
+}
+
+// TestFetcher_FloorMeasuresThisTransfer: the spool's floorObject bytes were not
+// received by this transfer, so a fast resume passes, and a slow one is cut off
+// even though its bytes on disk, averaged over its whole run, would clear the
+// floor.
+func TestFetcher_FloorMeasuresThisTransfer(t *testing.T) {
+	tests := []struct {
+		name string
+		rate int64
+		size int
+		cut  bool
+	}{
+		{name: "fast resume", rate: 64 << 10, size: 2 * floorObject},
+		{name: "slow resume", rate: 1 << 10, size: floorObject + 256<<10, cut: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := floorRun(t, tt.rate, tt.size, floorObject)
+
+			r.fetchOnce()
+
+			if seen := r.up.seen(); len(seen) != 1 || seen[0].Range != fmt.Sprintf("bytes=%d-", floorObject) {
+				t.Fatalf("requests = %v, want one for the second half", seen)
+			}
+			if tt.cut {
+				wantCutOff(r)
+				return
+			}
+			r.wantRow(r.sc.key, fleet.CacheReady, 0)
+		})
+	}
+}
+
+func TestFloorReader(t *testing.T) {
+	const perSecond = MinThroughput // bytes in one second at exactly the floor
+	type step struct {
+		at      time.Duration // since the transfer started
+		n       int           // bytes the read returns
+		srcErr  error
+		wantErr error
+	}
+	steady := func(per int, until int) []step {
+		var steps []step
+		for s := 1; s <= until; s++ {
+			steps = append(steps, step{at: time.Duration(s) * time.Second, n: per})
+		}
+		return steps
+	}
+	tests := []struct {
+		name  string
+		steps []step
+	}{
+		{"nothing is judged before the window has run", []step{{at: ThroughputWindow - time.Second, n: 1}}},
+		{"slow when the window has run", []step{{at: time.Minute, n: 1}, {at: ThroughputWindow, n: 1, wantErr: errTooSlow}}},
+		{"exactly the floor passes", steady(perSecond, 200)},
+		{"a byte under the floor is cut off", append(steady(perSecond-1, int(ThroughputWindow/time.Second)-1), step{at: ThroughputWindow, n: perSecond - 1, wantErr: errTooSlow})},
+		{"a burst older than the window does not count", []step{
+			{at: time.Second, n: 4 << 20},
+			{at: ThroughputWindow, n: 1}, // the burst is still inside the last window
+			{at: ThroughputWindow + time.Second, n: 1, wantErr: errTooSlow},
+		}},
+		{"a read that ends the body is not judged", []step{{at: time.Minute, n: 1}, {at: 3 * ThroughputWindow, srcErr: io.EOF, wantErr: io.EOF}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var clk simClock
+			var n int
+			var srcErr error
+			fr := newFloorReader(readerFunc(func([]byte) (int, error) { return n, srcErr }), clk.Now)
+			buf := make([]byte, 4<<20)
+			var last time.Duration
+			for i, s := range tt.steps {
+				clk.advance(s.at - last)
+				last, n, srcErr = s.at, s.n, s.srcErr
+
+				got, err := fr.Read(buf)
+
+				if !errors.Is(err, s.wantErr) {
+					t.Fatalf("step %d (at %s): Read = %d, %v; want error %v", i, s.at, got, err, s.wantErr)
+				}
+				if got != s.n {
+					t.Fatalf("step %d: Read returned %d bytes, want %d", i, got, s.n)
+				}
+			}
+		})
+	}
+}

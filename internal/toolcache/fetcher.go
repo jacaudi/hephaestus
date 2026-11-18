@@ -36,6 +36,13 @@ const (
 	// abandoned. It restarts on every read that makes progress; it is not a
 	// total timeout.
 	IdleTimeout = 60 * time.Second
+	// MinThroughput is the least the upstream must send, in bytes per second,
+	// averaged over ThroughputWindow. An upstream that sends a byte just often
+	// enough to keep the idle timeout from firing would otherwise hold a worker
+	// for good. It is not configurable.
+	MinThroughput = 32 << 10
+	// ThroughputWindow is the span MinThroughput is averaged over.
+	ThroughputWindow = 2 * time.Minute
 
 	// DefaultFetchWorkers is how many downloads run at once when
 	// FetcherConfig.Workers is 0.
@@ -70,6 +77,11 @@ var errUnparsableLocation = errors.New("unparsable Location header")
 // errIdle is why a download was cancelled: no data arrived within the idle
 // timeout.
 var errIdle = errors.New("idle timeout: no data from the upstream")
+
+// errTooSlow is why a download was abandoned: the upstream sent fewer than
+// MinThroughput bytes per second over ThroughputWindow. It is not an integrity
+// failure; a retry may meet a faster server.
+var errTooSlow = fmt.Errorf("the upstream sent fewer than %d KiB/s over %s", MinThroughput>>10, ThroughputWindow)
 
 // FetcherConfig is what a Fetcher works on. Every field but Workers is required.
 type FetcherConfig struct {
@@ -638,7 +650,9 @@ func (j *fetchJob) transfer(ctx context.Context, n int, have int64, etag string)
 	}
 	body := newIdleReader(resp.Body, j.f.idle, cancel)
 	defer body.Stop()
-	return j.write(ctx, body, n, offset)
+	// The floor counts only what this response sends, never the offset's bytes
+	// that an earlier attempt left in the spool.
+	return j.write(ctx, newFloorReader(body, j.f.now), n, offset)
 }
 
 // accept checks the response to object n's request against the pin and returns
@@ -835,6 +849,62 @@ func (i *idleReader) Read(p []byte) (int, error) {
 
 // Stop ends the idle timer.
 func (i *idleReader) Stop() { i.timer.Stop() }
+
+// floorSampleEvery is how often a floorReader keeps a sample of its running
+// total; it bounds the samples to about one window's worth.
+const floorSampleEvery = time.Second
+
+type floorSample struct {
+	at    time.Time
+	total int64
+}
+
+// floorReader fails a Read with errTooSlow once the transfer has run at least
+// ThroughputWindow and the bytes received in the last ThroughputWindow are
+// fewer than MinThroughput times its seconds. It counts only the bytes it
+// returns, and reads time from now.
+type floorReader struct {
+	r     io.Reader
+	now   func() time.Time
+	start time.Time
+	total int64
+	// samples holds the running total at the times it was last kept, oldest
+	// first. The first is the latest one at or before the window's start.
+	samples []floorSample
+}
+
+// newFloorReader wraps r and starts the transfer's clock.
+func newFloorReader(r io.Reader, now func() time.Time) *floorReader {
+	start := now()
+	return &floorReader{r: r, now: now, start: start, samples: []floorSample{{at: start}}}
+}
+
+// Read implements io.Reader. A Read that returns an error, the end of the body
+// included, is not judged. The bytes of the Read that fails are still returned.
+func (f *floorReader) Read(p []byte) (int, error) {
+	n, err := f.r.Read(p)
+	f.total += int64(n)
+	if err != nil {
+		return n, err
+	}
+	now := f.now()
+	if now.Sub(f.samples[len(f.samples)-1].at) >= floorSampleEvery {
+		f.samples = append(f.samples, floorSample{at: now, total: f.total})
+	}
+	if now.Sub(f.start) < ThroughputWindow {
+		return n, nil
+	}
+	cutoff := now.Add(-ThroughputWindow)
+	for len(f.samples) > 1 && !f.samples[1].at.After(cutoff) {
+		f.samples = f.samples[1:]
+	}
+	// ponytail: samples are a second apart, so the window may run up to a second
+	// past ThroughputWindow, in the upstream's favour; exact bucketing if that matters.
+	if f.total-f.samples[0].total < MinThroughput*int64(ThroughputWindow/time.Second) {
+		return n, errTooSlow
+	}
+	return n, nil
+}
 
 // integrityf returns an *IntegrityError for a failure the retry cannot fix.
 func integrityf(format string, args ...any) error {
