@@ -1157,3 +1157,24 @@ func TestUtilityList_JSONCauseIsPrintable(t *testing.T) {
 		t.Errorf("last_error = %q, want %q", row["last_error"], "bad mirror")
 	}
 }
+
+// TestUtilityList_TextEscapesLegacyCause seeds a last_error with a raw ESC and
+// TAB by SQL: storage now strips them, but a row written before that change
+// still holds them, and the text listing must show them escaped.
+func TestUtilityList_TextEscapesLegacyCause(t *testing.T) {
+	c := newCLITest(t)
+	c.breakRow(t, "tshell", fleet.ArchAMD64, "placeholder")
+	q := "UPDATE utility_cache SET last_error = ? WHERE entry = 'tshell' AND arch = 'amd64'"
+	if _, err := c.d.Bun().ExecContext(t.Context(), q, "legacy \x1b[2J\tmirror"); err != nil {
+		t.Fatalf("seed last_error: %v", err)
+	}
+
+	out := c.mustRun(t, "utility", "list")
+
+	if strings.ContainsAny(out, "\x1b\t") {
+		t.Errorf("utility list holds a raw ESC or TAB:\n%q", out)
+	}
+	if want := `legacy \x1b[2J\tmirror`; !strings.Contains(out, want) {
+		t.Errorf("utility list lacks the escaped cause %q:\n%s", want, out)
+	}
+}

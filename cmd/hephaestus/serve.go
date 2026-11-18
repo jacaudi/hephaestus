@@ -249,7 +249,10 @@ func runServe(ctx context.Context, cfg serveConfig, logger *slog.Logger, deps se
 	rc := toolcache.ReconcileConfig{
 		Repo: repo, Store: content, Catalog: deps.catalog, SpoolDir: filepath.Join(cfg.DataDir, "spool"), At: time.Now(),
 	}
-	fetcher, err := prepareUtility(ctx, logger, metrics, rc, deps.client)
+	fc := toolcache.FetcherConfig{
+		Repo: rc.Repo, Store: rc.Store, Catalog: rc.Catalog, Client: deps.client, SpoolDir: rc.SpoolDir, Workers: cfg.FetchWorkers,
+	}
+	fetcher, err := prepareUtility(ctx, logger, metrics, rc, fc)
 	if err != nil {
 		return err
 	}
@@ -352,8 +355,8 @@ func bootErrorHandler(logger *slog.Logger) func(context.Context, error) {
 // catalog, and collects the garbage of tags that are no longer current, logging
 // what each changed. A reconciliation failure is returned; a spool sweep or a
 // collection failure is logged at Warn and startup goes on. It returns the
-// fetcher over the same rows, store and spool, not yet started.
-func prepareUtility(ctx context.Context, logger *slog.Logger, metrics *telemetry.Metrics, rc toolcache.ReconcileConfig, client *http.Client) (*toolcache.Fetcher, error) {
+// fetcher built from fc, over the same rows, store and spool as rc, not yet started.
+func prepareUtility(ctx context.Context, logger *slog.Logger, metrics *telemetry.Metrics, rc toolcache.ReconcileConfig, fc toolcache.FetcherConfig) (*toolcache.Fetcher, error) {
 	rep, err := toolcache.Reconcile(ctx, rc)
 	if err != nil {
 		return nil, fmt.Errorf("reconcile utility cache: %w", err)
@@ -373,7 +376,7 @@ func prepareUtility(ctx context.Context, logger *slog.Logger, metrics *telemetry
 	}
 
 	return toolcache.NewFetcher(
-		toolcache.FetcherConfig{Repo: rc.Repo, Store: rc.Store, Catalog: rc.Catalog, Client: client, SpoolDir: rc.SpoolDir},
+		fc,
 		toolcache.WithMeter(metrics.Meter()),
 		toolcache.WithEvents(func(ctx context.Context, ev toolcache.FetchEvent) { logFetchEvent(ctx, logger, ev) }),
 		toolcache.WithErrorHandler(func(ctx context.Context, err error) {

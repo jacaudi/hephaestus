@@ -111,6 +111,9 @@ func TestLoadConfig_Defaults(t *testing.T) {
 	if want := slog.LevelInfo; got.LogLevel != want {
 		t.Errorf("LogLevel = %v, want %v", got.LogLevel, want)
 	}
+	if want := 4; got.FetchWorkers != want {
+		t.Errorf("FetchWorkers = %d, want %d", got.FetchWorkers, want)
+	}
 	if want := "sqlite:" + filepath.Join(dir, "hephaestus.db"); got.DatabaseURL.Expose() != want {
 		t.Errorf("DatabaseURL = %q, want %q", got.DatabaseURL.Expose(), want)
 	}
@@ -208,6 +211,10 @@ func TestLoadConfig_Invalid(t *testing.T) {
 		{"trusted prefix is everything", proxyModeEnv(map[string]string{"PROXY_TRUSTED": "127.0.0.0/8,0.0.0.0/0"}), "HEPHAESTUS_PROXY_TRUSTED prefix 0.0.0.0/0 contains the provisioning subnet 10.10.20.0/24"},
 		{"IPv4-mapped trusted prefix contains the subnet", proxyModeEnv(map[string]string{"PROXY_TRUSTED": "::ffff:10.10.0.0/112"}), "HEPHAESTUS_PROXY_TRUSTED prefix 10.10.0.0/16 contains the provisioning subnet 10.10.20.0/24"},
 		{"zero grace", map[string]string{"SHUTDOWN_GRACE": "0s"}, "HEPHAESTUS_SHUTDOWN_GRACE must be positive"},
+		{"zero fetch workers", map[string]string{"FETCH_WORKERS": "0"}, "HEPHAESTUS_FETCH_WORKERS 0: must be between 1 and 16"},
+		{"too many fetch workers", map[string]string{"FETCH_WORKERS": "17"}, "HEPHAESTUS_FETCH_WORKERS 17: must be between 1 and 16"},
+		{"negative fetch workers", map[string]string{"FETCH_WORKERS": "-1"}, "HEPHAESTUS_FETCH_WORKERS -1: must be between 1 and 16"},
+		{"fetch workers not a number", map[string]string{"FETCH_WORKERS": "four"}, `HEPHAESTUS_FETCH_WORKERS "four": must be a whole number`},
 		{"xml logs", map[string]string{"LOG_FORMAT": "xml"}, `HEPHAESTUS_LOG_FORMAT "xml": must be json or text`},
 		{"bad level", map[string]string{"LOG_LEVEL": "loud"}, "decode config"},
 	}
@@ -383,6 +390,31 @@ func TestLoadConfig_Normalizes(t *testing.T) {
 	}
 	if got.DatabaseURL.Expose() != postgresURL {
 		t.Errorf("DatabaseURL = %q, want %q", got.DatabaseURL.Expose(), postgresURL)
+	}
+}
+
+func TestLoadConfig_FetchWorkers(t *testing.T) {
+	tests := []struct {
+		env  string
+		want int
+	}{
+		{"1", 1},
+		{"2", 2},
+		{"16", 16},
+	}
+	for _, tt := range tests {
+		t.Run(tt.env, func(t *testing.T) {
+			setMinimalEnv(t)
+			t.Setenv("HEPHAESTUS_FETCH_WORKERS", tt.env)
+
+			got, err := load(t)
+			if err != nil {
+				t.Fatalf("loadConfig: %v", err)
+			}
+			if got.FetchWorkers != tt.want {
+				t.Errorf("FetchWorkers = %d, want %d", got.FetchWorkers, tt.want)
+			}
+		})
 	}
 }
 

@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1106,6 +1107,83 @@ func TestRunServe_FetchFailureDoesNotStopServe(t *testing.T) {
 		if probe := get(t, client, deps.adminURL()+"/readyz"); probe.status != http.StatusOK {
 			t.Fatalf("GET /readyz after the failed fetch = %d, want 200", probe.status)
 		}
+	}
+	stop()
+	if err := waitDone(t, done, 10*time.Second); err != nil {
+		t.Errorf("runServe after cancel = %v, want nil", err)
+	}
+}
+
+// TestRunServe_FetchWorkersBoundsConcurrentDownloads pins that serve builds the
+// fetcher with cfg.FetchWorkers. serveDeps has no fetcher seam, so it is seen
+// through the upstream: with 2 workers and 3 wanted rows against upstreams that
+// block, exactly 2 downloads start and the third row waits until one is done.
+func TestRunServe_FetchWorkersBoundsConcurrentDownloads(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	up := newUtilityUpstream()
+	defer up.Close()
+	fx := catalogtest.New(t, up.URL)
+	objects := serveObjects(up.URL, fx.Objects)
+	arrived, release := make(chan string, 4), make(chan struct{})
+	var releaseOnce sync.Once
+	open := func() { releaseOnce.Do(func() { close(release) }) }
+	defer open() // runs before up.Close, which waits for the blocked handlers
+	up.serve(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		arrived <- r.URL.Path
+		select {
+		case <-release:
+			objects.ServeHTTP(w, r)
+		case <-r.Context().Done():
+		}
+	}))
+
+	cfg, root := testServeConfig(t)
+	cfg.FetchWorkers = 2
+	deps := testDeps(t, root)
+	deps.catalog, deps.client = fx.Catalog, up.client()
+	repo, closeDB := openCache(t, cfg)
+	defer closeDB()
+	keys := []fleet.CacheKey{
+		tshellAMD64Key(),
+		{Entry: "tlive", Arch: fleet.ArchAMD64},
+		{Entry: "tlive", Arch: fleet.ArchARM64},
+	}
+	for _, key := range keys {
+		entry, _ := fx.Catalog.Lookup(key.Entry, string(key.Arch))
+		if _, err := repo.RequestFetch(t.Context(), key, entry.Pin.ID, 0, time.Now()); err != nil {
+			t.Fatalf("RequestFetch(%v): %v", key, err)
+		}
+	}
+	stop, done := startServe(t, cfg, discardLogger(), deps)
+	waitStatus(t, deps.adminURL()+"/readyz", done)
+
+	for range cfg.FetchWorkers {
+		select {
+		case <-arrived:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("fewer than %d downloads reached the upstream, want one per worker", cfg.FetchWorkers)
+		}
+	}
+	select {
+	case path := <-arrived:
+		t.Fatalf("a third download (%s) reached the upstream with %d workers busy", path, cfg.FetchWorkers)
+	case <-time.After(300 * time.Millisecond):
+	}
+	states := map[fleet.CacheState]int{}
+	for _, key := range keys {
+		row, _, err := repo.CacheRow(t.Context(), key)
+		if err != nil {
+			t.Fatalf("CacheRow(%v): %v", key, err)
+		}
+		states[row.State]++
+	}
+	if states[fleet.CacheFetching] != 2 || states[fleet.CacheWanted] != 1 {
+		t.Errorf("row states = %v, want 2 fetching and 1 wanted", states)
+	}
+
+	open()
+	for _, key := range keys {
+		waitCacheState(t, repo, key, fleet.CacheReady, 10*time.Second)
 	}
 	stop()
 	if err := waitDone(t, done, 10*time.Second); err != nil {

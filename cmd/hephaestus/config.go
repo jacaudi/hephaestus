@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 
 	"go.jacaudi.dev/hephaestus/internal/db"
 	"go.jacaudi.dev/hephaestus/internal/secret"
+	"go.jacaudi.dev/hephaestus/internal/toolcache"
 )
 
 // The values of HEPHAESTUS_TLS_MODE: where the boot HTTPS service gets TLS.
@@ -59,6 +61,11 @@ type rawConfig struct {
 		Address string   `mapstructure:"address"`
 		Trusted []string `mapstructure:"trusted"`
 	} `mapstructure:"proxy"`
+	Fetch struct {
+		// Workers is a string so that a non-number is reported under its
+		// environment variable, not as a decode error of "fetch.workers".
+		Workers string `mapstructure:"workers"`
+	} `mapstructure:"fetch"`
 	ShutdownGrace time.Duration `mapstructure:"shutdown_grace"`
 	Log           struct {
 		Format string     `mapstructure:"format"`
@@ -83,6 +90,8 @@ type serveConfig struct {
 	ShutdownGrace           time.Duration
 	LogFormat               string
 	LogLevel                slog.Level
+	// FetchWorkers is how many utility downloads run at once, 1 to toolcache.MaxFetchWorkers.
+	FetchWorkers int
 }
 
 // loadConfig reads the bootstrap configuration from the HEPHAESTUS_ environment
@@ -101,6 +110,7 @@ func loadConfig(fs *pflag.FlagSet, addrsOf interfaceAddrs) (serveConfig, error) 
 	v.SetDefault("admin.address", "127.0.0.1:9090")
 	v.SetDefault("data.dir", "/var/lib/hephaestus")
 	v.SetDefault("tls.mode", tlsModeFile)
+	v.SetDefault("fetch.workers", toolcache.DefaultFetchWorkers)
 	v.SetDefault("shutdown_grace", 60*time.Second)
 	v.SetDefault("log.format", "json")
 	v.SetDefault("log.level", "info")
@@ -154,6 +164,9 @@ func (r rawConfig) validate(addrsOf interfaceAddrs) (serveConfig, error) {
 		}
 	}
 
+	cfg.FetchWorkers, err = validateFetchWorkers(r.Fetch.Workers)
+	errs = append(errs, err)
+
 	cfg.ShutdownGrace = r.ShutdownGrace
 	if cfg.ShutdownGrace <= 0 {
 		errs = append(errs, errors.New("HEPHAESTUS_SHUTDOWN_GRACE must be positive"))
@@ -169,6 +182,18 @@ func (r rawConfig) validate(addrsOf interfaceAddrs) (serveConfig, error) {
 		return serveConfig{}, err
 	}
 	return cfg, nil
+}
+
+// validateFetchWorkers parses raw as a whole number from 1 to toolcache.MaxFetchWorkers.
+func validateFetchWorkers(raw string) (int, error) {
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("HEPHAESTUS_FETCH_WORKERS %q: must be a whole number", raw)
+	}
+	if n < 1 || n > toolcache.MaxFetchWorkers {
+		return 0, fmt.Errorf("HEPHAESTUS_FETCH_WORKERS %d: must be between 1 and %d", n, toolcache.MaxFetchWorkers)
+	}
+	return n, nil
 }
 
 // validateFQDN lowercases fqdn and requires at least two DNS labels, 253 bytes at most.

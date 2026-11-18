@@ -24,6 +24,7 @@ task build
 | `HEPHAESTUS_DATA_DIR` | `/var/lib/hephaestus` | Absolute path for state |
 | `HEPHAESTUS_DATABASE_URL` | `sqlite:<data dir>/hephaestus.db` | `sqlite:/abs/path.db` or `postgres://...` |
 | `HEPHAESTUS_SHUTDOWN_GRACE` | `60s` | Time allowed to drain in-flight requests on SIGINT or SIGTERM |
+| `HEPHAESTUS_FETCH_WORKERS` | `4` | How many utility downloads run at once (1–16); see [Operations: utility content](#operations-utility-content) |
 | `HEPHAESTUS_LOG_LEVEL` | `info` | `slog` level |
 | `HEPHAESTUS_LOG_FORMAT` | `json` | `json` or `text` (the `--log-format` flag wins) |
 
@@ -167,7 +168,9 @@ Shell access to the container is the authorization; the CLI has no network surfa
 
 **Artifact route.** A booted utility fetches its files from `GET /u/<entry>/<arch>/<version>/<path>` over plain HTTP on port 80, by design, with Range support. It serves a file only when the tag's layer has the digest and size the catalog pins for that path; any other layer, a missing one included, is a 404 that also puts a `ready` row back to `wanted`.
 
-**A fetch needs free space** on the spool volume: twice the object's size plus a 1 GiB reserve. The data directory also holds the database, so `/health` warns on `disk:data_dir` below 10% free.
+**Parallel downloads.** `HEPHAESTUS_FETCH_WORKERS` (default 4, 1 to 16) is how many entries `serve` downloads at once; an invalid value stops `serve` at startup. The setting is read at startup, so a change takes a restart. An upstream that averages under 32 KiB/s over 2 minutes is cut off and the row fails and is retried with backoff, so a slow mirror cannot hold a worker for good.
+
+**A fetch needs free space** on the spool volume: twice the object's size plus a 1 GiB reserve, held for as long as the download is in flight. A new download starts only when the free space, less what the other downloads in flight hold, covers its own need; otherwise it fails and is retried with backoff. The data directory also holds the database, so `/health` warns on `disk:data_dir` below 10% free.
 
 **When the store is moved aside.** If `index.json` cannot be decoded or has the wrong type, if the `oci-layout` version is unsupported, if a digest is malformed, or if a manifest does not match its digest or is truncated, `serve` renames `<data>/store` to `store.corrupt-<UTC time>`, logs one `store was unusable; moved aside` line at Error with the new path, starts an empty store and refetches. Any other failure, a permission or I/O error included, stops `serve` with that error and moves nothing. An empty `index.json` is not corruption: the store resets it in place and keeps its blobs.
 
