@@ -620,6 +620,45 @@ func TestFetcher_AlreadyInStoreShortcut(t *testing.T) {
 	r.wantSpool()
 }
 
+// TestFetcher_UnreadableStoreFailsTheAttempt pins that content the store cannot
+// read is not content it lacks: the claim-time check fails the attempt in the
+// default class and downloads nothing, as the other store checks do.
+func TestFetcher_UnreadableStoreFailsTheAttempt(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores file modes")
+	}
+	var fx catalogtest.Fixture
+	r := runScenario(t, func(t *testing.T, base string) scenario {
+		t.Helper()
+		fx = catalogtest.New(t, base)
+		return scenario{cat: fx.Catalog, key: tliveAMD64(), fx: fx, handler: objectsAt(base, fx.Objects)}
+	})
+	catalogtest.Stock(t, r.store, fx, catalog.Key{Entry: "tlive", Arch: "amd64"})
+	manifest, err := r.store.Resolve(t.Context(), r.e.Tag())
+	if err != nil {
+		t.Fatalf("Resolve(%s): %v", r.e.Tag(), err)
+	}
+	blob := filepath.Join(r.storeDir, ocispec.ImageBlobsDir, manifest.Digest.Algorithm().String(), manifest.Digest.Encoded())
+	if err := os.Chmod(blob, 0o000); err != nil {
+		t.Fatalf("chmod manifest blob: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chmod(blob, 0o444); err != nil {
+			t.Errorf("restore manifest blob mode: %v", err)
+		}
+	})
+
+	r.fetchOnce()
+
+	r.wantRow(tliveAMD64(), fleet.CacheFailed, 1)
+	if ev := r.lastEvent(); ev.To != fleet.CacheFailed || ev.Class != "other" {
+		t.Errorf("last event = %+v, want To failed, Class other", ev)
+	}
+	if got := r.up.seen(); len(got) != 0 {
+		t.Errorf("the upstream saw %d requests, want 0: %v", len(got), got)
+	}
+}
+
 func TestFetcher_NewRequiresClient(t *testing.T) {
 	d := dbtest.SQLite(t)
 	st, _, err := store.Open(t.Context(), filepath.Join(t.TempDir(), "store"), fetchT0)

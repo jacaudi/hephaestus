@@ -392,8 +392,13 @@ func (j *fetchJob) run(ctx context.Context) error {
 		return fmt.Errorf("%s/%s is not in the catalog at this pin %q", j.row.Entry, j.row.Arch, j.row.Pin)
 	}
 	j.entry = e
-	if j.f.cfg.Store.CheckLayers(ctx, e.Tag()) == nil {
+	// Only lost content is fetched again: content the store cannot read is not
+	// content it lacks, so that fails the attempt without a download.
+	switch err := j.f.cfg.Store.CheckLayers(ctx, e.Tag()); {
+	case err == nil:
 		return nil
+	case !store.ContentLost(err):
+		return fmt.Errorf("check %s before fetching it: %w", e.Tag(), err)
 	}
 
 	var layers []ocispec.Descriptor
