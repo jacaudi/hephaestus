@@ -11,6 +11,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/oras-project/oras-go/v3"
@@ -39,12 +40,15 @@ var ErrNotFound = fmt.Errorf("store: %w", errdef.ErrNotFound)
 
 // Store is an OCI image layout on disk. Blobs are pushed with PushBlob,
 // tagged with TagArtifact and read back with OpenBlob. Its methods may be
-// called concurrently, except PushBlob for one digest whose blob is on disk at
-// the wrong size: two such calls race on the repair, so callers serialise them
-// (serve runs one fetch at a time).
+// called concurrently; PushBlob serialises the pushes of one digest itself.
 type Store struct {
 	root string
 	oci  *oci.Store
+
+	// pushMu guards pushing: one mutex per digest ever pushed, held by PushBlob
+	// from its size check to the end of its push.
+	pushMu  sync.Mutex
+	pushing map[digest.Digest]*sync.Mutex
 }
 
 // Layer returns the descriptor of a layer holding a file: media type
@@ -191,8 +195,16 @@ func (s *Store) blobSize(d digest.Digest) (int64, error) {
 // read. A blob on disk at another size is a truncated leftover: oras keeps any
 // existing file, so it is unlinked first (that needs only write permission on
 // the directory, not on the 0444 file) and pushed again. A concurrent push of
-// the same blob is not an error.
+// the same blob is not an error: pushes of one digest take turns, because the
+// size check, the unlink and the push are one repair, and a second repair that
+// unlinked the first one's blob would leave it missing while the second still
+// writes. Pushes of different digests run together.
 func (s *Store) PushBlob(ctx context.Context, desc ocispec.Descriptor, r io.Reader) error {
+	if _, err := blobRel(desc.Digest); err != nil {
+		return err
+	}
+	unlock := s.lockPush(desc.Digest)
+	defer unlock()
 	size, err := s.blobSize(desc.Digest)
 	switch {
 	case err != nil && !errors.Is(err, fs.ErrNotExist):
@@ -208,6 +220,24 @@ func (s *Store) PushBlob(ctx context.Context, desc ocispec.Descriptor, r io.Read
 		return fmt.Errorf("push blob %s: %w", desc.Digest, err)
 	}
 	return nil
+}
+
+// lockPush takes the push lock of d, which the returned function releases.
+// ponytail: a mutex stays in the map for every digest pushed, a few per catalog
+// entry, so it is not freed; a reference count would if digests ever churn.
+func (s *Store) lockPush(d digest.Digest) (unlock func()) {
+	s.pushMu.Lock()
+	if s.pushing == nil {
+		s.pushing = map[digest.Digest]*sync.Mutex{}
+	}
+	m, ok := s.pushing[d]
+	if !ok {
+		m = &sync.Mutex{}
+		s.pushing[d] = m
+	}
+	s.pushMu.Unlock()
+	m.Lock()
+	return m.Unlock
 }
 
 // removeBlob unlinks a blob file; one that is already gone is not an error.

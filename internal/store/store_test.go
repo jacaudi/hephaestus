@@ -262,6 +262,51 @@ func TestPushBlob_ReplacesWrongSized(t *testing.T) {
 	}
 }
 
+// TestPushBlob_ConcurrentRepairs repairs one wrong-sized blob from several
+// pushes at once, as parallel fetches of two entries that share a file do. Each
+// push must succeed, and the blob must be whole the moment its push returns: a
+// push that removed the repair another push had just made would leave it
+// missing while the second push is still writing.
+func TestPushBlob_ConcurrentRepairs(t *testing.T) {
+	const rounds, pushers = 300, 16
+	data := bytes.Repeat([]byte("kernel bytes "), 1<<10)
+	for round := range rounds {
+		s, root := newStore(t)
+		desc := pushLayer(t, s, "boot/vmlinuz", data)
+		path := blobFile(root, desc)
+		truncateBlob(t, path)
+		start := make(chan struct{})
+		errs := make(chan error, pushers)
+		for range pushers {
+			go func() {
+				<-start
+				if err := s.PushBlob(t.Context(), desc, bytes.NewReader(data)); err != nil {
+					errs <- err
+					return
+				}
+				fi, err := os.Stat(path)
+				if err == nil && fi.Size() != desc.Size {
+					err = fmt.Errorf("blob has %d bytes, want %d", fi.Size(), desc.Size)
+				}
+				errs <- err
+			}()
+		}
+		close(start)
+		for range pushers {
+			if err := <-errs; err != nil {
+				t.Fatalf("round %d: a push returned and left %v", round, err)
+			}
+		}
+		got, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("round %d: read the repaired blob: %v", round, err)
+		}
+		if int64(len(got)) != desc.Size || sha256Hex(got) != desc.Digest.Encoded() {
+			t.Fatalf("round %d: repaired blob has %d bytes and sha256 %s, want %d bytes and %s", round, len(got), sha256Hex(got), desc.Size, desc.Digest.Encoded())
+		}
+	}
+}
+
 func TestCheckLayers(t *testing.T) {
 	tests := []struct {
 		name   string
