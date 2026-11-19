@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hephaestus M3: making reinstall work with halt_if_installed</title>
+<style>
+  :root { --ink:#1b1f24; --muted:#59636e; --line:#d0d7de; --bg:#ffffff; --panel:#f6f8fa; --rec:#1a7f37; --warn:#9a6700; --bad:#cf222e; --hl:#fff8c5; --bar:#8c959f; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:24px 16px 48px; font:16px/1.5 -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; color:var(--ink); background:var(--bg); }
+  main { max-width:1180px; margin:0 auto; }
+  h1 { font-size:24px; line-height:1.25; margin:0 0 8px; }
+  h2 { font-size:20px; margin:0 0 4px; }
+  h3 { font-size:16px; margin:16px 0 6px; }
+  p { margin:0 0 12px; }
+  .lede { color:var(--muted); margin-bottom:20px; }
+  .grid { display:grid; grid-template-columns:1fr; gap:20px; }
+  @media (min-width: 900px) { .grid { grid-template-columns:1fr 1fr 1fr; } }
+  .opt { border:1px solid var(--line); border-radius:8px; padding:16px; background:var(--bg); min-width:0; }
+  .opt.rec { border:2px solid var(--rec); }
+  .tag { display:inline-block; font-size:13px; font-weight:600; padding:2px 8px; border-radius:12px; margin-bottom:8px; }
+  .tag.rec { background:#dafbe1; color:var(--rec); }
+  .tag.alt { background:#fff1e5; color:var(--warn); }
+  .ms { border:1px solid var(--line); background:var(--panel); border-radius:6px; padding:10px 12px; margin:0 0 6px; overflow-wrap:anywhere; }
+  .ms h3 { margin:0 0 6px; }
+  .ms ul { margin:0 0 8px; padding-left:18px; font-size:14px; }
+  .ms .ships { background:var(--hl); border:1px solid #d4a72c; border-radius:4px; padding:6px 8px; font-size:14px; }
+  .arrow { color:var(--muted); font-size:14px; padding:0 0 0 14px; margin:-2px 0 4px; }
+  .count { display:flex; align-items:baseline; gap:6px; margin:0 0 4px; }
+  .count b { font-size:18px; }
+  .count span { font-size:14px; color:var(--muted); }
+  .bar { height:8px; border-radius:4px; background:var(--bar); margin:0 0 8px; }
+  .bar.over { background:var(--bad); }
+  .ref { border-top:2px dashed var(--muted); margin:2px 0 0; font-size:13px; color:var(--muted); padding-top:2px; }
+  code { font:13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; background:#eff1f3; padding:1px 4px; border-radius:4px; overflow-wrap:anywhere; }
+  .pros, .cons { margin:4px 0 0; padding-left:20px; font-size:15px; }
+  .pros li::marker { color:var(--rec); }
+  .cons li::marker { color:var(--bad); }
+  .note { font-size:14px; color:var(--muted); margin-top:16px; }
+  .shared { border:1px solid var(--line); border-radius:8px; padding:16px; margin-bottom:20px; background:var(--panel); }
+  .shared ul { margin:0; padding-left:20px; }
+  .scale { display:grid; grid-template-columns:auto 1fr; gap:4px 10px; align-items:center; font-size:14px; max-width:520px; }
+  .scale .bar { margin:0; }
+</style>
+<style>
+  @media (min-width: 900px) { .grid { grid-template-columns:1fr 1fr; } }
+  .flow { list-style:none; margin:0 0 8px; padding:0; }
+  .flow li { border:1px solid var(--line); background:var(--panel); border-radius:6px; padding:8px 10px; margin:0 0 6px; overflow-wrap:anywhere; }
+  .flow li.arrow { border:none; background:none; padding:0 0 0 14px; margin:-2px 0 4px; color:var(--muted); font-size:14px; }
+  .flow li.hl { background:var(--hl); border-color:#d4a72c; }
+  .flow li.bad { background:#ffebe9; border-color:#ff8182; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Reinstall: The Install Script's Safety Flag Blocks It</h1>
+  <p class="lede">Found by the design gate and checked in source. The install script (core §5.2) always sets <code>talos.halt_if_installed=1</code>, so a network boot never reinstalls over a working node by accident. Talos v1.12.11 halts when that flag is set and <code>Installed()</code> is true (<code>v1alpha1_sequencer.go</code>), and <code>Installed()</code> means the META partition exists (<code>v1alpha1_state.go:226</code>). Topf <code>70cdbc8</code>'s <code>reset</code> wipes only STATE and EPHEMERAL when <code>--full</code> is false (<code>internal/cmd/reset/reset.go:21-23, 76-81</code>), so META survives then. <b>Corrected after design-gate pass 2:</b> <code>--full</code> defaults to <b>true</b> (<code>cmd/topf/reset.go</code>, env <code>TOPF_FULL</code>), so a default <code>topf reset</code> already wipes META. The hazard below is <code>topf reset --full=false</code>; this page first said the default kept META, which was wrong.</p>
+
+  <section class="shared">
+    <h2>Today's Design, Example talos-04-wrk</h2>
+    <ol class="flow">
+      <li><code>topf reset --full=false</code> → STATE and EPHEMERAL wiped, META kept</li>
+      <li><code>hephaestus machine reinstall 52:54:00:e2:e0:03 --topf-reset-done</code> → <code>assigned</code></li>
+      <li class="arrow">↓ reboot, network boot, row 10: install script with <code>talos.halt_if_installed=1</code></li>
+      <li class="bad">Talos sees META → halts. Every boot, forever. The recovery path M3 ships does not recover.</li>
+    </ol>
+  </section>
+
+  <div class="grid">
+    <section class="opt rec">
+      <span class="tag rec">A · recommended</span>
+      <h2>Keep The Flag; Reinstall Needs A Full Reset</h2>
+      <ol class="flow">
+        <li class="hl"><code>topf reset</code> (default <code>--full=true</code>) → every partition wiped, META included</li>
+        <li class="hl"><code>machine reinstall 52:54:00:e2:e0:03 --topf-reset-full-done</code> → <code>assigned</code></li>
+        <li class="arrow">↓ network boot, same install script as every install</li>
+        <li>No META → Talos installs → <code>installing</code></li>
+      </ol>
+      <ul class="pros">
+        <li>One install script; the flag still guards every other path into <code>assigned</code></li>
+        <li>A reinstall starts from a clean disk, which is what a reinstall is for</li>
+        <li>The flag name says which reset was run, so the CLI cannot be satisfied by the wrong one</li>
+      </ul>
+      <ul class="cons">
+        <li>A full wipe of the system disk, not only STATE and EPHEMERAL</li>
+      </ul>
+    </section>
+
+    <section class="opt">
+      <span class="tag alt">B</span>
+      <h2>Drop The Flag After Reinstall Or Abort</h2>
+      <ol class="flow">
+        <li><code>topf reset --full=false</code> → META kept</li>
+        <li><code>machine reinstall … --topf-reset-done</code> → <code>assigned</code>, marked "entered by reinstall"</li>
+        <li class="hl">Install script omits <code>talos.halt_if_installed</code> for that machine's next install</li>
+        <li>Talos boots the network image and installs over the existing install</li>
+      </ol>
+      <ul class="pros">
+        <li>Also tolerates <code>--full=false</code></li>
+      </ul>
+      <ul class="cons">
+        <li>Two script variants and a new "how it entered assigned" field</li>
+        <li>Installing over a kept META is unverified; it needs its own lab test</li>
+        <li>Removes the safety net exactly where a machine is known to hold an install</li>
+      </ul>
+    </section>
+  </div>
+  <p class="note">Either way, lab test 3 gains this reinstall case on real hardware.</p>
+</main>
+</body>
+</html>

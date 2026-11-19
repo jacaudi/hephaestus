@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hephaestus M3: which control commands ship before the UI</title>
+<style>
+  :root { --ink:#1b1f24; --muted:#59636e; --line:#d0d7de; --bg:#ffffff; --panel:#f6f8fa; --rec:#1a7f37; --warn:#9a6700; --bad:#cf222e; --hl:#fff8c5; --bar:#8c959f; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:24px 16px 48px; font:16px/1.5 -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; color:var(--ink); background:var(--bg); }
+  main { max-width:1180px; margin:0 auto; }
+  h1 { font-size:24px; line-height:1.25; margin:0 0 8px; }
+  h2 { font-size:20px; margin:0 0 4px; }
+  h3 { font-size:16px; margin:16px 0 6px; }
+  p { margin:0 0 12px; }
+  .lede { color:var(--muted); margin-bottom:20px; }
+  .grid { display:grid; grid-template-columns:1fr; gap:20px; }
+  @media (min-width: 900px) { .grid { grid-template-columns:1fr 1fr 1fr; } }
+  .opt { border:1px solid var(--line); border-radius:8px; padding:16px; background:var(--bg); min-width:0; }
+  .opt.rec { border:2px solid var(--rec); }
+  .tag { display:inline-block; font-size:13px; font-weight:600; padding:2px 8px; border-radius:12px; margin-bottom:8px; }
+  .tag.rec { background:#dafbe1; color:var(--rec); }
+  .tag.alt { background:#fff1e5; color:var(--warn); }
+  .ms { border:1px solid var(--line); background:var(--panel); border-radius:6px; padding:10px 12px; margin:0 0 6px; overflow-wrap:anywhere; }
+  .ms h3 { margin:0 0 6px; }
+  .ms ul { margin:0 0 8px; padding-left:18px; font-size:14px; }
+  .ms .ships { background:var(--hl); border:1px solid #d4a72c; border-radius:4px; padding:6px 8px; font-size:14px; }
+  .arrow { color:var(--muted); font-size:14px; padding:0 0 0 14px; margin:-2px 0 4px; }
+  .count { display:flex; align-items:baseline; gap:6px; margin:0 0 4px; }
+  .count b { font-size:18px; }
+  .count span { font-size:14px; color:var(--muted); }
+  .bar { height:8px; border-radius:4px; background:var(--bar); margin:0 0 8px; }
+  .bar.over { background:var(--bad); }
+  .ref { border-top:2px dashed var(--muted); margin:2px 0 0; font-size:13px; color:var(--muted); padding-top:2px; }
+  code { font:13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; background:#eff1f3; padding:1px 4px; border-radius:4px; overflow-wrap:anywhere; }
+  .pros, .cons { margin:4px 0 0; padding-left:20px; font-size:15px; }
+  .pros li::marker { color:var(--rec); }
+  .cons li::marker { color:var(--bad); }
+  .note { font-size:14px; color:var(--muted); margin-top:16px; }
+  .shared { border:1px solid var(--line); border-radius:8px; padding:16px; margin-bottom:20px; background:var(--panel); }
+  .shared ul { margin:0; padding-left:20px; }
+  .scale { display:grid; grid-template-columns:auto 1fr; gap:4px 10px; align-items:center; font-size:14px; max-width:520px; }
+  .scale .bar { margin:0; }
+</style>
+<style>
+  .grid2 { display:grid; grid-template-columns:1fr; gap:20px; }
+  @media (min-width: 900px) { .grid2 { grid-template-columns:1fr 1fr; } }
+  table { border-collapse:collapse; width:100%; font-size:14px; }
+  th, td { border:1px solid var(--line); padding:6px 8px; text-align:left; vertical-align:top; }
+  th { background:var(--panel); }
+  td.yes { color:var(--rec); font-weight:600; }
+  td.no { color:var(--bad); }
+  .tbl td, .tbl th { white-space:normal; }
+  .tbl td:first-child { white-space:nowrap; }
+  @media (max-width: 700px) { .tbl table, .tbl tbody, .tbl tr, .tbl td { display:block; width:100%; } .tbl tr:first-child { display:none; } .tbl tr { border:1px solid var(--line); border-radius:6px; margin:0 0 8px; } .tbl td { border:none; padding:3px 8px; white-space:normal !important; } .tbl td::before { content:attr(data-l); color:var(--muted); font-weight:400; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>M3: Which Machine Commands Ship Before The UI?</h1>
+  <p class="lede">The core design gives every caller of <code>fleet.Transition</code> to M4's UI. M3 is the first milestone that installs Talos, so some of those callers must arrive now as CLI commands, run inside the container like M2's <code>boot-next</code>. Every trigger below already exists and is tested in <code>internal/fleet/transition.go</code>; a command is a thin wrapper that M4's buttons later share. Examples use the home-ops hosts: talos-01-cp, talos-03-cp, r230-t02, talos-04-wrk, talos-05-wrk (arm64), Talos v1.12.11.</p>
+
+  <section class="shared">
+    <h2>The Same In Both Options: Cluster Commands</h2>
+    <ul>
+      <li><code>hephaestus cluster import home-ops --repo &lt;git url&gt; --ref main --path talos --credential ref+op://homelab/gitlab-deploy/token</code></li>
+      <li><code>hephaestus cluster list</code> · <code>cluster diff home-ops</code> (each host's redacted diff for the pending pair, and "secret values changed") · <code>cluster approve home-ops &lt;pair id&gt;</code> · <code>cluster refresh home-ops</code></li>
+      <li><code>hephaestus machine list</code> and <code>machine show &lt;mac|uuid&gt;</code>, read-only, with <code>--json</code> like every M2 command</li>
+    </ul>
+  </section>
+
+  <div class="tbl"><table>
+    <tr><th>Command</th><th>Trigger (already in fleet)</th><th>Needed for</th><th>A: all admin triggers</th><th>B: install path only</th></tr>
+    <tr><td data-l="Command: "><code>machine approve 52:54:00:e2:e0:03 home-ops/talos-04-wrk</code></td><td data-l="Trigger: ">approve</td><td data-l="Needed for: ">First install</td><td data-l="A: " class="yes">M3</td><td data-l="B: " class="yes">M3</td></tr>
+    <tr><td data-l="Command: "><code>machine adopt &lt;mac|uuid&gt; home-ops/talos-01-cp</code></td><td data-l="Trigger: ">adopt, adopt_by_uuid</td><td data-l="Needed for: ">Cut-over runbook step 3</td><td data-l="A: " class="yes">M3</td><td data-l="B: " class="yes">M3</td></tr>
+    <tr><td data-l="Command: "><code>machine mark-installed &lt;…&gt;</code></td><td data-l="Trigger: ">mark_installed</td><td data-l="Needed for: ">Finishing an install</td><td data-l="A: " class="yes">M3</td><td data-l="B: " class="yes">M3</td></tr>
+    <tr><td data-l="Command: "><code>unknown-action set hold</code> (lists unbound hosts, asks to confirm)</td><td data-l="Trigger: ">SetUnknownAction</td><td data-l="Needed for: ">Cut-over runbook step 4</td><td data-l="A: " class="yes">M3</td><td data-l="B: " class="yes">M3</td></tr>
+    <tr><td data-l="Command: "><code>machine abort &lt;…&gt;</code></td><td data-l="Trigger: ">abort_install</td><td data-l="Needed for: ">Retrying a failed install</td><td data-l="A: " class="yes">M3</td><td data-l="B: " class="no">M4</td></tr>
+    <tr><td data-l="Command: "><code>machine reinstall &lt;…&gt; --topf-reset-full-done</code></td><td data-l="Trigger: ">reinstall</td><td data-l="Needed for: ">Rebuilding a node</td><td data-l="A: " class="yes">M3</td><td data-l="B: " class="no">M4</td></tr>
+    <tr><td data-l="Command: "><code>machine unassign</code>, <code>unbind</code>, <code>rebind</code></td><td data-l="Trigger: ">unassign, unbind, rebind</td><td data-l="Needed for: ">Moving a machine between hosts</td><td data-l="A: " class="yes">M3</td><td data-l="B: " class="no">M4</td></tr>
+    <tr><td data-l="Command: "><code>machine cordon</code>, <code>uncordon</code></td><td data-l="Trigger: ">cordon, uncordon</td><td data-l="Needed for: ">Holding a machine</td><td data-l="A: " class="yes">M3</td><td data-l="B: " class="no">M4</td></tr>
+    <tr><td data-l="Command: "><code>machine local-only</code>, <code>reject</code>, <code>forget</code> (and their undo)</td><td data-l="Trigger: ">mark/unmark_local_only, reject, unreject, forget</td><td data-l="Needed for: ">Cut-over step 3 (non-Talos machines)</td><td data-l="A: " class="yes">M3</td><td data-l="B: " class="no">M4</td></tr>
+  </table></div>
+
+  <div class="grid2" style="margin-top:20px">
+    <section class="opt rec">
+      <span class="tag rec">A · recommended</span>
+      <h2>Every Admin Trigger Gets A Command</h2>
+      <div class="ms">
+        <h3>talos-04-wrk's install writes to the wrong disk</h3>
+        <ul>
+          <li>Talos fetched <code>/config</code> (ticket consumed) and installed; its next <code>/boot</code> recorded <code>install-unconfirmed</code> (row 6)</li>
+          <li>Fix the node patch, <code>cluster approve</code>, run <code>topf reset --full</code>, then <code>machine reinstall 52:54:00:e2:e0:03 --topf-reset-full-done</code> → <code>assigned</code></li>
+          <li>Reboot: the next <code>/boot</code> mints a new ticket and installs again</li>
+        </ul>
+        <div class="ships">You can recover from any state at a shell, before M4 exists.</div>
+      </div>
+      <div class="count"><b>+2</b><span>tasks over B (est.)</span></div>
+      <ul class="pros">
+        <li>The whole cut-over runbook runs, including marking non-Talos machines local-only</li>
+        <li>No state you can enter but not leave</li>
+      </ul>
+      <ul class="cons">
+        <li>More commands to test now; M4 then only adds buttons</li>
+      </ul>
+    </section>
+
+    <section class="opt">
+      <span class="tag alt">B</span>
+      <h2>Only The Install Path</h2>
+      <div class="ms">
+        <h3>The same failed install</h3>
+        <ul>
+          <li>It is <code>install-unconfirmed</code>; there is no <code>reinstall</code> command</li>
+          <li>Row 6 answers <code>exit</code> on every boot, so it keeps booting the bad install</li>
+          <li>Way out: hand-edit the database, or wait for M4</li>
+        </ul>
+        <div class="ships">The happy path works; failures are stuck until M4.</div>
+      </div>
+      <div class="count"><b>0</b><span>extra tasks</span></div>
+      <ul class="pros">
+        <li>Smallest M3</li>
+      </ul>
+      <ul class="cons">
+        <li>States you can enter but not leave without SQL</li>
+        <li>Cut-over step 3 cannot mark booty-era non-Talos machines local-only</li>
+      </ul>
+    </section>
+  </div>
+  <p class="note">Network control stays out in both: the admin listener remains read-only and no control endpoint is reachable over the network (core §6, M2's choice A).</p>
+</main>
+</body>
+</html>

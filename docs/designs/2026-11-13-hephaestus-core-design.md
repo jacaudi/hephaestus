@@ -5,7 +5,10 @@ Updated 2026-11-15 to match M1 as built: the Milestones section, and the M1 note
 touch. Also 2026-11-15 (owner): the in-process Let's Encrypt client is dropped. TLS comes from certificate files that an
 external tool writes and renews, or from a TLS-terminating reverse proxy (§5.10); the data key returns with its consumers
 in M3 (D25). Also 2026-11-16: M2 is now utility boots, and the Talos prefetch, `assets_ready` and the `/v2/` mirror moved to
-M3 (see the M2 design, `2026-11-16-hephaestus-m2-utility-boot-design.md`).
+M3 (see the M2 design, `2026-11-16-hephaestus-m2-utility-boot-design.md`). Also 2026-11-19 (owner): M3 is split into M3 "First Talos
+Install" and M3b "Offline Installs and Preseed", native clusters move to M4, and the admin CLI gains every fleet trigger in
+M3. Every change this makes to the sections below is listed in §8 of the M3 design
+(`2026-11-18-hephaestus-m3-first-install-design.md`), which is authoritative where this text differs.
 Research and decision record: [`docs/research/booty-slim/reference.md`](../research/booty-slim/reference.md) (sources S1–S11
 under `docs/research/booty-slim/sources/`).
 - `D<n>` cites a decision from that record.
@@ -74,13 +77,19 @@ The goals above are built in four milestones. This section says what each contai
 - **M2: utility boots.** The content store, the pinned utility catalog (D7's verifiable 7) and utility-OS boots, driven
   by an admin CLI (§5.6), with the `store`, `catalog` and `toolcache` packages. Design:
   `docs/designs/2026-11-16-hephaestus-m2-utility-boot-design.md`.
-- **M3: clusters.** Clusters, render, secrets, `/config` and tickets (§5.4–5.6, §6); Talos prefetch, `assets_ready` and
-  Talos reconciliation, the `/v2/` mirror and the runtime GC quiet window (§5.6); the Talos install script; the data
-  key (its `datakey` package exists, and nothing reads the key before M3) and the 1Password token; host binding and the create-on-adopt path (§5.2); the machinery assertion and the Topf parity test in CI.
+- **M3: First Talos Install.** Git-imported clusters, render, secrets, `/config` and tickets (§5.4–5.6, §6); Talos boot-asset
+  prefetch, `assets_ready` and Talos reconciliation (§5.6); the Talos install script; the data key and the 1Password
+  token; host binding and the create-on-adopt path (§5.2); the admin CLI for every fleet trigger and for clusters; blob
+  and manifest durability; the machinery assertion and the Topf parity test in CI. Design:
+  `docs/designs/2026-11-18-hephaestus-m3-first-install-design.md`.
+- **M3b: Offline Installs and Preseed.** The installer image index, the `/v2/` mirror, Talos pins and the runtime GC
+  quiet window (§5.6), and the Talos preseed: the latest patch of the three newest minors, amd64 and arm64, plain
+  schematic, kept current by a release watcher, with a maintenance-mode boot-next target (owner, 2026-11-18).
 - **M4: auth, UI and operations.** `web` and `auth` (§5.7, §5.8); `hephaestus backup` and `admin recover` (§5.9); the
   menu-preview endpoint; the alert evaluators and surfaces that need the UI (§5.9), including the `/start`-without-`/boot`
-  alert and certificate-expiry alerting beyond the `/health` warning; and the callers of `Transition` and
-  `SetUnknownAction` (§5.2).
+  alert and certificate-expiry alerting beyond the `/health` warning; native clusters (create, the 1Password writer,
+  the YAML editor, export; §5.4, owner 2026-11-18); and UI buttons over the `fleet` and `clusters` functions the M3 CLI
+  already calls.
 - **After M2: Alpine aarch64** (D18, the owner's option A, after its spike; §5.6). `zfs-lts` is out of v1.
 
 Inputs owned by a later milestone already exist as inputs in M1: the decision function takes boot-next, readiness and

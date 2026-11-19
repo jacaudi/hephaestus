@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hephaestus M3: where the Talos preseed lands</title>
+<style>
+  :root { --ink:#1b1f24; --muted:#59636e; --line:#d0d7de; --bg:#ffffff; --panel:#f6f8fa; --rec:#1a7f37; --warn:#9a6700; --bad:#cf222e; --hl:#fff8c5; --bar:#8c959f; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:24px 16px 48px; font:16px/1.5 -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; color:var(--ink); background:var(--bg); }
+  main { max-width:1180px; margin:0 auto; }
+  h1 { font-size:24px; line-height:1.25; margin:0 0 8px; }
+  h2 { font-size:20px; margin:0 0 4px; }
+  h3 { font-size:16px; margin:16px 0 6px; }
+  p { margin:0 0 12px; }
+  .lede { color:var(--muted); margin-bottom:20px; }
+  .grid { display:grid; grid-template-columns:1fr; gap:20px; }
+  @media (min-width: 900px) { .grid { grid-template-columns:1fr 1fr 1fr; } }
+  .opt { border:1px solid var(--line); border-radius:8px; padding:16px; background:var(--bg); min-width:0; }
+  .opt.rec { border:2px solid var(--rec); }
+  .tag { display:inline-block; font-size:13px; font-weight:600; padding:2px 8px; border-radius:12px; margin-bottom:8px; }
+  .tag.rec { background:#dafbe1; color:var(--rec); }
+  .tag.alt { background:#fff1e5; color:var(--warn); }
+  .ms { border:1px solid var(--line); background:var(--panel); border-radius:6px; padding:10px 12px; margin:0 0 6px; overflow-wrap:anywhere; }
+  .ms h3 { margin:0 0 6px; }
+  .ms ul { margin:0 0 8px; padding-left:18px; font-size:14px; }
+  .ms .ships { background:var(--hl); border:1px solid #d4a72c; border-radius:4px; padding:6px 8px; font-size:14px; }
+  .arrow { color:var(--muted); font-size:14px; padding:0 0 0 14px; margin:-2px 0 4px; }
+  .count { display:flex; align-items:baseline; gap:6px; margin:0 0 4px; }
+  .count b { font-size:18px; }
+  .count span { font-size:14px; color:var(--muted); }
+  .bar { height:8px; border-radius:4px; background:var(--bar); margin:0 0 8px; }
+  .bar.over { background:var(--bad); }
+  .ref { border-top:2px dashed var(--muted); margin:2px 0 0; font-size:13px; color:var(--muted); padding-top:2px; }
+  code { font:13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; background:#eff1f3; padding:1px 4px; border-radius:4px; overflow-wrap:anywhere; }
+  .pros, .cons { margin:4px 0 0; padding-left:20px; font-size:15px; }
+  .pros li::marker { color:var(--rec); }
+  .cons li::marker { color:var(--bad); }
+  .note { font-size:14px; color:var(--muted); margin-top:16px; }
+  .shared { border:1px solid var(--line); border-radius:8px; padding:16px; margin-bottom:20px; background:var(--panel); }
+  .shared ul { margin:0; padding-left:20px; }
+  .scale { display:grid; grid-template-columns:auto 1fr; gap:4px 10px; align-items:center; font-size:14px; max-width:520px; }
+  .scale .bar { margin:0; }
+</style>
+<style>
+  table { border-collapse:collapse; width:100%; font-size:14px; }
+  th, td { border:1px solid var(--line); padding:6px 8px; text-align:left; vertical-align:top; }
+  th { background:var(--panel); }
+  .tbl { overflow-x:auto; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Talos Preseed: Which Milestone Builds It?</h1>
+  <p class="lede">Your request: keep the latest patch of the three newest Talos minors cached for amd64 and arm64, plain schematic (no extensions). A new patch replaces the old one; a new minor drops the oldest. Your two uses: boot any machine into Talos maintenance mode on demand, and install with nothing to fetch at approval.</p>
+
+  <section class="shared">
+    <h2>What It Would Hold Today (factory.talos.dev/versions, 2026-11-18)</h2>
+    <div class="tbl"><table>
+      <tr><th>Version</th><th>amd64 boot assets</th><th>arm64 boot assets</th><th>Installer image (both arches)</th></tr>
+      <tr><td>v1.14.6</td><td>kernel + initramfs</td><td>kernel + initramfs</td><td>plain installer index</td></tr>
+      <tr><td>v1.13.12</td><td>kernel + initramfs</td><td>kernel + initramfs</td><td>plain installer index</td></tr>
+      <tr><td>v1.12.12</td><td>kernel + initramfs</td><td>kernel + initramfs</td><td>plain installer index</td></tr>
+    </table></div>
+    <p class="note">Boot assets: about 100 MB amd64 and 92 MB arm64 per version (measured on v1.12.11), about 580 MB in all. v1.15.0-beta.0 is left out as a pre-release (my call). A timer polls <code>/versions</code> over TLS 1.3 to notice new patches and minors.</p>
+    <h3>The Two Uses</h3>
+    <ol class="flow">
+      <li><b>Maintenance boot:</b> <code>hephaestus boot-next set 52:54:00:e2:e0:03 talos-1.14</code> → row 3 boots v1.14.6's kernel and initramfs with no <code>talos.config</code> → Talos waits in maintenance mode for <code>talosctl apply-config --insecure</code>. A new boot-next target beside the utilities. Needs only the boot assets.</li>
+      <li><b>Install with nothing to fetch:</b> a host whose cluster uses the plain schematic at a preseeded version is <code>assets_ready</code> the moment it is approved. Needs the boot assets <em>and</em> the installer image, which is served by the <code>/v2/</code> mirror (M3b). A host with extensions (a different schematic) still fetches at approval.</li>
+    </ol>
+  </section>
+
+  <div class="grid">
+    <section class="opt rec">
+      <span class="tag rec">A · recommended</span>
+      <h2>All Of It In M3b</h2>
+      <div class="ms">
+        <h3>M3 · First Talos Install</h3>
+        <div class="count"><b>~18</b><span>tasks (est.), unchanged</span></div>
+        <h3 style="margin-top:10px">M3b · Offline Installs And Preseed</h3>
+        <div class="count"><b>~12</b><span>tasks (est.), up from ~8</span></div>
+        <ul>
+          <li>Release watcher, boot-asset and installer preseed</li>
+          <li>Maintenance boot-next target</li>
+          <li>Bumps garbage-collected by the runtime GC built there</li>
+        </ul>
+        <div class="ships">Both uses work the day M3b merges, offline.</div>
+      </div>
+      <ul class="pros">
+        <li>M3 stays M1-sized, the reason for the split</li>
+        <li>A bump's old version is collected at runtime, by the GC M3b already builds</li>
+      </ul>
+      <ul class="cons">
+        <li>Maintenance boot waits one milestone</li>
+      </ul>
+    </section>
+
+    <section class="opt">
+      <span class="tag alt">B</span>
+      <h2>Boot Assets In M3, Installers In M3b</h2>
+      <div class="ms">
+        <h3>M3 · First Talos Install</h3>
+        <div class="count"><b>~22</b><span>tasks (est.)</span></div>
+        <ul><li>+ release watcher, boot-asset preseed, maintenance target</li></ul>
+        <h3 style="margin-top:10px">M3b · Offline Installs</h3>
+        <div class="count"><b>~9</b><span>tasks (est.)</span></div>
+        <ul><li>+ installer preseed</li></ul>
+        <div class="ships">Maintenance boot works at M3; install-with-nothing-to-fetch at M3b.</div>
+      </div>
+      <ul class="pros">
+        <li>Maintenance boot one milestone sooner</li>
+      </ul>
+      <ul class="cons">
+        <li>M3 grows past M1's 18</li>
+        <li>Until M3b, a bump's old version lingers until the next restart's GC</li>
+      </ul>
+    </section>
+
+    <section class="opt">
+      <span class="tag alt">C</span>
+      <h2>All Of It In M3</h2>
+      <div class="ms">
+        <h3>M3 · First Talos Install</h3>
+        <div class="count"><b>~25</b><span>tasks (est.)</span></div>
+        <div class="bar over" style="width:100%"></div>
+        <ul><li>Installer preseed has nothing to serve it until the mirror exists</li></ul>
+        <div class="ships">Cached installers sit idle until M3b.</div>
+      </div>
+      <ul class="pros">
+        <li>Preseed done in one place</li>
+      </ul>
+      <ul class="cons">
+        <li>Undoes the split's sizing; ships idle content</li>
+      </ul>
+    </section>
+  </div>
+  <p class="note">To check in the lab: a PXE-booted Talos on a machine that already has Talos installed may pick up the installed config rather than stay in maintenance mode. The install script sets <code>talos.halt_if_installed=1</code> for this reason; whether the maintenance target should too is a design question once the placement is settled.</p>
+</main>
+</body>
+</html>

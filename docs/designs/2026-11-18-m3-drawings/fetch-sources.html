@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hephaestus M3: how Talos downloads join the fetcher</title>
+<style>
+  :root { --ink:#1b1f24; --muted:#59636e; --line:#d0d7de; --bg:#ffffff; --panel:#f6f8fa; --rec:#1a7f37; --warn:#9a6700; --bad:#cf222e; --hl:#fff8c5; --bar:#8c959f; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:24px 16px 48px; font:16px/1.5 -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; color:var(--ink); background:var(--bg); }
+  main { max-width:1180px; margin:0 auto; }
+  h1 { font-size:24px; line-height:1.25; margin:0 0 8px; }
+  h2 { font-size:20px; margin:0 0 4px; }
+  h3 { font-size:16px; margin:16px 0 6px; }
+  p { margin:0 0 12px; }
+  .lede { color:var(--muted); margin-bottom:20px; }
+  .grid { display:grid; grid-template-columns:1fr; gap:20px; }
+  @media (min-width: 900px) { .grid { grid-template-columns:1fr 1fr 1fr; } }
+  .opt { border:1px solid var(--line); border-radius:8px; padding:16px; background:var(--bg); min-width:0; }
+  .opt.rec { border:2px solid var(--rec); }
+  .tag { display:inline-block; font-size:13px; font-weight:600; padding:2px 8px; border-radius:12px; margin-bottom:8px; }
+  .tag.rec { background:#dafbe1; color:var(--rec); }
+  .tag.alt { background:#fff1e5; color:var(--warn); }
+  .ms { border:1px solid var(--line); background:var(--panel); border-radius:6px; padding:10px 12px; margin:0 0 6px; overflow-wrap:anywhere; }
+  .ms h3 { margin:0 0 6px; }
+  .ms ul { margin:0 0 8px; padding-left:18px; font-size:14px; }
+  .ms .ships { background:var(--hl); border:1px solid #d4a72c; border-radius:4px; padding:6px 8px; font-size:14px; }
+  .arrow { color:var(--muted); font-size:14px; padding:0 0 0 14px; margin:-2px 0 4px; }
+  .count { display:flex; align-items:baseline; gap:6px; margin:0 0 4px; }
+  .count b { font-size:18px; }
+  .count span { font-size:14px; color:var(--muted); }
+  .bar { height:8px; border-radius:4px; background:var(--bar); margin:0 0 8px; }
+  .bar.over { background:var(--bad); }
+  .ref { border-top:2px dashed var(--muted); margin:2px 0 0; font-size:13px; color:var(--muted); padding-top:2px; }
+  code { font:13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; background:#eff1f3; padding:1px 4px; border-radius:4px; overflow-wrap:anywhere; }
+  .pros, .cons { margin:4px 0 0; padding-left:20px; font-size:15px; }
+  .pros li::marker { color:var(--rec); }
+  .cons li::marker { color:var(--bad); }
+  .note { font-size:14px; color:var(--muted); margin-top:16px; }
+  .shared { border:1px solid var(--line); border-radius:8px; padding:16px; margin-bottom:20px; background:var(--panel); }
+  .shared ul { margin:0; padding-left:20px; }
+  .scale { display:grid; grid-template-columns:auto 1fr; gap:4px 10px; align-items:center; font-size:14px; max-width:520px; }
+  .scale .bar { margin:0; }
+</style>
+<style>
+  @media (min-width: 900px) { .grid { grid-template-columns:1fr 1fr; } }
+  table { border-collapse:collapse; width:100%; font-size:13px; }
+  th, td { border:1px solid var(--line); padding:5px 7px; text-align:left; vertical-align:top; overflow-wrap:anywhere; }
+  th { background:var(--panel); }
+  td.new { background:var(--hl); }
+  .tbl { overflow-x:auto; margin:0 0 8px; }
+  @media (min-width: 701px) { .tbl td:first-child { white-space:nowrap; overflow-wrap:normal; } }
+  .flow { list-style:none; margin:0 0 8px; padding:0; }
+  .flow li { border:1px solid var(--line); background:var(--panel); border-radius:6px; padding:8px 10px; margin:0 0 6px; overflow-wrap:anywhere; }
+  .flow li.arrow { border:none; background:none; padding:0 0 0 14px; margin:-2px 0 4px; color:var(--muted); font-size:14px; }
+  .flow li.hl { background:var(--hl); border-color:#d4a72c; }
+  @media (max-width: 700px) { .tbl table, .tbl tbody, .tbl tr, .tbl td { display:block; width:100%; } .tbl tr:first-child { display:none; } .tbl tr { border:1px solid var(--line); border-radius:6px; margin:0 0 8px; } .tbl td { border:none; padding:3px 8px; } .tbl td::before { content:attr(data-l); color:var(--muted); } }
+</style>
+</head>
+<body>
+<main>
+  <h1>M3: How Talos Downloads Join The Fetcher</h1>
+  <p class="lede">The handoff's constraint: Talos prefetch reuses the existing pool, so there is no second fetcher. Today the pool (<code>internal/toolcache/fetcher.go</code>) claims only <code>utility_cache</code> rows, looks each up in the compiled-in catalog, downloads whole objects, checks pinned hashes, extracts files and tags them. A Talos download differs in four ways: its URL is built from (schematic, version, arch); it goes through a one-hour signed redirect; nothing is pinned, so the sha256 is recorded at the first fetch; and nothing is extracted. M3b then adds a third kind, installer images, which are registry pulls rather than file downloads. Highlighted = new.</p>
+
+  <section class="shared">
+    <h2>Shared By Both Options</h2>
+    <ul>
+      <li>One pool of <code>HEPHAESTUS_FETCH_WORKERS</code> (default 4), one space-reservation ledger (2× the object size, 1 GiB margin counted once), one 32 KiB/s floor, resume with <code>Range</code> + <code>If-Range</code>, and every blob fsynced in <code>store.PushBlob</code> (your choice A).</li>
+      <li>Claim order (my call): armed boot-next utilities first (priority 1, as today), then Talos assets for <code>assigned</code> machines, then everything else, oldest first.</li>
+      <li><code>store.ContentLost</code> stays the only lost-content test; startup reconciliation recomputes <code>assets_ready</code> from the store.</li>
+    </ul>
+    <h3>Rows After talos-04-wrk Is Approved</h3>
+    <div class="tbl"><table>
+      <tr><th>table</th><th>key</th><th>state</th><th>integrity</th><th>tag</th></tr>
+      <tr><td data-l="table: ">utility_cache</td><td data-l="key: ">systemrescue / amd64, pin 377eddae20f4</td><td data-l="state: ">ready</td><td data-l="integrity: ">sha256 pinned in the binary</td><td data-l="tag: ">utility/systemrescue-amd64:377eddae20f4</td></tr>
+      <tr><td data-l="table: " class="new">talos_cache</td><td data-l="key: " class="new">376567…b4ba / v1.12.11 / amd64</td><td data-l="state: " class="new">wanted → fetching → ready</td><td data-l="integrity: " class="new">sha256 recorded at first fetch: kernel d5c460…7b69</td><td data-l="tag: " class="new">talos/376567…b4ba-amd64:v1.12.11</td></tr>
+    </table></div>
+    <p class="note">Table, column and tag names are illustrative; the plan fixes them.</p>
+  </section>
+
+  <div class="grid">
+    <section class="opt rec">
+      <span class="tag rec">A · recommended</span>
+      <h2>One Pool, One Job Per Source</h2>
+      <ol class="flow">
+        <li>A worker asks the sources in claim order: <span class="hl" style="background:var(--hl)">utility source</span>, then <span style="background:var(--hl)">Talos source</span></li>
+        <li class="arrow">↓ the source that has a row returns a job</li>
+        <li class="hl">Each source owns its job: the utility job is today's code moved behind the seam; the Talos job builds the factory URL, follows the redirect, records the sha256, tags</li>
+        <li class="arrow">↓ both call the pool's shared helpers</li>
+        <li>download with resume and the floor, reserve space, push, tag</li>
+      </ol>
+      <div class="count"><b>2</b><span>sources in M3; M3b's installer pull is a third, added as one new file</span></div>
+      <ul class="pros">
+        <li>Patchbay: a new kind is a new source, never an edit to its siblings</li>
+        <li>The seam arrives with its second implementor, as go-standards §12 requires</li>
+        <li>Each table keeps its own simple state machine</li>
+      </ul>
+      <ul class="cons">
+        <li>The utility job moves behind the seam, a refactor of M2 code (a <code>Kind: refactor</code> task with its blind A/B)</li>
+      </ul>
+    </section>
+
+    <section class="opt">
+      <span class="tag alt">B</span>
+      <h2>One Table, A Kind Column</h2>
+      <ol class="flow">
+        <li><code>utility_cache</code> gains <code class="new" style="background:var(--hl)">kind</code> (<code>utility</code> | <code>talos</code>) and the key widens to hold a schematic and version</li>
+        <li class="arrow">↓ one claim query, as today</li>
+        <li class="hl">The job branches on kind at each step: catalog lookup or factory URL, pinned or recorded hash, extract or not</li>
+      </ol>
+      <div class="count"><b>4</b><span>branch points in the job; M3b adds a third kind to each</span></div>
+      <ul class="pros">
+        <li>One claim query and one table to reconcile</li>
+      </ul>
+      <ul class="cons">
+        <li>A growing switch every new kind edits, the wall Patchbay warns about</li>
+        <li>A widened key and nullable columns weaken the utility table's constraints</li>
+        <li>An installer pull (manifests and blobs) fits none of the four branches</li>
+      </ul>
+    </section>
+  </div>
+  <p class="note">Not offered: a second fetcher for Talos. The handoff rules it out, and it would split the worker count and the space ledger.</p>
+</main>
+</body>
+</html>

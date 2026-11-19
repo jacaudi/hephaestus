@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hephaestus M3: where native clusters land</title>
+<style>
+  :root { --ink:#1b1f24; --muted:#59636e; --line:#d0d7de; --bg:#ffffff; --panel:#f6f8fa; --rec:#1a7f37; --warn:#9a6700; --bad:#cf222e; --hl:#fff8c5; --bar:#8c959f; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:24px 16px 48px; font:16px/1.5 -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; color:var(--ink); background:var(--bg); }
+  main { max-width:1180px; margin:0 auto; }
+  h1 { font-size:24px; line-height:1.25; margin:0 0 8px; }
+  h2 { font-size:20px; margin:0 0 4px; }
+  h3 { font-size:16px; margin:16px 0 6px; }
+  p { margin:0 0 12px; }
+  .lede { color:var(--muted); margin-bottom:20px; }
+  .grid { display:grid; grid-template-columns:1fr; gap:20px; }
+  @media (min-width: 900px) { .grid { grid-template-columns:1fr 1fr 1fr; } }
+  .opt { border:1px solid var(--line); border-radius:8px; padding:16px; background:var(--bg); min-width:0; }
+  .opt.rec { border:2px solid var(--rec); }
+  .tag { display:inline-block; font-size:13px; font-weight:600; padding:2px 8px; border-radius:12px; margin-bottom:8px; }
+  .tag.rec { background:#dafbe1; color:var(--rec); }
+  .tag.alt { background:#fff1e5; color:var(--warn); }
+  .ms { border:1px solid var(--line); background:var(--panel); border-radius:6px; padding:10px 12px; margin:0 0 6px; overflow-wrap:anywhere; }
+  .ms h3 { margin:0 0 6px; }
+  .ms ul { margin:0 0 8px; padding-left:18px; font-size:14px; }
+  .ms .ships { background:var(--hl); border:1px solid #d4a72c; border-radius:4px; padding:6px 8px; font-size:14px; }
+  .arrow { color:var(--muted); font-size:14px; padding:0 0 0 14px; margin:-2px 0 4px; }
+  .count { display:flex; align-items:baseline; gap:6px; margin:0 0 4px; }
+  .count b { font-size:18px; }
+  .count span { font-size:14px; color:var(--muted); }
+  .bar { height:8px; border-radius:4px; background:var(--bar); margin:0 0 8px; }
+  .bar.over { background:var(--bad); }
+  .ref { border-top:2px dashed var(--muted); margin:2px 0 0; font-size:13px; color:var(--muted); padding-top:2px; }
+  code { font:13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; background:#eff1f3; padding:1px 4px; border-radius:4px; overflow-wrap:anywhere; }
+  .pros, .cons { margin:4px 0 0; padding-left:20px; font-size:15px; }
+  .pros li::marker { color:var(--rec); }
+  .cons li::marker { color:var(--bad); }
+  .note { font-size:14px; color:var(--muted); margin-top:16px; }
+  .shared { border:1px solid var(--line); border-radius:8px; padding:16px; margin-bottom:20px; background:var(--panel); }
+  .shared ul { margin:0; padding-left:20px; }
+  .scale { display:grid; grid-template-columns:auto 1fr; gap:4px 10px; align-items:center; font-size:14px; max-width:520px; }
+  .scale .bar { margin:0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Native Clusters: Which Milestone Builds Them?</h1>
+  <p class="lede">A native cluster is one hephaestus authors itself instead of importing from git (core design §5.4, your call of 2026-11-14). Example below: a cluster <code>lab</code> on Talos <code>1.12.11</code>, endpoint <code>https://lab.k8s.example:6443</code>. Each option shows how you would create it; the highlighted box says what you get.</p>
+
+  <section class="shared">
+    <h2>What A Native Cluster Needs (Core Design §5.4, §5.5)</h2>
+    <ul>
+      <li><b>Create:</b> name, Talos version, endpoint, and a schematic chosen with the extension picker (P3.3).</li>
+      <li><b>Bundle:</b> hephaestus generates the cluster secrets and the 1Password writer stores them in a fixed item layout. A failed write rolls back what it created.</li>
+      <li><b>Edit:</b> raw YAML, then each host's redacted diff. Saving after the diff is the approval, and it is audit-logged.</li>
+      <li><b>Export:</b> a Topf repo holding only <code>ref+op://</code> references, for bootstrap and day 2 from your laptop.</li>
+    </ul>
+    <p class="note">home-ops is a git-imported cluster (D16, D23), so the first install in M3 needs none of this.</p>
+  </section>
+
+  <div class="grid">
+    <section class="opt rec">
+      <span class="tag rec">A · recommended</span>
+      <h2>M4, With The UI</h2>
+      <div class="ms">
+        <h3>Creating <code>lab</code></h3>
+        <ul>
+          <li>Clusters page → New</li>
+          <li>Form: name, version, endpoint; extension picker for the schematic</li>
+          <li>Editor: YAML on the left, each host's redacted diff on the right → Save = approve</li>
+          <li>Export button downloads the Topf repo</li>
+        </ul>
+        <div class="ships">Built once, in the place its form, picker and side-by-side diff live.</div>
+      </div>
+      <div class="count"><b>+5</b><span>tasks for M4 (est.)</span></div>
+      <ul class="pros">
+        <li>No consumer is waiting for it: home-ops is git-imported</li>
+        <li>M3b stays about 8 tasks, focused on offline installs</li>
+      </ul>
+      <ul class="cons">
+        <li>M4 is already the auth, UI and operations milestone, so it grows</li>
+        <li>No native cluster until M4 merges</li>
+      </ul>
+    </section>
+
+    <section class="opt">
+      <span class="tag alt">B</span>
+      <h2>M3b, As CLI Commands</h2>
+      <div class="ms">
+        <h3>Creating <code>lab</code></h3>
+        <ul>
+          <li><code>hephaestus cluster create lab --talos-version 1.12.11 --endpoint https://lab.k8s.example:6443 --schematic schematic.yaml</code></li>
+          <li><code>hephaestus cluster edit lab --file lab.yaml</code> prints each host's redacted diff; <code>--approve &lt;diff id&gt;</code> saves it</li>
+          <li><code>hephaestus cluster export lab ./lab-topf</code></li>
+        </ul>
+        <div class="ships">Usable before the UI. M4's pages call the same functions later.</div>
+      </div>
+      <div class="count"><b>~13</b><span>tasks for M3b (est., up from ~8)</span></div>
+      <ul class="pros">
+        <li>Native clusters work one milestone earlier</li>
+        <li>The writer's rollback is tested before a UI sits on it</li>
+      </ul>
+      <ul class="cons">
+        <li>The extension picker becomes a schematic file you write by hand</li>
+        <li>Approving a diff by id at a shell is clumsier than the side-by-side view</li>
+      </ul>
+    </section>
+
+    <section class="opt">
+      <span class="tag alt">C</span>
+      <h2>Out Of v1</h2>
+      <div class="ms">
+        <h3>Creating <code>lab</code></h3>
+        <ul>
+          <li>Write the Topf repo by hand, push it to git</li>
+          <li><code>hephaestus cluster import</code> as for home-ops</li>
+        </ul>
+        <div class="ships">One cluster source: git. No writer, no export.</div>
+      </div>
+      <div class="count"><b>0</b><span>tasks</span></div>
+      <ul class="pros">
+        <li>Smallest scope; drops the 1Password write path entirely</li>
+      </ul>
+      <ul class="cons">
+        <li>Reverses your 2026-11-14 decision to support native clusters</li>
+        <li>New clusters need their secrets made with laptop Topf first</li>
+      </ul>
+    </section>
+  </div>
+</main>
+</body>
+</html>

@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hephaestus M3: one milestone or several</title>
+<style>
+  :root { --ink:#1b1f24; --muted:#59636e; --line:#d0d7de; --bg:#ffffff; --panel:#f6f8fa; --rec:#1a7f37; --warn:#9a6700; --bad:#cf222e; --hl:#fff8c5; --bar:#8c959f; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:24px 16px 48px; font:16px/1.5 -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; color:var(--ink); background:var(--bg); }
+  main { max-width:1180px; margin:0 auto; }
+  h1 { font-size:24px; line-height:1.25; margin:0 0 8px; }
+  h2 { font-size:20px; margin:0 0 4px; }
+  h3 { font-size:16px; margin:16px 0 6px; }
+  p { margin:0 0 12px; }
+  .lede { color:var(--muted); margin-bottom:20px; }
+  .grid { display:grid; grid-template-columns:1fr; gap:20px; }
+  @media (min-width: 900px) { .grid { grid-template-columns:1fr 1fr 1fr; } }
+  .opt { border:1px solid var(--line); border-radius:8px; padding:16px; background:var(--bg); min-width:0; }
+  .opt.rec { border:2px solid var(--rec); }
+  .tag { display:inline-block; font-size:13px; font-weight:600; padding:2px 8px; border-radius:12px; margin-bottom:8px; }
+  .tag.rec { background:#dafbe1; color:var(--rec); }
+  .tag.alt { background:#fff1e5; color:var(--warn); }
+  .ms { border:1px solid var(--line); background:var(--panel); border-radius:6px; padding:10px 12px; margin:0 0 6px; overflow-wrap:anywhere; }
+  .ms h3 { margin:0 0 6px; }
+  .ms ul { margin:0 0 8px; padding-left:18px; font-size:14px; }
+  .ms .ships { background:var(--hl); border:1px solid #d4a72c; border-radius:4px; padding:6px 8px; font-size:14px; }
+  .arrow { color:var(--muted); font-size:14px; padding:0 0 0 14px; margin:-2px 0 4px; }
+  .count { display:flex; align-items:baseline; gap:6px; margin:0 0 4px; }
+  .count b { font-size:18px; }
+  .count span { font-size:14px; color:var(--muted); }
+  .bar { height:8px; border-radius:4px; background:var(--bar); margin:0 0 8px; }
+  .bar.over { background:var(--bad); }
+  .ref { border-top:2px dashed var(--muted); margin:2px 0 0; font-size:13px; color:var(--muted); padding-top:2px; }
+  code { font:13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; background:#eff1f3; padding:1px 4px; border-radius:4px; overflow-wrap:anywhere; }
+  .pros, .cons { margin:4px 0 0; padding-left:20px; font-size:15px; }
+  .pros li::marker { color:var(--rec); }
+  .cons li::marker { color:var(--bad); }
+  .note { font-size:14px; color:var(--muted); margin-top:16px; }
+  .shared { border:1px solid var(--line); border-radius:8px; padding:16px; margin-bottom:20px; background:var(--panel); }
+  .shared ul { margin:0; padding-left:20px; }
+  .scale { display:grid; grid-template-columns:auto 1fr; gap:4px 10px; align-items:center; font-size:14px; max-width:520px; }
+  .scale .bar { margin:0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>M3: design it as one milestone, or split it?</h1>
+  <p class="lede">Scope comes from the core design's Milestones list. Each milestone gets its own design, plan, plan gate and unattended run, and is merged locally into main. Highlighted boxes show what works the day each piece merges. Task counts are my estimates from that scope, not plan output.</p>
+
+  <section class="shared">
+    <h2>The Same In Every Option</h2>
+    <ul>
+      <li>There is no UI until M4, so approve, adopt and cluster import are CLI commands run inside the container, the way M2's <code>boot-next</code> works. The CLI calls the same <code>fleet</code> functions the M4 UI will.</li>
+      <li>Talos downloads go through the existing fetcher pool (4 workers, the 32 KiB/s floor, the space reservations) into the same content store, and <code>store.ContentLost</code> decides when content is lost.</li>
+      <li>Host binding keeps the MAC-bound boot-next rule (<code>flagServesMAC</code>). A junk-UUID machine never gets an install.</li>
+      <li><b>Native clusters</b> (the create form, the YAML editor with a diff, the 1Password writer, export) are built around forms that arrive with the M4 UI. Where they land is the next question, so they are left out of the counts below.</li>
+    </ul>
+    <h3>Run Size, For Scale</h3>
+    <div class="scale">
+      <span><b>18</b> tasks, M1</span><div class="bar" style="width:69%"></div>
+      <span><b>16</b> tasks, M2</span><div class="bar" style="width:62%"></div>
+      <span><b>6</b> tasks, parallel fetch</span><div class="bar" style="width:23%"></div>
+    </div>
+    <p class="note">The parallel-fetch run took about 15 minutes per task, and the e2e harness run about 27. The run contract pauses a run at 8 hours of wall clock.</p>
+  </section>
+
+  <div class="grid">
+    <section class="opt rec">
+      <span class="tag rec">A · recommended</span>
+      <h2>Two: Install First, Then Offline</h2>
+      <div class="ms">
+        <h3>M3 · First Talos Install</h3>
+        <div class="count"><b>~18</b><span>tasks (est.)</span></div>
+        <div class="bar" style="width:69%"></div>
+        <ul>
+          <li>Git-imported clusters, tree-hash revisions</li>
+          <li>Vendored Topf render and its sandbox</li>
+          <li>Secrets: 1Password token, data key, encrypted cache</li>
+          <li>Pending pairs, approval, <code>config_hash</code>, drift</li>
+          <li>Host binding, create-on-adopt</li>
+          <li>Schematic registration; kernel and initramfs prefetch, <code>assets_ready</code>, reconciliation</li>
+          <li>Tickets, <code>/config</code>, install script (rows 8–10 live)</li>
+          <li>Machinery assertion, Topf parity test</li>
+        </ul>
+        <div class="ships">Approve a machine into a home-ops host and it installs Talos and reaches <code>install-unconfirmed</code>. The installer image is still pulled from <code>factory.talos.dev</code>.</div>
+      </div>
+      <div class="arrow">↓ then</div>
+      <div class="ms">
+        <h3>M3b · Offline Installs</h3>
+        <div class="count"><b>~8</b><span>tasks (est.)</span></div>
+        <div class="bar" style="width:31%"></div>
+        <ul>
+          <li>Installer index prefetch, every arch in use</li>
+          <li><code>/v2/</code> mirror: allow-list, routing contract, 404 on a miss with a background fetch</li>
+          <li>Talos pins and the runtime GC quiet window</li>
+        </ul>
+        <div class="ships">Installs succeed with egress blocked (success criterion 1 in full).</div>
+      </div>
+      <ul class="pros">
+        <li>Each piece is no bigger than M1, the largest run that has finished</li>
+        <li>The first piece ends in a real install, so nothing ships idle</li>
+        <li>The mirror and GC are built against Talos content that already works</li>
+      </ul>
+      <ul class="cons">
+        <li>Until M3b, installs need internet for the installer pull</li>
+        <li>Talos content is not garbage-collected until M3b; one tuple's kernel and initramfs are roughly 100 MB (my estimate, not measured)</li>
+      </ul>
+    </section>
+
+    <section class="opt">
+      <span class="tag alt">B</span>
+      <h2>One: All Of M3</h2>
+      <div class="ms">
+        <h3>M3 · Clusters</h3>
+        <div class="count"><b>~26</b><span>tasks (est.)</span></div>
+        <div class="bar over" style="width:100%"></div>
+        <div class="ref" style="width:69%">M1 = 18</div>
+        <ul>
+          <li>Everything in A's two boxes, in one design, one plan and one run</li>
+        </ul>
+        <div class="ships">Offline installs, all at once.</div>
+      </div>
+      <ul class="pros">
+        <li>One design gate, one plan gate, one integration review</li>
+        <li>No hand-off between pieces</li>
+      </ul>
+      <ul class="cons">
+        <li>About 1.4× M1. At 15–27 minutes a task it likely hits the 8 h pause before Phase 4</li>
+        <li>The longest wait before anything works</li>
+        <li>The whole core design needed three gate passes; one design this size would likely need as many</li>
+      </ul>
+    </section>
+
+    <section class="opt">
+      <span class="tag alt">C</span>
+      <h2>Three: Render, Install, Offline</h2>
+      <div class="ms">
+        <h3>M3a · Clusters And Secrets</h3>
+        <div class="count"><b>~10</b><span>tasks (est.)</span></div>
+        <div class="bar" style="width:38%"></div>
+        <ul><li>Import, render, sandbox, secrets, approval, drift, parity test</li></ul>
+        <div class="ships">Import home-ops, read each host's redacted render and diff, approve. No machine receives anything.</div>
+      </div>
+      <div class="arrow">↓ then</div>
+      <div class="ms">
+        <h3>M3b · Install</h3>
+        <div class="count"><b>~9</b><span>tasks (est.)</span></div>
+        <div class="bar" style="width:35%"></div>
+        <ul><li>Binding, schematics, boot-asset prefetch, tickets, <code>/config</code>, install script</li></ul>
+        <div class="ships">Same as A's first piece.</div>
+      </div>
+      <div class="arrow">↓ then</div>
+      <div class="ms">
+        <h3>M3c · Offline Installs</h3>
+        <div class="count"><b>~8</b><span>tasks (est.)</span></div>
+        <div class="bar" style="width:31%"></div>
+        <ul><li>Same as A's M3b</li></ul>
+      </div>
+      <ul class="pros">
+        <li>The riskiest new code (vendored Topf, the 1Password SDK, parity) is proven alone</li>
+        <li>You can check renders against home-ops before any machine is touched</li>
+      </ul>
+      <ul class="cons">
+        <li>M3a has no consumer on the boot path, the thing M2's shape choice avoided</li>
+        <li>Three designs, plans and gates instead of two</li>
+      </ul>
+    </section>
+  </div>
+
+  <p class="note">I left out a fourth split, Talos content and the mirror first, then clusters. Its first piece would run a mirror that no hephaestus-installed node uses yet. That is the same "ships idle" shape M2 rejected.</p>
+</main>
+</body>
+</html>

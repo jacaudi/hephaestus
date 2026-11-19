@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hephaestus M3: Talos assets and power loss</title>
+<style>
+  :root { --ink:#1b1f24; --muted:#59636e; --line:#d0d7de; --bg:#ffffff; --panel:#f6f8fa; --rec:#1a7f37; --warn:#9a6700; --bad:#cf222e; --hl:#fff8c5; --bar:#8c959f; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:24px 16px 48px; font:16px/1.5 -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; color:var(--ink); background:var(--bg); }
+  main { max-width:1180px; margin:0 auto; }
+  h1 { font-size:24px; line-height:1.25; margin:0 0 8px; }
+  h2 { font-size:20px; margin:0 0 4px; }
+  h3 { font-size:16px; margin:16px 0 6px; }
+  p { margin:0 0 12px; }
+  .lede { color:var(--muted); margin-bottom:20px; }
+  .grid { display:grid; grid-template-columns:1fr; gap:20px; }
+  @media (min-width: 900px) { .grid { grid-template-columns:1fr 1fr 1fr; } }
+  .opt { border:1px solid var(--line); border-radius:8px; padding:16px; background:var(--bg); min-width:0; }
+  .opt.rec { border:2px solid var(--rec); }
+  .tag { display:inline-block; font-size:13px; font-weight:600; padding:2px 8px; border-radius:12px; margin-bottom:8px; }
+  .tag.rec { background:#dafbe1; color:var(--rec); }
+  .tag.alt { background:#fff1e5; color:var(--warn); }
+  .ms { border:1px solid var(--line); background:var(--panel); border-radius:6px; padding:10px 12px; margin:0 0 6px; overflow-wrap:anywhere; }
+  .ms h3 { margin:0 0 6px; }
+  .ms ul { margin:0 0 8px; padding-left:18px; font-size:14px; }
+  .ms .ships { background:var(--hl); border:1px solid #d4a72c; border-radius:4px; padding:6px 8px; font-size:14px; }
+  .arrow { color:var(--muted); font-size:14px; padding:0 0 0 14px; margin:-2px 0 4px; }
+  .count { display:flex; align-items:baseline; gap:6px; margin:0 0 4px; }
+  .count b { font-size:18px; }
+  .count span { font-size:14px; color:var(--muted); }
+  .bar { height:8px; border-radius:4px; background:var(--bar); margin:0 0 8px; }
+  .bar.over { background:var(--bad); }
+  .ref { border-top:2px dashed var(--muted); margin:2px 0 0; font-size:13px; color:var(--muted); padding-top:2px; }
+  code { font:13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; background:#eff1f3; padding:1px 4px; border-radius:4px; overflow-wrap:anywhere; }
+  .pros, .cons { margin:4px 0 0; padding-left:20px; font-size:15px; }
+  .pros li::marker { color:var(--rec); }
+  .cons li::marker { color:var(--bad); }
+  .note { font-size:14px; color:var(--muted); margin-top:16px; }
+  .shared { border:1px solid var(--line); border-radius:8px; padding:16px; margin-bottom:20px; background:var(--panel); }
+  .shared ul { margin:0; padding-left:20px; }
+  .scale { display:grid; grid-template-columns:auto 1fr; gap:4px 10px; align-items:center; font-size:14px; max-width:520px; }
+  .scale .bar { margin:0; }
+</style>
+<style>
+  .fix { border-left:4px solid var(--warn); background:#fff8ef; padding:10px 12px; border-radius:4px; margin:0 0 16px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Talos Assets: What Survives A Power Cut?</h1>
+  <p class="lede">Example: talos-04-wrk is approved. hephaestus has just fetched its kernel-amd64 (21,627,392 bytes) and initramfs-amd64.xz (78,894,177 bytes, both measured on factory.talos.dev for v1.12.11 today), tagged them, and set <code>assets_ready</code>. Seconds later the lab loses power.</p>
+
+  <div class="fix"><b>Corrected after the design gate (2026-11-18).</b> <code>index.json</code> is fsynced and written atomically (<code>SyncIndex: true</code>, <code>internal/store/store.go:116</code>; <code>oras-go v3.0.0 content/oci/atomicwrite.go</code>). But neither layer blobs nor the manifest are fsynced: <code>TagArtifact</code> pushes the manifest through <code>oras.PackManifest</code> → <code>oci.Push</code>, which indexes and saves it without syncing its bytes. So the synced index can name a short or zeroed manifest, and on reopen the verified index load fails and the whole store is set aside (<code>docs/utility-content.md:29</code>). M2's original note was right; my first version of this box said otherwise and was wrong. Option A therefore covers the manifest and its empty config blob as well as the layers.</div>
+
+  <section class="shared">
+    <h2>After Power Returns, Without A Fix</h2>
+    <ol class="flow" style="list-style:none;padding:0;margin:0">
+      <li class="ms">The tag is on disk (the index was fsynced) and names the kernel blob</li>
+      <li class="arrow">↓ but the blob's data may never have reached the disk</li>
+      <li class="ms">Case 1: the blob is <b>short or empty</b> → the startup layer check finds the wrong size → <code>store.ContentLost</code> → <code>assets_ready</code> cleared, refetch queued. talos-04-wrk holds at row 8 until the internet answers.</li>
+      <li class="ms">Case 2: the blob has the <b>right size but zeroed blocks</b> (allocated, never written) → the size-only check passes → iPXE is handed a broken kernel and the boot fails at the console.</li>
+    </ol>
+  </section>
+
+  <div class="grid">
+    <section class="opt rec">
+      <span class="tag rec">A · recommended</span>
+      <h2>Fsync Each Blob Before It Is Tagged</h2>
+      <div class="ms">
+        <h3>In <code>store.PushBlob</code> and <code>store.TagArtifact</code></h3>
+        <ul>
+          <li>Layers: open the blob, <code>Sync()</code>, fsync <code>blobs/sha256/</code></li><li>Manifest and config: written durably (ingest, fsync, rename, directory fsync) before <code>oci.Tag</code> indexes them</li>
+          <li>Only then can a tag name it, and the tag is already fsynced</li>
+        </ul>
+        <div class="ships">Anything tagged survives a power cut. Neither case can happen. Utilities gain it too.</div>
+      </div>
+      <div class="count"><b>4</b><span>blob fsyncs per Talos tuple (kernel, initramfs, cmdline, manifest), against ~100 MB downloaded</span></div>
+      <ul class="pros">
+        <li>Keeps the core promise: once caches are warm, no install step needs the internet</li>
+        <li>Small and local to one function in <code>internal/store</code></li>
+      </ul>
+      <ul class="cons">
+        <li>Reverses M2's accepted risk (in the safe direction), so M2's note is corrected</li>
+      </ul>
+    </section>
+
+    <section class="opt">
+      <span class="tag alt">B</span>
+      <h2>Accept, As For Utilities</h2>
+      <div class="ms">
+        <h3>No change</h3>
+        <ul>
+          <li>Case 1 refetches; case 2 serves a broken kernel until someone notices</li>
+        </ul>
+        <div class="ships">Power-cut exposure is limited to content written in the seconds before the cut.</div>
+      </div>
+      <div class="count"><b>0</b><span>tasks</span></div>
+      <ul class="pros">
+        <li>Nothing to build</li>
+      </ul>
+      <ul class="cons">
+        <li>Case 2 is silent: the store believes the kernel is good</li>
+        <li>A refetch after a power cut needs the internet, which may be down too</li>
+      </ul>
+    </section>
+
+    <section class="opt">
+      <span class="tag alt">C</span>
+      <h2>Re-Hash Talos Blobs At Startup</h2>
+      <div class="ms">
+        <h3>In Talos reconciliation</h3>
+        <ul>
+          <li>Read every tagged Talos blob and compare its sha256 to the digest</li>
+        </ul>
+        <div class="ships">Case 2 becomes case 1: detected and refetched, not prevented.</div>
+      </div>
+      <div class="count"><b>~100</b><span>MB read per tuple at every start</span></div>
+      <ul class="pros">
+        <li>Also catches bit rot, not only power cuts</li>
+      </ul>
+      <ul class="cons">
+        <li>Still needs the internet to recover</li>
+        <li>Startup time grows with every tuple and, in M3b, every installer image</li>
+      </ul>
+    </section>
+  </div>
+  <p class="note">Where this bites: ZFS (TrueNAS, the day-to-day host) commits transaction groups in order, so a renamed blob never lands without its data; both cases are effectively absent there. They come from filesystems with delayed allocation, such as ext4 or XFS, which is what a recovery host on "any Linux host" (core goal 7) is likely to run.</p>
+</main>
+</body>
+</html>
