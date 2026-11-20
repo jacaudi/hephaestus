@@ -94,6 +94,7 @@ CREATE TABLE talos_cache (
     bytes_total     BIGINT NOT NULL DEFAULT 0 CHECK (bytes_total >= 0),
     last_error      TEXT NOT NULL DEFAULT '',
     assets          TEXT NOT NULL DEFAULT '{}',
+    claim_gen       BIGINT NOT NULL DEFAULT 0 CHECK (claim_gen >= 0),
     updated_at      TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (schematic, version, arch),
     CHECK (state <> 'failed' OR next_attempt_at IS NOT NULL)

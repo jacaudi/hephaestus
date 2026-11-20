@@ -5,6 +5,7 @@ import (
 	"cmp"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -13,6 +14,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,6 +24,7 @@ import (
 	"go.jacaudi.dev/hephaestus/internal/factory"
 	"go.jacaudi.dev/hephaestus/internal/factory/factorytest"
 	"go.jacaudi.dev/hephaestus/internal/fleet"
+	"go.jacaudi.dev/hephaestus/internal/store"
 )
 
 const (
@@ -82,6 +85,8 @@ type talosRig struct {
 	seenReq []seenRequest // Path is "<method> <path>"
 	fakeNow time.Time
 	cutDone bool
+	// onRequest, when set, runs with each request's "<method> <path>" before it is served.
+	onRequest func(path string)
 }
 
 func newTalosRig(t *testing.T, s talosSetup) *talosRig {
@@ -111,7 +116,11 @@ func newTalosRig(t *testing.T, s talosSetup) *talosRig {
 	srv := startTLS(t, http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		r.mu.Lock()
 		r.seenReq = append(r.seenReq, seenRequest{Path: req.Method + " " + req.URL.Path, Range: req.Header.Get("Range"), IfRange: req.Header.Get("If-Range")})
+		hook := r.onRequest
 		r.mu.Unlock()
+		if hook != nil {
+			hook(req.Method + " " + req.URL.Path)
+		}
 		r.serve(t, w, req, cut)
 	}), false)
 	client := NewHTTPClient(testUserAgent, poolOf(srv))
@@ -155,6 +164,13 @@ func (r *talosRig) seen() []seenRequest {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return slices.Clone(r.seenReq)
+}
+
+// setOnRequest sets the hook run before each request is served.
+func (r *talosRig) setOnRequest(fn func(path string)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.onRequest = fn
 }
 
 func (r *talosRig) setFakeNow(at time.Time) {
@@ -580,4 +596,73 @@ func FuzzValidCmdline(f *testing.F) {
 			}
 		}
 	})
+}
+
+func TestTalosSource_ResetDuringFetchNotRepinned(t *testing.T) {
+	r := newTalosRig(t, talosSetup{})
+	r.fetchOnce()
+	r.wantTalosRow(fleet.CacheReady, 0)
+	r.requeue(true)
+
+	// While the fetch downloads, the admin resets the hashes and a second worker
+	// claims the row again. The first worker's writes must all miss: its ready
+	// would put back the hashes the admin just cleared.
+	var once sync.Once
+	r.setOnRequest(func(path string) {
+		if path != r.imagePath(fleet.TalosCmdline) {
+			return
+		}
+		once.Do(func() {
+			if moved, err := r.repo.ResetTalosHash(t.Context(), r.key, fleet.ActorCLI, fetchT0()); err != nil || !moved {
+				t.Errorf("ResetTalosHash during the fetch = %v, %v; want true, nil", moved, err)
+			}
+			if _, ok, err := r.repo.ClaimTalos(t.Context(), fleet.TalosOther, fetchT0()); err != nil || !ok {
+				t.Errorf("the second worker's ClaimTalos = %v, %v; want the reset row", ok, err)
+			}
+		})
+	})
+	r.fetchOnce()
+
+	row := r.wantTalosRow(fleet.CacheFetching, 0)
+	if len(row.Assets) != 0 || row.BytesDone != 0 || row.BytesTotal != 0 {
+		t.Errorf("row after the first worker settled = assets %v, progress %d/%d; want the reset's: none, 0/0", row.Assets, row.BytesDone, row.BytesTotal)
+	}
+}
+
+func TestTalosSource_PushReservesSpace(t *testing.T) {
+	r := newTalosRig(t, talosSetup{})
+	var free atomic.Uint64
+	free.Store(1 << 40)
+	r.f.statfs = func(string) (uint64, error) { return spaceReserve + free.Load(), nil }
+	// Once the kernel and initramfs are in the spool, the volume has room beyond
+	// its margin for the largest part, but not for the store copies of all three.
+	r.setOnRequest(func(path string) {
+		if path == r.imagePath(fleet.TalosCmdline) {
+			free.Store(uint64(len(r.file(fleet.TalosInitramfs))) + 1000)
+		}
+	})
+	r.fetchOnce()
+
+	row := r.wantTalosRow(fleet.CacheFailed, 1)
+	if !strings.Contains(row.LastError, "free space") {
+		t.Errorf("LastError = %q, want the free space refusal", row.LastError)
+	}
+	for _, p := range []fleet.TalosPart{fleet.TalosKernel, fleet.TalosInitramfs} {
+		a := assetOf(r.file(p))
+		desc, err := store.Layer(string(p), a.Size, a.SHA256)
+		if err != nil {
+			t.Fatalf("Layer(%s): %v", p, err)
+		}
+		if rc, err := r.store.OpenBlob(desc); !errors.Is(err, store.ErrLayerMissing) {
+			if err == nil {
+				if cerr := rc.Close(); cerr != nil {
+					t.Errorf("close blob %s: %v", p, cerr)
+				}
+			}
+			t.Errorf("OpenBlob(%s) = %v; want ErrLayerMissing, nothing pushed", p, err)
+		}
+	}
+	if _, err := r.store.Resolve(t.Context(), r.key.Tag()); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("Resolve(%s) = %v; want ErrNotFound", r.key.Tag(), err)
+	}
 }

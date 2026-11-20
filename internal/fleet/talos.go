@@ -89,13 +89,27 @@ type TalosRow struct {
 	BytesTotal    int64       `bun:"bytes_total"`
 	LastError     string      `bun:"last_error"`
 	Assets        TalosAssets `bun:"assets"`
-	UpdatedAt     time.Time   `bun:"updated_at"`
+	// ClaimGen counts the row's claims; ClaimTalos adds one.
+	ClaimGen  int64     `bun:"claim_gen"`
+	UpdatedAt time.Time `bun:"updated_at"`
 }
 
 // Key returns the row's key.
 func (r TalosRow) Key() TalosKey {
 	return TalosKey{Schematic: r.Schematic, Version: r.Version, Arch: r.Arch}
 }
+
+// TalosClaim is one claim of a talos_cache row: its key and the claim's
+// generation. The writes of a fetch name its claim and land only while the row
+// is fetching under it, so once the row is reset or claimed again the old fetch
+// can no longer settle it.
+type TalosClaim struct {
+	Key TalosKey
+	Gen int64
+}
+
+// Claim returns the claim of the row as ClaimTalos returned it.
+func (r TalosRow) Claim() TalosClaim { return TalosClaim{Key: r.Key(), Gen: r.ClaimGen} }
 
 // TalosWant names the row a transaction wants fetched. Body, when set, is the
 // schematic body a row without one takes. Rearm moves a failed or broken row
@@ -118,10 +132,10 @@ const (
 	TalosOther
 )
 
-// TalosFailure is a failed fetch of the row at Key. Integrity marks a failure
-// no retry can fix, which breaks the row at once.
+// TalosFailure is a failed fetch under Claim. Integrity marks a failure no
+// retry can fix, which breaks the row at once.
 type TalosFailure struct {
-	Key       TalosKey
+	Claim     TalosClaim
 	Cause     string
 	Integrity bool
 	At        time.Time

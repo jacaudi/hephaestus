@@ -17,9 +17,6 @@ const (
 	actionTalosHashReset = "talos.hash_reset"
 )
 
-// ErrTalosFetching means ResetTalosHash found the row being fetched.
-var ErrTalosFetching = errors.New("the Talos row is being fetched; reset its hash once the fetch has ended")
-
 // talosDetail is the detail of a talos.hash_reset audit event.
 type talosDetail struct {
 	Schematic string `json:"schematic"`
@@ -96,8 +93,8 @@ func rearmTalosOf(ctx context.Context, q bun.IDB, m Machine, at time.Time) error
 	return err
 }
 
-// ClaimTalos moves the next row of class the fetcher should work on to fetching
-// and returns it: the wanted rows and the failed rows due at at, oldest
+// ClaimTalos moves the next row of class the fetcher should work on to fetching,
+// one claim on in its ClaimGen, and returns it: the wanted rows and the failed rows due at at, oldest
 // updated_at first. TalosAssigned takes the rows whose key is the Talos tuple and
 // arch of a machine in assigned, and TalosOther the rest. A row another worker
 // takes first is skipped for the next. It reports false when none is eligible.
@@ -129,7 +126,7 @@ func (r *Repository) ClaimTalos(ctx context.Context, class TalosClass, at time.T
 			up = up.Where("next_attempt_at <= ?", at)
 		}
 		var claimed TalosRow
-		err := up.Set("state = ?", CacheFetching).Set("updated_at = ?", at).Returning("*").Scan(ctx, &claimed)
+		err := up.Set("state = ?", CacheFetching).Set("claim_gen = claim_gen + 1").Set("updated_at = ?", at).Returning("*").Scan(ctx, &claimed)
 		if errors.Is(err, sql.ErrNoRows) {
 			continue
 		}
@@ -142,36 +139,37 @@ func (r *Repository) ClaimTalos(ctx context.Context, class TalosClass, at time.T
 }
 
 // RecordTalosProgress stores how much of the asset being fetched is downloaded.
-// It touches only a fetching row. It is not a state change, so it is not audited
-// and leaves updated_at alone.
-func (r *Repository) RecordTalosProgress(ctx context.Context, key TalosKey, done, total int64) error {
-	_, err := updateTalos(r.bdb, key).Where("state = ?", CacheFetching).
+// It touches only the row fetching under c. It is not a state change, so it is
+// not audited and leaves updated_at alone.
+func (r *Repository) RecordTalosProgress(ctx context.Context, c TalosClaim, done, total int64) error {
+	_, err := updateClaimed(r.bdb, c).
 		Set("bytes_done = ?", done).Set("bytes_total = ?", total).Exec(ctx)
 	if err != nil {
-		return fmt.Errorf("fleet: record Talos progress %s: %w", key.Tag(), err)
+		return fmt.Errorf("fleet: record Talos progress %s: %w", c.Key.Tag(), err)
 	}
 	return nil
 }
 
-// MarkTalosReady moves a fetching row to ready with the assets its fetch
-// recorded, and clears its failure history. It reports whether it did. Assets
-// that are not Complete are an error and move nothing: a ready row without its
-// hashes would have the next fetch record fresh ones unaudited.
-func (r *Repository) MarkTalosReady(ctx context.Context, key TalosKey, assets TalosAssets, at time.Time) (bool, error) {
+// MarkTalosReady moves the row fetching under c to ready with the assets its
+// fetch recorded, and clears its failure history. It reports whether it did.
+// Assets that are not Complete are an error and move nothing: a ready row
+// without its hashes would have the next fetch record fresh ones unaudited.
+func (r *Repository) MarkTalosReady(ctx context.Context, c TalosClaim, assets TalosAssets, at time.Time) (bool, error) {
 	if !assets.Complete() {
-		return false, fmt.Errorf("fleet: mark Talos %s ready: the assets %v do not record every part with a sha256", key.Tag(), assets)
+		return false, fmt.Errorf("fleet: mark Talos %s ready: the assets %v do not record every part with a sha256", c.Key.Tag(), assets)
 	}
-	moved, err := applied(ctx, updateTalos(r.bdb, key).Where("state = ?", CacheFetching).
+	moved, err := applied(ctx, updateClaimed(r.bdb, c).
 		Set("state = ?", CacheReady).Set("assets = ?", assets).
 		Set("attempts = 0").Set("last_error = ''").Set("next_attempt_at = NULL").Set("updated_at = ?", stamp(at)))
 	if err != nil {
-		return false, fmt.Errorf("fleet: mark Talos %s ready: %w", key.Tag(), err)
+		return false, fmt.Errorf("fleet: mark Talos %s ready: %w", c.Key.Tag(), err)
 	}
 	return moved, nil
 }
 
-// RecordTalosFailure records a failed fetch of the fetching row at f.Key and
-// returns the row as stored; any other row is returned unchanged, and an absent
+// RecordTalosFailure records a failed fetch of the row fetching under f.Claim
+// and returns the row as stored; any other row, the row under another claim
+// included, is returned unchanged, and an absent
 // one as the zero row. It adds an attempt and the cause, stored clean and cut to
 // MaxCauseBytes. An integrity failure, or the MaxFetchAttempts-th attempt,
 // breaks the row and audits talos.broken; otherwise the row is failed, due
@@ -185,21 +183,22 @@ func (r *Repository) RecordTalosFailure(ctx context.Context, f TalosFailure) (Ta
 		return err
 	})
 	if err != nil {
-		return TalosRow{}, fmt.Errorf("fleet: record Talos failure %s: %w", f.Key.Tag(), err)
+		return TalosRow{}, fmt.Errorf("fleet: record Talos failure %s: %w", f.Claim.Key.Tag(), err)
 	}
 	return out, nil
 }
 
 func recordTalosFailure(ctx context.Context, tx bun.IDB, f TalosFailure) (TalosRow, error) {
-	row, ok, err := loadTalos(ctx, tx, f.Key)
-	if err != nil || !ok || row.State != CacheFetching {
+	key := f.Claim.Key
+	row, ok, err := loadTalos(ctx, tx, key)
+	if err != nil || !ok || row.State != CacheFetching || row.ClaimGen != f.Claim.Gen {
 		return row, err
 	}
 	at := stamp(f.At)
 	attempts := row.Attempts + 1
 	broken := f.Integrity || attempts >= MaxFetchAttempts
 
-	up := updateTalos(tx, f.Key).Where("state = ? AND attempts = ?", CacheFetching, row.Attempts).
+	up := updateClaimed(tx, f.Claim).Where("attempts = ?", row.Attempts).
 		Set("attempts = ?", attempts).Set("last_error = ?", f.Cause).Set("updated_at = ?", at)
 	if broken {
 		up = up.Set("state = ?", CacheBroken).Set("next_attempt_at = NULL")
@@ -208,18 +207,18 @@ func recordTalosFailure(ctx context.Context, tx bun.IDB, f TalosFailure) (TalosR
 	}
 	moved, err := applied(ctx, up)
 	if err != nil {
-		return TalosRow{}, fmt.Errorf("record failure of %s: %w", f.Key.Tag(), err)
+		return TalosRow{}, fmt.Errorf("record failure of %s: %w", key.Tag(), err)
 	}
 	if !moved {
-		return TalosRow{}, fmt.Errorf("record failure of %s: %w", f.Key.Tag(), db.ErrConflict)
+		return TalosRow{}, fmt.Errorf("record failure of %s: %w", key.Tag(), db.ErrConflict)
 	}
 	if broken {
-		ev := AuditEvent{At: at, Actor: ActorSystem, Action: actionTalosBroken, Detail: talosFailureDetail{talosDetail: talosDetail(f.Key), Cause: f.Cause}}
+		ev := AuditEvent{At: at, Actor: ActorSystem, Action: actionTalosBroken, Detail: talosFailureDetail{talosDetail: talosDetail(key), Cause: f.Cause}}
 		if err := InsertAudit(ctx, tx, ev); err != nil {
 			return TalosRow{}, err
 		}
 	}
-	return mustLoadTalos(ctx, tx, f.Key)
+	return mustLoadTalos(ctx, tx, key)
 }
 
 // ResetTalosFetching moves every fetching row back to wanted, as when the
@@ -237,14 +236,14 @@ func (r *Repository) ResetTalosFetching(ctx context.Context, at time.Time) (int,
 	return int(n), nil
 }
 
-// ResetTalosFetchingRow moves the fetching row at key back to wanted, when the
+// ResetTalosFetchingRow moves the row fetching under c back to wanted, when the
 // fetch that held it ends without an outcome to record; every other fetching row
 // is left to its own worker. It reports whether it did.
-func (r *Repository) ResetTalosFetchingRow(ctx context.Context, key TalosKey, at time.Time) (bool, error) {
-	moved, err := applied(ctx, updateTalos(r.bdb, key).Where("state = ?", CacheFetching).
+func (r *Repository) ResetTalosFetchingRow(ctx context.Context, c TalosClaim, at time.Time) (bool, error) {
+	moved, err := applied(ctx, updateClaimed(r.bdb, c).
 		Set("state = ?", CacheWanted).Set("updated_at = ?", stamp(at)))
 	if err != nil {
-		return false, fmt.Errorf("fleet: reset fetching Talos row %s: %w", key.Tag(), err)
+		return false, fmt.Errorf("fleet: reset fetching Talos row %s: %w", c.Key.Tag(), err)
 	}
 	return moved, nil
 }
@@ -261,33 +260,21 @@ func (r *Repository) RequeueTalos(ctx context.Context, key TalosKey, at time.Tim
 }
 
 // ResetTalosHash is an admin's trust decision to accept a changed upstream
-// build: it moves the row at key, in any state but fetching, to wanted with its
-// recorded assets, attempts, progress and last error cleared, and audits
-// talos.hash_reset as actor, in a single transaction. It reports whether a row
-// was there. A fetching row is refused with ErrTalosFetching: moved to wanted
-// under its fetch, it could be claimed by a second worker while the first still
-// settles it, so the admin resets it once that fetch has ended.
+// build: it moves the row at key, in any state, to wanted with its recorded
+// assets, attempts, progress and last error cleared, and audits talos.hash_reset
+// as actor, in a single transaction. It reports whether a row was there. A
+// fetch in flight runs on, but none of its writes land: the row is no longer
+// fetching under its claim, and a later claim is another.
 func (r *Repository) ResetTalosHash(ctx context.Context, key TalosKey, actor string, at time.Time) (bool, error) {
 	at = stamp(at)
 	var moved bool
 	err := db.RunInTxRetry(ctx, r.bdb, func(ctx context.Context, tx bun.Tx) error {
-		row, ok, err := loadTalos(ctx, tx, key)
-		switch {
-		case err != nil || !ok:
-			moved = false
-			return err
-		case row.State == CacheFetching:
-			return ErrTalosFetching
-		}
-		moved, err = applied(ctx, updateTalos(tx, key).Where("state = ?", row.State).
+		var err error
+		moved, err = applied(ctx, updateTalos(tx, key).
 			Set("state = ?", CacheWanted).Set("assets = ?", TalosAssets{}).Set("attempts = 0").Set("next_attempt_at = NULL").
 			Set("bytes_done = 0").Set("bytes_total = 0").Set("last_error = ''").Set("updated_at = ?", at))
-		switch {
-		case err != nil:
+		if err != nil || !moved {
 			return err
-		case !moved:
-			// The row left the state it was read in: read it again.
-			return db.ErrConflict
 		}
 		return InsertAudit(ctx, tx, AuditEvent{At: at, Actor: actor, Action: actionTalosHashReset, Detail: talosDetail(key)})
 	})
@@ -338,6 +325,12 @@ func mustLoadTalos(ctx context.Context, q bun.IDB, key TalosKey) (TalosRow, erro
 		err = fmt.Errorf("Talos row %s is gone: %w", key.Tag(), db.ErrConflict)
 	}
 	return row, err
+}
+
+// updateClaimed starts an update of the row fetching under c, so a fetch that
+// lost its claim to a reset or to a later claim changes nothing.
+func updateClaimed(q bun.IDB, c TalosClaim) *bun.UpdateQuery {
+	return updateTalos(q, c.Key).Where("state = ? AND claim_gen = ?", CacheFetching, c.Gen)
 }
 
 // updateTalos starts an update of the row at key; the caller adds the state it

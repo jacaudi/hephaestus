@@ -232,6 +232,16 @@ func (j *talosJob) push(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// Each download swapped out the reservation of the one before, so the job
+	// holds room for the cmdline alone, while the store copies of all three are
+	// still to be written: it holds room for them until close.
+	var size int64
+	for i := range layers {
+		size += layers[i].Size
+	}
+	if err := j.dl().reserveSpace(size, 1); err != nil {
+		return err
+	}
 	for n, part := range fleet.TalosParts() {
 		if err := j.pushPart(ctx, n, part, layers[n]); err != nil {
 			return fmt.Errorf("store %s: %w", part, err)
@@ -350,7 +360,7 @@ func (j *talosJob) close(ctx context.Context) { j.dl().close(ctx) }
 // progress records that done of total bytes of the current part are in place.
 // It is advisory: a failure goes to the error handler and the fetch goes on.
 func (j *talosJob) progress(ctx context.Context, done, total int64) {
-	if err := j.f.cfg.Repo.RecordTalosProgress(ctx, j.row.Key(), done, total); err != nil && ctx.Err() == nil {
+	if err := j.f.cfg.Repo.RecordTalosProgress(ctx, j.row.Claim(), done, total); err != nil && ctx.Err() == nil {
 		j.f.onError(ctx, err)
 	}
 }
@@ -372,7 +382,7 @@ func (j *talosJob) record(ctx context.Context, o outcome) error {
 		return nil
 	}
 	if o.ready {
-		moved, err := f.cfg.Repo.MarkTalosReady(ctx, j.row.Key(), j.assets, f.now())
+		moved, err := f.cfg.Repo.MarkTalosReady(ctx, j.row.Claim(), j.assets, f.now())
 		if err != nil {
 			return err
 		}
@@ -382,7 +392,7 @@ func (j *talosJob) record(ctx context.Context, o outcome) error {
 		}
 		return nil
 	}
-	row, err := f.cfg.Repo.RecordTalosFailure(ctx, fleet.TalosFailure{Key: j.row.Key(), Cause: o.cause, Integrity: o.integrity, At: o.at})
+	row, err := f.cfg.Repo.RecordTalosFailure(ctx, fleet.TalosFailure{Claim: j.row.Claim(), Cause: o.cause, Integrity: o.integrity, At: o.at})
 	if err != nil {
 		return fmt.Errorf("%w (the fetch failed: %s)", err, o.cause)
 	}
@@ -396,7 +406,7 @@ func (j *talosJob) record(ctx context.Context, o outcome) error {
 // giveBack moves the row from fetching back to wanted. The row may have been
 // settled since it was claimed; the reset then moves nothing.
 func (j *talosJob) giveBack(ctx context.Context, at time.Time) (bool, error) {
-	return j.f.cfg.Repo.ResetTalosFetchingRow(ctx, j.row.Key(), at)
+	return j.f.cfg.Repo.ResetTalosFetchingRow(ctx, j.row.Claim(), at)
 }
 
 // countFailure adds one to hephaestus.talos.fetch.failures under class.

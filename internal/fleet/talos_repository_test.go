@@ -3,7 +3,6 @@ package fleet
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -61,7 +60,7 @@ func seedTalos(t *testing.T, d *db.DB, row TalosRow) {
 
 func sameTalosRow(a, b TalosRow) bool {
 	return a.Key() == b.Key() && a.State == b.State && bytes.Equal(a.Body, b.Body) && a.Attempts == b.Attempts &&
-		a.NextAttemptAt.Equal(b.NextAttemptAt) && a.BytesDone == b.BytesDone && a.BytesTotal == b.BytesTotal &&
+		a.NextAttemptAt.Equal(b.NextAttemptAt) && a.ClaimGen == b.ClaimGen && a.BytesDone == b.BytesDone && a.BytesTotal == b.BytesTotal &&
 		a.LastError == b.LastError && maps.Equal(a.Assets, b.Assets) && a.UpdatedAt.Equal(b.UpdatedAt)
 }
 
@@ -212,6 +211,7 @@ func runTalosSuite(t *testing.T, open func(testing.TB) *db.DB, pair func(testing
 		at := t0.Add(time.Hour)
 		got, ok := mustClaimTalos(t, r, TalosOther, at)
 		want := talosRowIn(others, CacheFetching, at)
+		want.ClaimGen = 1
 		if !ok || !sameTalosRow(got, want) {
 			t.Fatalf("ClaimTalos(TalosOther) = %+v, %v; want %+v (the assigned machine's row is not Other, though older)", got, ok, want)
 		}
@@ -221,6 +221,7 @@ func runTalosSuite(t *testing.T, open func(testing.TB) *db.DB, pair func(testing
 
 		got, ok = mustClaimTalos(t, r, TalosAssigned, at)
 		want = talosRowIn(mine, CacheFetching, at)
+		want.ClaimGen = 1
 		if !ok || !sameTalosRow(got, want) {
 			t.Fatalf("ClaimTalos(TalosAssigned) = %+v, %v; want %+v", got, ok, want)
 		}
@@ -274,7 +275,7 @@ func runTalosSuite(t *testing.T, open func(testing.TB) *db.DB, pair func(testing
 
 		got, ok := mustClaimTalos(t, r, TalosOther, seed.NextAttemptAt)
 		want := seed
-		want.State, want.UpdatedAt = CacheFetching, seed.NextAttemptAt
+		want.State, want.UpdatedAt, want.ClaimGen = CacheFetching, seed.NextAttemptAt, 1
 		if !ok || !sameTalosRow(got, want) {
 			t.Fatalf("ClaimTalos when the backoff ends = %+v, %v; want %+v", got, ok, want)
 		}
@@ -311,14 +312,14 @@ func runTalosSuite(t *testing.T, open func(testing.TB) *db.DB, pair func(testing
 		seedTalos(t, d, fetching)
 		seedTalos(t, d, wanted)
 
-		if err := r.RecordTalosProgress(t.Context(), k, 40, 100); err != nil {
+		if err := r.RecordTalosProgress(t.Context(), TalosClaim{Key: k}, 40, 100); err != nil {
 			t.Fatalf("RecordTalosProgress(fetching): %v", err)
 		}
 		want := fetching
 		want.BytesDone, want.BytesTotal = 40, 100
 		wantTalos(t, r, k, want)
 
-		if err := r.RecordTalosProgress(t.Context(), wanted.Key(), 40, 100); err != nil {
+		if err := r.RecordTalosProgress(t.Context(), wanted.Claim(), 40, 100); err != nil {
 			t.Fatalf("RecordTalosProgress(wanted): %v", err)
 		}
 		wantTalos(t, r, wanted.Key(), wanted)
@@ -332,13 +333,13 @@ func runTalosSuite(t *testing.T, open func(testing.TB) *db.DB, pair func(testing
 		seedTalos(t, d, seed)
 
 		at := t0.Add(time.Minute)
-		moved, err := r.MarkTalosReady(t.Context(), k, talosAssets(), at)
+		moved, err := r.MarkTalosReady(t.Context(), TalosClaim{Key: k}, talosAssets(), at)
 		wantBool(t, "MarkTalosReady(fetching)", moved, err, true)
 		want := talosRowIn(k, CacheReady, at)
 		want.BytesDone, want.BytesTotal, want.Assets = seed.BytesDone, seed.BytesTotal, talosAssets()
 		wantTalos(t, r, k, want)
 
-		moved, err = r.MarkTalosReady(t.Context(), k, talosAssets(), at.Add(time.Minute))
+		moved, err = r.MarkTalosReady(t.Context(), TalosClaim{Key: k}, talosAssets(), at.Add(time.Minute))
 		wantBool(t, "MarkTalosReady(ready)", moved, err, false)
 		wantTalos(t, r, k, want)
 	})
@@ -354,7 +355,7 @@ func runTalosSuite(t *testing.T, open func(testing.TB) *db.DB, pair func(testing
 		noCmdline := talosAssets()
 		delete(noCmdline, TalosCmdline)
 		for _, assets := range []TalosAssets{nil, {}, noCmdline} {
-			moved, err := r.MarkTalosReady(t.Context(), k, assets, t0.Add(time.Minute))
+			moved, err := r.MarkTalosReady(t.Context(), TalosClaim{Key: k}, assets, t0.Add(time.Minute))
 			if err == nil || moved {
 				t.Fatalf("MarkTalosReady(%v) = %v, %v; want an error", assets, moved, err)
 			}
@@ -368,7 +369,7 @@ func runTalosSuite(t *testing.T, open func(testing.TB) *db.DB, pair func(testing
 		seedTalos(t, d, talosRowIn(k, CacheFetching, t0))
 
 		at := t0.Add(time.Minute)
-		got := mustFailTalos(t, r, TalosFailure{Key: k, Cause: talosCause, At: at})
+		got := mustFailTalos(t, r, TalosFailure{Claim: TalosClaim{Key: k}, Cause: talosCause, At: at})
 		want := talosRowIn(k, CacheFailed, at)
 		want.Attempts, want.NextAttemptAt, want.LastError = 1, at.Add(Backoff(1)), talosCause
 		if !sameTalosRow(got, want) {
@@ -391,12 +392,12 @@ func runTalosSuite(t *testing.T, open func(testing.TB) *db.DB, pair func(testing
 		}
 
 		at := t0.Add(time.Minute)
-		got := mustFailTalos(t, r, TalosFailure{Key: ninth, Cause: talosCause, At: at})
+		got := mustFailTalos(t, r, TalosFailure{Claim: TalosClaim{Key: ninth}, Cause: talosCause, At: at})
 		if got.State != CacheFailed || got.Attempts != MaxFetchAttempts-1 || !got.NextAttemptAt.Equal(at.Add(Backoff(MaxFetchAttempts-1))) {
 			t.Fatalf("the %dth failure = %+v, want failed, attempts %d, due after %s", MaxFetchAttempts-1, got, MaxFetchAttempts-1, Backoff(MaxFetchAttempts-1))
 		}
 
-		got = mustFailTalos(t, r, TalosFailure{Key: tenth, Cause: talosCause, At: at})
+		got = mustFailTalos(t, r, TalosFailure{Claim: TalosClaim{Key: tenth}, Cause: talosCause, At: at})
 		want := talosRowIn(tenth, CacheBroken, at)
 		want.Attempts, want.LastError = MaxFetchAttempts, talosCause
 		if !sameTalosRow(got, want) {
@@ -412,7 +413,7 @@ func runTalosSuite(t *testing.T, open func(testing.TB) *db.DB, pair func(testing
 		seedTalos(t, d, talosRowIn(k, CacheFetching, t0))
 
 		at := t0.Add(time.Minute)
-		got := mustFailTalos(t, r, TalosFailure{Key: k, Cause: talosCause, Integrity: true, At: at})
+		got := mustFailTalos(t, r, TalosFailure{Claim: TalosClaim{Key: k}, Cause: talosCause, Integrity: true, At: at})
 		want := talosRowIn(k, CacheBroken, at)
 		want.Attempts, want.LastError = 1, talosCause
 		if !sameTalosRow(got, want) {
@@ -429,7 +430,7 @@ func runTalosSuite(t *testing.T, open func(testing.TB) *db.DB, pair func(testing
 		seed.Assets = talosAssets()
 		seedTalos(t, d, seed)
 
-		got := mustFailTalos(t, r, TalosFailure{Key: k, Cause: talosCause, Integrity: true, At: t0.Add(time.Minute)})
+		got := mustFailTalos(t, r, TalosFailure{Claim: TalosClaim{Key: k}, Cause: talosCause, Integrity: true, At: t0.Add(time.Minute)})
 		if !sameTalosRow(got, seed) {
 			t.Fatalf("RecordTalosFailure of a ready row = %+v, want it unchanged: %+v", got, seed)
 		}
@@ -444,7 +445,7 @@ func runTalosSuite(t *testing.T, open func(testing.TB) *db.DB, pair func(testing
 		r := NewRepository(d)
 		seedTalos(t, d, talosRowIn(k, CacheFetching, t0))
 
-		got := mustFailTalos(t, r, TalosFailure{Key: k, Cause: strings.Repeat("x", 2*MaxCauseBytes), At: t0})
+		got := mustFailTalos(t, r, TalosFailure{Claim: TalosClaim{Key: k}, Cause: strings.Repeat("x", 2*MaxCauseBytes), At: t0})
 		if len(got.LastError) != MaxCauseBytes {
 			t.Fatalf("stored cause is %d bytes, want %d", len(got.LastError), MaxCauseBytes)
 		}
@@ -478,12 +479,12 @@ func runTalosSuite(t *testing.T, open func(testing.TB) *db.DB, pair func(testing
 		seedTalos(t, d, talosRowIn(b, CacheFetching, t0))
 
 		at := t0.Add(time.Minute)
-		moved, err := r.ResetTalosFetchingRow(t.Context(), a, at)
+		moved, err := r.ResetTalosFetchingRow(t.Context(), TalosClaim{Key: a}, at)
 		wantBool(t, "ResetTalosFetchingRow(a)", moved, err, true)
 		wantTalos(t, r, a, talosRowIn(a, CacheWanted, at))
 		wantTalos(t, r, b, talosRowIn(b, CacheFetching, t0))
 
-		moved, err = r.ResetTalosFetchingRow(t.Context(), a, at.Add(time.Minute))
+		moved, err = r.ResetTalosFetchingRow(t.Context(), TalosClaim{Key: a}, at.Add(time.Minute))
 		wantBool(t, "ResetTalosFetchingRow(wanted)", moved, err, false)
 		wantTalos(t, r, a, talosRowIn(a, CacheWanted, at))
 	})
@@ -535,23 +536,60 @@ func runTalosSuite(t *testing.T, open func(testing.TB) *db.DB, pair func(testing
 		}
 	})
 
-	// A reset under a fetch in flight would let a second worker claim the row
-	// while the first still settles it, so it is refused until the fetch ends.
-	t.Run("ResetHashRefusedWhileFetching", func(t *testing.T) {
+	// A reset applies to a fetching row too. The claim's generation makes every
+	// write of the worker that held the row miss afterwards, even once a second
+	// worker has claimed it again: its ready would put back the cleared hashes.
+	t.Run("ResetHashDuringFetch", func(t *testing.T) {
 		d := open(t)
 		r := NewRepository(d)
-		seed := talosRowIn(k, CacheFetching, t0)
+		seed := talosRowIn(k, CacheWanted, t0)
 		seed.Assets = talosAssets()
 		seedTalos(t, d, seed)
+		old, ok := mustClaimTalos(t, r, TalosOther, t0)
+		if !ok {
+			t.Fatal("ClaimTalos found no row")
+		}
 
-		moved, err := r.ResetTalosHash(t.Context(), k, ActorCLI, t0.Add(time.Minute))
-		if !errors.Is(err, ErrTalosFetching) || moved {
-			t.Fatalf("ResetTalosHash(fetching) = %v, %v; want false, ErrTalosFetching", moved, err)
+		at := t0.Add(time.Minute)
+		moved, err := r.ResetTalosHash(t.Context(), k, ActorCLI, at)
+		wantBool(t, "ResetTalosHash(fetching)", moved, err, true)
+		reset := talosRowIn(k, CacheWanted, at)
+		reset.ClaimGen = old.ClaimGen
+		wantTalos(t, r, k, reset)
+		wantOneAudit(t, d, "talos.hash_reset", ActorCLI, "", hashResetAuditJSON)
+
+		// late sends the old worker's writes and fails unless they all miss.
+		late := func(t *testing.T, want TalosRow) {
+			t.Helper()
+			lateAt := at.Add(time.Minute)
+			moved, err := r.MarkTalosReady(t.Context(), old.Claim(), talosAssets(), lateAt)
+			wantBool(t, "the old claim's MarkTalosReady", moved, err, false)
+			if got := mustFailTalos(t, r, TalosFailure{Claim: old.Claim(), Cause: talosCause, Integrity: true, At: lateAt}); !sameTalosRow(got, want) {
+				t.Fatalf("the old claim's RecordTalosFailure = %+v, want the row unchanged: %+v", got, want)
+			}
+			if err := r.RecordTalosProgress(t.Context(), old.Claim(), 40, 100); err != nil {
+				t.Fatalf("the old claim's RecordTalosProgress: %v", err)
+			}
+			moved, err = r.ResetTalosFetchingRow(t.Context(), old.Claim(), lateAt)
+			wantBool(t, "the old claim's ResetTalosFetchingRow", moved, err, false)
+			wantTalos(t, r, k, want)
 		}
-		wantTalos(t, r, k, seed)
-		if got := auditsOf(t, d, "talos.hash_reset"); len(got) != 0 {
-			t.Fatalf("talos.hash_reset audits = %+v, want none for a refused reset", got)
+		late(t, reset)
+
+		claimAt := at.Add(2 * time.Minute)
+		cur, ok := mustClaimTalos(t, r, TalosOther, claimAt)
+		if !ok || cur.ClaimGen != old.ClaimGen+1 {
+			t.Fatalf("second ClaimTalos = %+v, %v; want the row at generation %d", cur, ok, old.ClaimGen+1)
 		}
+		reclaimed := reset
+		reclaimed.State, reclaimed.UpdatedAt, reclaimed.ClaimGen = CacheFetching, claimAt, cur.ClaimGen
+		late(t, reclaimed)
+		if got := auditsOf(t, d, "talos.broken"); len(got) != 0 {
+			t.Fatalf("talos.broken audits = %+v, want none from the old claim", got)
+		}
+
+		moved, err = r.MarkTalosReady(t.Context(), cur.Claim(), talosAssets(), claimAt)
+		wantBool(t, "the new claim's MarkTalosReady", moved, err, true)
 	})
 
 	t.Run("Talos", func(t *testing.T) {
