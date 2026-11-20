@@ -48,9 +48,6 @@ func allowedCases() []allowedCase {
 		{Lifecycle{State: StateOrphaned, OrphanedFrom: StateInstallUnconfirmed}, TriggerRebind, guardOK, Lifecycle{State: StateInstalled}},
 		{Lifecycle{State: StateOrphaned, OrphanedFrom: StateInstalling}, TriggerRebind, guardOK, Lifecycle{State: StateAssigned}},
 		{Lifecycle{State: StateOrphaned, OrphanedFrom: StateAssigned}, TriggerRebind, guardOK, Lifecycle{State: StateAssigned}},
-		// Rebind keeps the machine's own UUID, so Junk is not consulted.
-		{Lifecycle{State: StateOrphaned, OrphanedFrom: StateInstalled}, TriggerRebind,
-			Guard{Junk: true, HostExists: true, HostUnbound: true}, Lifecycle{State: StateInstalled}},
 		{Lifecycle{State: StateOrphaned, OrphanedFrom: StateInstalled}, TriggerCordon, Guard{},
 			Lifecycle{State: StateCordoned, Prior: StateOrphaned, OrphanedFrom: StateInstalled}},
 		{Lifecycle{State: StateCordoned, Prior: StateInstalled}, TriggerUncordon, Guard{}, Lifecycle{State: StateInstalled}},
@@ -167,6 +164,27 @@ func TestNext_Rejected(t *testing.T) {
 			}
 			if got != tt.from {
 				t.Errorf("Next returned %+v on error, want the input %+v unchanged", got, tt.from)
+			}
+		})
+	}
+}
+
+// A junk machine is never put into a host, so a rebind of one is refused, and
+// before the host is looked at.
+func TestNext_RebindJunk(t *testing.T) {
+	orphaned := Lifecycle{State: StateOrphaned, OrphanedFrom: StateInstalled}
+	for name, g := range map[string]Guard{
+		"host free":    {Junk: true, HostExists: true, HostUnbound: true},
+		"host missing": {Junk: true, HostUnbound: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, err := Next(orphaned, TriggerRebind, g)
+			te, ok := errors.AsType[*TransitionError](err)
+			if !ok || te.Reason != reasonJunkUUID {
+				t.Fatalf("Next(%+v, rebind, %+v) error = %v, want a %s TransitionError", orphaned, g, err, reasonJunkUUID)
+			}
+			if got != orphaned {
+				t.Errorf("Next returned %+v on error, want the input %+v unchanged", got, orphaned)
 			}
 		})
 	}

@@ -118,5 +118,11 @@ type BootRecord struct {
 	// WantFetch asks for the row it names to be wanted, as wantFetch does. Only
 	// a known, non-conflict boot may carry it.
 	WantFetch *FetchWant
-	At        time.Time
+	// ObserveIdentity is true when the caller decided on a machine whose
+	// IdentityObserved was false: RecordBoot stores Identity's serial and
+	// product as the machine's first report, before anything else, and returns
+	// ErrIdentityRace, storing nothing, when another boot or /discover did. Only
+	// a known, non-conflict boot may carry it.
+	ObserveIdentity bool
+	At              time.Time
 }

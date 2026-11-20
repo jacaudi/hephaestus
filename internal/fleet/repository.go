@@ -20,10 +20,15 @@ const (
 	// oldest are dropped.
 	ReportsKept = 10
 
-	actorSystem        = "system"
-	actionUUIDConflict = "alert.uuid_conflict"
-	actionHold         = "hold"
-	actionSetting      = "settings.unknown_action"
+	// ActorCLI is the audit actor of an admin's command.
+	ActorCLI = "cli"
+	// ActorSystem is the audit actor of hephaestus acting on its own.
+	ActorSystem = "system"
+
+	actionUUIDConflict     = "alert.uuid_conflict"
+	actionHold             = "hold"
+	actionSetting          = "settings.unknown_action"
+	actionIdentityObserved = "identity.observed"
 	// holdCoalesceWindow is how long an identical hold is folded into the last one.
 	holdCoalesceWindow = time.Hour
 
@@ -35,6 +40,11 @@ const (
 // names the stored flag: another process set it again or cleared it since the
 // caller read it. Nothing was stored; the caller reads the machine again.
 var ErrBootNextChanged = errors.New("boot-next changed since it was read")
+
+// ErrIdentityRace is returned by RecordBoot when its ObserveIdentity no longer
+// holds: the machine's identity was observed since the caller read it. Nothing
+// was stored; the caller reads the machine and decides again.
+var ErrIdentityRace = errors.New("fleet: the machine's identity was observed since it was read")
 
 // ErrIdentityConflict is returned by Observe when the stored serial or product
 // of the machine holding the reported UUID differs from the report's.
@@ -117,6 +127,20 @@ type transitionDetail struct {
 	To   string `json:"to"`
 }
 
+// identityDetail is the detail of an identity.observed audit event.
+type identityDetail struct {
+	Serial  string `json:"serial"`
+	Product string `json:"product"`
+}
+
+// AuditEvent is one entry of the audit log: what Actor did at At, to the
+// machine MachineID when it names one. Detail is stored as JSON.
+type AuditEvent struct {
+	At                       time.Time
+	Actor, Action, MachineID string
+	Detail                   any
+}
+
 // Repository stores machines, their boot events and the audit log.
 type Repository struct {
 	bdb *bun.DB
@@ -143,15 +167,38 @@ func (r *Repository) Get(ctx context.Context, id string) (Machine, error) {
 	return loadMachine(ctx, r.bdb, id)
 }
 
+// ListMachines returns every machine, oldest first and then by ID, with their MACs.
+func (r *Repository) ListMachines(ctx context.Context) ([]Machine, error) {
+	var out []Machine
+	if err := r.bdb.NewSelect().Model(&out).Order("created_at", "id").Scan(ctx); err != nil {
+		return nil, fmt.Errorf("fleet: list machines: %w", err)
+	}
+	if err := hydrateAll(ctx, r.bdb, out); err != nil {
+		return nil, fmt.Errorf("fleet: list machines: %w", err)
+	}
+	return out, nil
+}
+
+// Audit stores ev on the repository's database, for a caller outside a
+// transaction; InsertAudit stores it in the caller's.
+func (r *Repository) Audit(ctx context.Context, ev AuditEvent) error {
+	if err := InsertAudit(ctx, r.bdb, ev); err != nil {
+		return fmt.Errorf("fleet: audit: %w", err)
+	}
+	return nil
+}
+
 // RecordBoot stores one observed boot in a single transaction and returns the
 // machine as stored. With no MachineID it creates the machine (Trigger must be
 // TriggerFirstContact); otherwise it records the boot against that machine. A
 // Conflict boot touches nothing but the machine's junk flag and the audit log.
 // The boot event is stored too, except a hold identical to the machine's last
 // one within the hour, and the machine's boot events and MACs stay bounded. On
-// a known boot that is not a Conflict, ClearBootNext and then WantFetch run
-// before the boot event is stored; either one on any other boot is
-// ErrInvalidTransition.
+// a known boot that is not a Conflict, ObserveIdentity, ClearBootNext and then
+// WantFetch run before the boot event is stored; any of them on another boot is
+// ErrInvalidTransition. ObserveIdentity stores the boot's serial and product as
+// the machine's first report, and ErrIdentityRace, storing nothing, says the
+// identity was observed since the caller read the machine.
 func (r *Repository) RecordBoot(ctx context.Context, rec BootRecord) (Machine, error) {
 	var out Machine
 	err := r.bdb.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
@@ -172,19 +219,20 @@ type TransitionRequest struct {
 	// Guard carries the facts about the host; Transition fills Guard.Junk from
 	// the stored machine.
 	Guard Guard
+	// Bind is the host and Talos image the machine is bound to. It is required
+	// for approve, adopt, adopt_by_uuid and rebind, and ignored otherwise.
+	Bind  *Binding
 	Actor string
 	At    time.Time
 }
 
 // Transition applies req.Trigger to the machine in a single transaction and
-// audits it. A refused transition returns a *TransitionError and writes
-// nothing. A trigger that ends in StateNone (forget) deletes the machine, with
-// its MACs and boot events, and returns it with State StateNone.
+// audits it, as TransitionTx does inside a caller's.
 func (r *Repository) Transition(ctx context.Context, req TransitionRequest) (Machine, error) {
 	var out Machine
 	err := r.bdb.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
 		var err error
-		out, err = transition(ctx, tx, req)
+		out, err = TransitionTx(ctx, tx, req)
 		return err
 	})
 	if err != nil {
@@ -205,7 +253,9 @@ type Observation struct {
 // transition.first_contact audit event. A known machine whose serial or product
 // differs from id is a clone: Observe marks its UUID junk and alerts once (the
 // first call reports Alerted), writes nothing else, and returns the
-// Observation with ErrIdentityConflict. Any other known machine is touched.
+// Observation with ErrIdentityConflict. Any other known machine is touched. A
+// machine whose identity was never observed takes id's serial and product as
+// its identity, unless another call did first, and then they are compared.
 func (r *Repository) Observe(ctx context.Context, id Identity, arch Arch, at time.Time) (Observation, error) {
 	var (
 		obs      Observation
@@ -311,6 +361,11 @@ func observe(ctx context.Context, tx bun.IDB, id Identity, arch Arch, at time.Ti
 	if err != nil {
 		return Observation{}, false, err
 	}
+	if ok && !m.IdentityObserved {
+		if m, err = settleIdentity(ctx, tx, m, id, at); err != nil {
+			return Observation{}, false, err
+		}
+	}
 	switch {
 	case !ok:
 		m, err = createMachine(ctx, tx, BootRecord{Identity: id, Arch: arch, Trigger: TriggerFirstContact, At: at})
@@ -319,7 +374,7 @@ func observe(ctx context.Context, tx bun.IDB, id Identity, arch Arch, at time.Ti
 		}
 		// A transition is applied with its event; /boot creations carry a boot
 		// event instead.
-		audit := auditEventRow{At: at.UTC(), Actor: actorSystem, Action: "transition." + string(TriggerFirstContact), MachineID: m.ID}
+		audit := auditEventRow{At: at.UTC(), Actor: ActorSystem, Action: "transition." + string(TriggerFirstContact), MachineID: m.ID}
 		if err := insertAudit(ctx, tx, audit, transitionDetail{From: stateName(StateNone), To: stateName(m.State)}); err != nil {
 			return Observation{}, false, err
 		}
@@ -340,6 +395,38 @@ func observe(ctx context.Context, tx bun.IDB, id Identity, arch Arch, at time.Ti
 		return Observation{}, false, fmt.Errorf("update machine %s: %w", m.ID, err)
 	}
 	return Observation{Machine: m}, false, nil
+}
+
+// settleIdentity gives a machine that was read with its identity unobserved the
+// serial and product of id. When another transaction observed it first, it
+// returns the machine as that left it, which observe then compares with id.
+func settleIdentity(ctx context.Context, tx bun.IDB, m Machine, id Identity, at time.Time) (Machine, error) {
+	observed, err := observeIdentity(ctx, tx, m.ID, id, at)
+	if err != nil {
+		return Machine{}, err
+	}
+	if !observed {
+		return loadMachine(ctx, tx, m.ID)
+	}
+	m.Serial, m.Product, m.IdentityObserved = id.Serial, id.Product, true
+	return m, nil
+}
+
+// observeIdentity stores id's serial and product as the machine's identity and
+// audits it, only while the machine's identity is unobserved. It reports false,
+// writing nothing, when it already is.
+func observeIdentity(ctx context.Context, q bun.IDB, machineID string, id Identity, at time.Time) (bool, error) {
+	observed, err := applied(ctx, q.NewUpdate().Model((*Machine)(nil)).
+		Set("serial = ?", id.Serial).Set("product = ?", id.Product).Set("identity_observed = ?", true).
+		Where("id = ?", machineID).Where("identity_observed = ?", false))
+	if err != nil {
+		return false, fmt.Errorf("observe identity of %s: %w", machineID, err)
+	}
+	if !observed {
+		return false, nil
+	}
+	ev := AuditEvent{At: at, Actor: ActorSystem, Action: actionIdentityObserved, MachineID: machineID, Detail: identityDetail{Serial: id.Serial, Product: id.Product}}
+	return true, InsertAudit(ctx, q, ev)
 }
 
 func recordReport(ctx context.Context, tx bun.IDB, machineID string, rep Report) (bool, error) {
@@ -487,6 +574,16 @@ func loadMachine(ctx context.Context, q bun.IDB, id string) (Machine, error) {
 	return m, nil
 }
 
+// hydrateAll is hydrate for every machine of ms.
+func hydrateAll(ctx context.Context, q bun.IDB, ms []Machine) error {
+	for i := range ms {
+		if err := hydrate(ctx, q, &ms[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // hydrate fills the MACs a machine row does not carry and puts its times in UTC.
 func hydrate(ctx context.Context, q bun.IDB, m *Machine) error {
 	m.CreatedAt, m.LastSeenAt, m.BootNextSetAt = m.CreatedAt.UTC(), m.LastSeenAt.UTC(), m.BootNextSetAt.UTC()
@@ -500,6 +597,9 @@ func hydrate(ctx context.Context, q bun.IDB, m *Machine) error {
 func recordBoot(ctx context.Context, tx bun.IDB, rec BootRecord) (Machine, error) {
 	if (rec.ClearBootNext != nil || rec.WantFetch != nil) && (rec.MachineID == "" || rec.Conflict) {
 		return Machine{}, fmt.Errorf("%w: clearing boot-next or wanting a fetch needs a known boot that is not a conflict", ErrInvalidTransition)
+	}
+	if rec.ObserveIdentity && (rec.MachineID == "" || rec.Conflict) {
+		return Machine{}, fmt.Errorf("%w: observing the identity needs a known boot that is not a conflict", ErrInvalidTransition)
 	}
 	var (
 		from State
@@ -533,7 +633,7 @@ func recordBoot(ctx context.Context, tx bun.IDB, rec BootRecord) (Machine, error
 // recordKnownBoot has already written: machines are locked before utility_cache.
 func applyBootNext(ctx context.Context, tx bun.IDB, machineID string, rec BootRecord) error {
 	if c := rec.ClearBootNext; c != nil {
-		req := ClearBootNextRequest{MachineID: machineID, Entry: c.Entry, SetAt: c.SetAt, Reason: c.Reason, Actor: actorSystem, At: rec.At}
+		req := ClearBootNextRequest{MachineID: machineID, Entry: c.Entry, SetAt: c.SetAt, Reason: c.Reason, Actor: ActorSystem, At: rec.At}
 		cleared, err := clearBootNext(ctx, tx, req)
 		if err != nil {
 			return err
@@ -610,6 +710,17 @@ func recordKnownBoot(ctx context.Context, tx bun.IDB, rec BootRecord) (State, Ma
 		return m.State, m, nil
 	}
 
+	// First, so a lost race stores nothing.
+	if rec.ObserveIdentity {
+		observed, err := observeIdentity(ctx, tx, m.ID, rec.Identity, rec.At)
+		if err != nil {
+			return StateNone, Machine{}, err
+		}
+		if !observed {
+			return StateNone, Machine{}, ErrIdentityRace
+		}
+	}
+
 	at := rec.At.UTC()
 	if rec.Identity.MAC != "" {
 		if err := upsertMAC(ctx, tx, m.ID, rec.Identity.MAC, at); err != nil {
@@ -640,7 +751,7 @@ func markUUIDJunk(ctx context.Context, q bun.IDB, stored Machine, seen Identity,
 	if _, err := q.NewUpdate().Model((*Machine)(nil)).Set("junk = ?", true).Where("smbios_uuid = ?", stored.UUID).Exec(ctx); err != nil {
 		return fmt.Errorf("mark UUID junk: %w", err)
 	}
-	audit := auditEventRow{At: at.UTC(), Actor: actorSystem, Action: actionUUIDConflict, MachineID: stored.ID}
+	audit := auditEventRow{At: at.UTC(), Actor: ActorSystem, Action: actionUUIDConflict, MachineID: stored.ID}
 	return insertAudit(ctx, q, audit, conflictDetail{
 		UUID: stored.UUID, MAC: seen.MAC,
 		StoredSerial: stored.Serial, StoredProduct: stored.Product,
@@ -699,30 +810,56 @@ func insertBootEvent(ctx context.Context, q bun.IDB, row bootEventRow) error {
 	return nil
 }
 
-func transition(ctx context.Context, tx bun.IDB, req TransitionRequest) (Machine, error) {
-	m, err := loadMachine(ctx, tx, req.MachineID)
+// TransitionTx applies req.Trigger to the machine inside the caller's
+// transaction q and audits it. A refused transition returns a *TransitionError
+// and writes nothing. The binding columns follow design section 5.2: approve,
+// adopt and rebind set them from req.Bind, unassign and unbind clear them, and
+// every other trigger leaves them. A bind the unique index refuses is the
+// *TransitionError "host_bound". A trigger that ends in StateNone (forget)
+// deletes the machine, with its MACs and boot events, and returns it with State
+// StateNone.
+func TransitionTx(ctx context.Context, q bun.IDB, req TransitionRequest) (Machine, error) {
+	m, err := loadMachine(ctx, q, req.MachineID)
 	if err != nil {
 		return Machine{}, err
 	}
 	req.Guard.Junk = m.Junk
-	from := m.State
-	lc, err := Next(m.Lifecycle(), req.Trigger, req.Guard)
+	from := m.Lifecycle()
+	lc, err := Next(from, req.Trigger, req.Guard)
 	if err != nil {
 		return Machine{}, err
 	}
 	m.State, m.Prior, m.OrphanedFrom = lc.State, lc.Prior, lc.OrphanedFrom
 
+	cols := []string{"state", "prior_state", "orphaned_from"}
+	switch {
+	case bindsHost(req.Trigger):
+		if req.Bind == nil {
+			return Machine{}, fmt.Errorf("%w: %s needs a binding", ErrInvalidTransition, req.Trigger)
+		}
+		setBinding(&m, req.Bind)
+		cols = append(cols, bindingColumns()...)
+	case clearsHost(req.Trigger):
+		setBinding(&m, nil)
+		cols = append(cols, bindingColumns()...)
+	}
+
 	if lc.State == StateNone {
-		_, err = tx.NewDelete().Model((*Machine)(nil)).Where("id = ?", m.ID).Exec(ctx)
+		_, err = q.NewDelete().Model((*Machine)(nil)).Where("id = ?", m.ID).Exec(ctx)
 	} else {
-		_, err = tx.NewUpdate().Model(&m).Column("state", "prior_state", "orphaned_from").WherePK().Exec(ctx)
+		_, err = q.NewUpdate().Model(&m).Column(cols...).WherePK().Exec(ctx)
+	}
+	if db.IsUniqueViolation(err) {
+		return Machine{}, &TransitionError{From: from, Trigger: req.Trigger, Reason: reasonHostBound}
 	}
 	if err != nil {
 		return Machine{}, fmt.Errorf("store state of %s: %w", m.ID, err)
 	}
-	detail := transitionDetail{From: stateName(from), To: stateName(lc.State)}
-	audit := auditEventRow{At: req.At.UTC(), Actor: req.Actor, Action: "transition." + string(req.Trigger), MachineID: m.ID}
-	if err := insertAudit(ctx, tx, audit, detail); err != nil {
+	ev := AuditEvent{
+		At: req.At, Actor: req.Actor, Action: "transition." + string(req.Trigger), MachineID: m.ID,
+		Detail: transitionDetail{From: stateName(from.State), To: stateName(lc.State)},
+	}
+	if err := InsertAudit(ctx, q, ev); err != nil {
 		return Machine{}, err
 	}
 	return m, nil
@@ -734,6 +871,13 @@ func stateName(s State) string {
 		return "none"
 	}
 	return string(s)
+}
+
+// InsertAudit stores ev in the caller's transaction or on its connection, its
+// Detail encoded as JSON.
+func InsertAudit(ctx context.Context, q bun.IDB, ev AuditEvent) error {
+	row := auditEventRow{At: stamp(ev.At), Actor: ev.Actor, Action: ev.Action, MachineID: ev.MachineID}
+	return insertAudit(ctx, q, row, ev.Detail)
 }
 
 // insertAudit stores row with detail encoded as its JSON Detail.

@@ -210,10 +210,14 @@ func bind(l Lifecycle, t Trigger, g Guard, from, to State) (Lifecycle, error) {
 
 // rebind binds an orphaned machine to another unbound host. It lands installed
 // when the machine was installed or install-unconfirmed before orphaning and
-// assigned otherwise. The UUID is the machine's own, so Junk is not consulted.
+// assigned otherwise. A junk UUID names no one machine, so a junk machine is
+// never put into a host again.
 func rebind(l Lifecycle, g Guard) (Lifecycle, error) {
 	if l.State != StateOrphaned || !l.OrphanedFrom.Bound() {
 		return refuse(l, TriggerRebind, reasonNotAllowed)
+	}
+	if g.Junk {
+		return refuse(l, TriggerRebind, reasonJunkUUID)
 	}
 	if reason := hostGuard(g); reason != "" {
 		return refuse(l, TriggerRebind, reason)

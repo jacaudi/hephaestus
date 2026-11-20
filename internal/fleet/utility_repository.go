@@ -241,7 +241,7 @@ func markReady(ctx context.Context, tx bun.IDB, w FetchWant, at time.Time, from 
 	if err != nil || !moved {
 		return false, err
 	}
-	audit := auditEventRow{At: at, Actor: actorSystem, Action: actionUtilityReady}
+	audit := auditEventRow{At: at, Actor: ActorSystem, Action: actionUtilityReady}
 	if err := insertAudit(ctx, tx, audit, cacheDetail{Entry: w.Key.Entry, Arch: w.Key.Arch, Pin: w.Pin}); err != nil {
 		return false, err
 	}
@@ -303,7 +303,7 @@ func recordFetchFailure(ctx context.Context, tx bun.IDB, f FetchFailure) (CacheR
 	}
 
 	if broken {
-		audit := auditEventRow{At: at, Actor: actorSystem, Action: actionUtilityBroken}
+		audit := auditEventRow{At: at, Actor: ActorSystem, Action: actionUtilityBroken}
 		detail := brokenDetail{cacheDetail: cacheDetail{Entry: f.Key.Entry, Arch: f.Key.Arch, Pin: f.Pin}, Error: f.Cause}
 		if err := insertAudit(ctx, tx, audit, detail); err != nil {
 			return CacheRow{}, err
@@ -323,7 +323,7 @@ func clearBrokenFlags(ctx context.Context, tx bun.IDB, key CacheKey, at time.Tim
 	}
 	for i := range flagged {
 		req := ClearBootNextRequest{
-			MachineID: flagged[i].ID, Entry: key.Entry, SetAt: flagged[i].BootNextSetAt, Reason: ClearBroken, Actor: actorSystem, At: at,
+			MachineID: flagged[i].ID, Entry: key.Entry, SetAt: flagged[i].BootNextSetAt, Reason: ClearBroken, Actor: ActorSystem, At: at,
 		}
 		if _, err := clearBootNext(ctx, tx, req); err != nil {
 			return err

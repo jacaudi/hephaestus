@@ -10,10 +10,7 @@ import (
 	"github.com/uptrace/bun"
 )
 
-const (
-	actorCLI          = "cli"
-	actionBootNextSet = "boot_next.set"
-)
+const actionBootNextSet = "boot_next.set"
 
 // AmbiguousError is returned by ResolveMachine when a UUID names more than one
 // machine, as a junk-pattern UUID does: Machines is how many, and MACs are
@@ -130,7 +127,7 @@ func setBootNext(ctx context.Context, tx bun.IDB, req SetBootNextRequest) (SetBo
 	if err != nil {
 		return SetBootNextResult{}, fmt.Errorf("set boot_next of %s: %w", m.ID, err)
 	}
-	audit := auditEventRow{At: at, Actor: actorCLI, Action: actionBootNextSet, MachineID: m.ID}
+	audit := auditEventRow{At: at, Actor: ActorCLI, Action: actionBootNextSet, MachineID: m.ID}
 	detail := setDetail{Entry: req.Entry, SetAt: at.Format(time.RFC3339Nano), Replaced: m.BootNext}
 	if err := insertAudit(ctx, tx, audit, detail); err != nil {
 		return SetBootNextResult{}, err
@@ -168,10 +165,8 @@ func (r *Repository) ListBootNext(ctx context.Context) ([]Machine, error) {
 	if err != nil {
 		return nil, fmt.Errorf("fleet: list boot-next: %w", err)
 	}
-	for i := range out {
-		if err := hydrate(ctx, r.bdb, &out[i]); err != nil {
-			return nil, fmt.Errorf("fleet: list boot-next: %w", err)
-		}
+	if err := hydrateAll(ctx, r.bdb, out); err != nil {
+		return nil, fmt.Errorf("fleet: list boot-next: %w", err)
 	}
 	return out, nil
 }
