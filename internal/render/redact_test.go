@@ -1,11 +1,14 @@
 package render
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"strings"
 	"testing"
+
+	"go.yaml.in/yaml/v4"
 )
 
 const refPassword = "ref+op://lab/admin/password"
@@ -226,34 +229,148 @@ func TestRedact_SurvivorNamesFirstPatternReference(t *testing.T) {
 	}
 }
 
-func FuzzRedact(f *testing.F) {
-	f.Add([]byte("k: abc\n"), "abc")
-	f.Add([]byte("a: RED\nb: E\nc: 0c9f\n"), "E")
-	f.Add([]byte("password: 'p@dm1n''sPass'\n"), "p@dm1n'sPass")
-	f.Add([]byte("key: |\n  -----BEGIN KEY-----\n  MHcCAQEEIEC1WIJb\n  -----END KEY-----\n"), "-----BEGIN KEY-----\nMHcCAQEEIEC1WIJb\n-----END KEY-----\n")
-	f.Add([]byte("k: Pj4+Pz8/eA==\nu: Pj4-Pz8_eA\nh: 3e3e3e3f3f3f78\n"), ">>>???x")
-	f.Add([]byte("a: [unclosed\n"), "secret-value")
-	f.Add([]byte(Marker+": "+Marker+"\n"), "RED")
-	f.Add([]byte("k: s3cr3t-one"+Marker+"s3cr3t-two\n"), "s3cr3t-one"+Marker+"s3cr3t-two")
-
-	f.Fuzz(func(t *testing.T, render []byte, value string) {
-		got, err := Redact(render, map[string]string{refPassword: value})
-
-		// A value that holds the marker cannot be told from a marker once replaced, so it is always refused.
-		if strings.Contains(value, Marker) && err == nil {
-			t.Fatalf("Redact(%q, %q) = %q, want an error: the value holds the marker", render, value, got)
+// outsideMarker reports whether s holds an occurrence of pat that is not wholly inside an occurrence of Marker.
+func outsideMarker(s, pat string) bool {
+	for i := range len(s) - len(pat) + 1 {
+		if s[i:i+len(pat)] != pat {
+			continue
 		}
 
-		if err != nil || value == "" {
+		inside := false
+
+		for m := max(0, i+len(pat)-len(Marker)); m <= i && !inside; m++ {
+			inside = strings.HasPrefix(s[m:], Marker)
+		}
+
+		if !inside {
+			return true
+		}
+	}
+
+	return false
+}
+
+// leakedRef returns the reference of a value with a pattern outside a Marker in out, as text or in a decoded scalar or
+// key.
+func leakedRef(out []byte, values map[string]string) (string, bool) {
+	texts := []string{string(out)}
+	dec := yaml.NewDecoder(bytes.NewReader(out))
+
+	for {
+		var doc any
+
+		if dec.Decode(&doc) != nil {
+			break
+		}
+
+		texts = appendDecoded(texts, doc)
+	}
+
+	for ref, value := range values {
+		for _, pat := range valuePatterns(value) {
+			for _, s := range texts {
+				if outsideMarker(s, pat) {
+					return ref, true
+				}
+			}
+		}
+	}
+
+	return "", false
+}
+
+// requireRedacted runs Redact and fails unless it either refuses with ErrRedaction, naming no value, or returns an
+// output in which no value has a pattern outside a Marker.
+func requireRedacted(t *testing.T, render string, values map[string]string) []byte {
+	t.Helper()
+
+	got, err := Redact([]byte(render), values)
+	if err != nil {
+		if !errors.Is(err, ErrRedaction) {
+			t.Fatalf("Redact error = %v, want ErrRedaction", err)
+		}
+
+		for _, value := range values {
+			if strings.Contains(err.Error(), value) {
+				t.Errorf("error text %q holds a value", err.Error())
+			}
+		}
+
+		return nil
+	}
+
+	if ref, found := leakedRef(got, values); found {
+		t.Fatalf("Redact = %q, <nil>: the value of %s remains outside a marker", got, ref)
+	}
+
+	return got
+}
+
+func TestRedact_StraddleSingleValue(t *testing.T) {
+	// The value ends with the first byte of a Marker that follows it.
+	requireRedacted(t, "k: abcdefgH"+Marker[1:]+"\n", map[string]string{refPassword: "abcdefgH"})
+}
+
+func TestRedact_StraddleAdjacentValues(t *testing.T) {
+	// The two values share the "H" where they meet, so redacting one leaves the other next to a Marker.
+	requireRedacted(t, "k: secretXHabcdefghij\n", map[string]string{"ref+op://a/b/one": "secretXH", "ref+op://a/b/two": "Habcdefghij"})
+}
+
+func TestRedact_ValueInsideMarkerAccepted(t *testing.T) {
+	values := map[string]string{refPassword: "RED"}
+
+	// "RED" also lies inside the Marker of b: that occurrence is the marker's own text.
+	got := redact(t, "a: RED\nb: "+Marker+"\n", values)
+
+	if !strings.HasPrefix(got, "a: "+Marker+"\n") {
+		t.Errorf("Redact = %q, want the value of a replaced by %s", got, Marker)
+	}
+
+	if ref, found := leakedRef([]byte(got), values); found {
+		t.Errorf("Redact = %q: the value of %s remains outside a marker", got, ref)
+	}
+}
+
+func TestRedact_PatternFormedAtMarkerEdgeRefused(t *testing.T) {
+	const refTwo = "ref+op://a/b/two"
+
+	// Replacing "zzzz" puts the Marker's last byte "f" before "Zq": the second value appears in a comment.
+	_, err := Redact([]byte("k: v # zzzzZq\n"), map[string]string{"ref+op://a/b/one": "zzzz", refTwo: "fZq"})
+
+	if redaction, ok := errors.AsType[*RedactionError](err); !ok || redaction.Ref != refTwo {
+		t.Fatalf("Redact error = %v, want a *RedactionError for %s", err, refTwo)
+	}
+}
+
+func FuzzRedact(f *testing.F) {
+	f.Add([]byte("k: abc\n"), "abc", "")
+	f.Add([]byte("a: RED\nb: E\nc: 0c9f\n"), "E", "0c9f")
+	f.Add([]byte("password: 'p@dm1n''sPass'\n"), "p@dm1n'sPass", "")
+	f.Add([]byte("key: |\n  -----BEGIN KEY-----\n  MHcCAQEEIEC1WIJb\n  -----END KEY-----\n"), "-----BEGIN KEY-----\nMHcCAQEEIEC1WIJb\n-----END KEY-----\n", "")
+	f.Add([]byte("k: Pj4+Pz8/eA==\nu: Pj4-Pz8_eA\nh: 3e3e3e3f3f3f78\n"), ">>>???x", "")
+	f.Add([]byte("a: [unclosed\n"), "secret-value", "")
+	f.Add([]byte(Marker+": "+Marker+"\n"), "RED", "")
+	f.Add([]byte("k: s3cr3t-one"+Marker+"s3cr3t-two\n"), "s3cr3t-one"+Marker+"s3cr3t-two", "")
+	f.Add([]byte("k: abcdefgH"+Marker[1:]+"\n"), "abcdefgH", "")
+	f.Add([]byte("k: secretXHabcdefghij\n"), "secretXH", "Habcdefghij")
+	f.Add([]byte("k: v # zzzzZq\n"), "zzzz", "fZq")
+
+	f.Fuzz(func(t *testing.T, render []byte, value, other string) {
+		values := map[string]string{refPassword: value, "ref+op://lab/admin/other": other}
+
+		got, err := Redact(render, values)
+
+		// A value that holds the marker cannot be told from a marker once replaced, so it is always refused.
+		if (strings.Contains(value, Marker) || strings.Contains(other, Marker)) && err == nil {
+			t.Fatalf("Redact(%q, %q) = %q, want an error: a value holds the marker", render, values, got)
+		}
+
+		if err != nil {
 			return
 		}
 
-		for _, scalar := range stringValues(got) {
-			for piece := range strings.SplitSeq(scalar, Marker) {
-				if strings.Contains(piece, value) {
-					t.Fatalf("Redact(%q, %q) = %q: the decoded scalar %q holds the value outside a marker", render, value, got, scalar)
-				}
-			}
+		if ref, found := leakedRef(got, values); found {
+			t.Fatalf("Redact(%q, %q) = %q: the value of %s remains outside a marker", render, values, got, ref)
 		}
 	})
 }

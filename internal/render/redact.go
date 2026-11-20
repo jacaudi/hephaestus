@@ -1,13 +1,13 @@
 package render
 
 import (
-	"bytes"
 	"cmp"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"iter"
 	"maps"
 	"slices"
 	"strings"
@@ -16,8 +16,8 @@ import (
 	"go.yaml.in/yaml/v4"
 )
 
-// Marker replaces every secret value in a display render. Matching skips its occurrences, so a value that is a part of
-// the marker's own text (such as "RED") is never matched inside one.
+// Marker replaces every secret value in a display render. A value's text that lies wholly inside a Marker, such as
+// "RED", is the marker's own text and not the value in clear.
 const Marker = "HEPHAESTUS-REDACTED-0c9f"
 
 // minLinePattern is the shortest trimmed line of a multi-line value that is redacted on its own.
@@ -51,37 +51,32 @@ type pattern struct {
 // value; an empty value is ignored.
 //
 // The patterns of a value are the value, its four base64 forms, its lower-case hex and, for a value of several lines,
-// each trimmed line of 8 or more characters that is not a PEM armour line. Longest patterns are replaced first. A
-// replacement pass, like the check, searches only the text between occurrences of Marker.
+// each trimmed line of 8 or more characters that is not a PEM armour line. Every occurrence of every pattern is found in
+// render, overlapping ones included, and each run of overlapping or touching occurrences is replaced by one Marker.
 //
-// The output is then decoded as multi-document YAML: a decode failure is ErrRedaction, and a decoded string scalar or
-// mapping key that still holds a pattern outside a Marker is a *RedactionError.
+// The output is then decoded as multi-document YAML: a decode failure is ErrRedaction. A pattern occurrence that is not
+// wholly inside a Marker, in the output text or in a decoded string scalar or mapping key, is a *RedactionError naming
+// the reference of the first such pattern, longest first.
 func Redact(render []byte, values map[string]string) ([]byte, error) {
 	patterns := patternsOf(values)
 
-	// A pattern that holds Marker spans the edge of a piece the search is cut into, so it would never match and the value
-	// would pass in clear: such a value is refused whole.
+	// A value that holds Marker cannot be told from a Marker once redacted, so it is refused whole.
 	for _, p := range patterns {
 		if strings.Contains(p.text, Marker) {
 			return nil, &RedactionError{Ref: p.ref}
 		}
 	}
 
-	text := string(render)
-
-	for _, p := range patterns {
-		text = replaceOutsideMarker(text, p.text)
-	}
-
-	out := []byte(text)
-	dec := yaml.NewDecoder(bytes.NewReader(out))
+	text := redactSpans(string(render), patterns)
+	texts := []string{text}
+	dec := yaml.NewDecoder(strings.NewReader(text))
 
 	for {
 		var doc any
 
 		err := dec.Decode(&doc)
 		if errors.Is(err, io.EOF) {
-			return out, nil
+			break
 		}
 
 		// The text of a decode error can quote the render, so it is dropped.
@@ -89,10 +84,14 @@ func Redact(render []byte, values map[string]string) ([]byte, error) {
 			return nil, fmt.Errorf("%w: the output does not decode as YAML", ErrRedaction)
 		}
 
-		if ref, found := survivor(appendDecoded(nil, doc), patterns); found {
-			return nil, &RedactionError{Ref: ref}
-		}
+		texts = appendDecoded(texts, doc)
 	}
+
+	if ref, found := survivor(texts, patterns); found {
+		return nil, &RedactionError{Ref: ref}
+	}
+
+	return []byte(text), nil
 }
 
 // patternsOf returns the patterns of every non-empty value: longest first, equal lengths in byte order, each text once
@@ -149,22 +148,63 @@ func isArmour(line string) bool {
 	return strings.HasPrefix(line, "-----BEGIN ") || strings.HasPrefix(line, "-----END ")
 }
 
-// replaceOutsideMarker replaces every occurrence of pat in text by Marker, except inside, or across the edge of, an
-// occurrence of Marker.
-func replaceOutsideMarker(text, pat string) string {
-	pieces := strings.Split(text, Marker)
+// redactSpans replaces every occurrence of every pattern in text by Marker, one Marker for each run of overlapping or
+// touching occurrences.
+func redactSpans(text string, patterns []pattern) string {
+	covered := make([]bool, len(text))
 
-	for i, piece := range pieces {
-		pieces[i] = strings.ReplaceAll(piece, pat, Marker)
+	for _, p := range patterns {
+		for i := range occurrences(text, p.text) {
+			for j := range len(p.text) {
+				covered[i+j] = true
+			}
+		}
 	}
 
-	return strings.Join(pieces, Marker)
+	var out strings.Builder
+
+	for i := 0; i < len(text); {
+		end := i
+		for end < len(text) && covered[end] == covered[i] {
+			end++
+		}
+
+		if covered[i] {
+			out.WriteString(Marker)
+		} else {
+			out.WriteString(text[i:end])
+		}
+
+		i = end
+	}
+
+	return out.String()
 }
 
-// holdsOutsideMarker reports whether s holds pat anywhere but inside an occurrence of Marker.
+// occurrences yields the start of every occurrence of pat in s, overlapping ones included. pat is not empty.
+func occurrences(s, pat string) iter.Seq[int] {
+	return func(yield func(int) bool) {
+		for i := 0; ; i++ {
+			at := strings.Index(s[i:], pat)
+			if at < 0 {
+				return
+			}
+
+			i += at
+			if !yield(i) {
+				return
+			}
+		}
+	}
+}
+
+// holdsOutsideMarker reports whether s holds an occurrence of pat that is not wholly inside an occurrence of Marker.
 func holdsOutsideMarker(s, pat string) bool {
-	for piece := range strings.SplitSeq(s, Marker) {
-		if strings.Contains(piece, pat) {
+	markers := slices.Collect(occurrences(s, Marker))
+
+	for i := range occurrences(s, pat) {
+		inside := func(m int) bool { return m <= i && i+len(pat) <= m+len(Marker) }
+		if !slices.ContainsFunc(markers, inside) {
 			return true
 		}
 	}
@@ -172,11 +212,11 @@ func holdsOutsideMarker(s, pat string) bool {
 	return false
 }
 
-// survivor returns the reference of the first pattern, in the order of patterns, that one of the decoded strings still
-// holds outside a Marker. Going pattern by pattern, not string by string, makes the answer the same on every run.
-func survivor(decoded []string, patterns []pattern) (ref string, found bool) {
+// survivor returns the reference of the first pattern, in the order of patterns, that one of texts holds outside a
+// Marker. Going pattern by pattern, not string by string, makes the answer the same on every run.
+func survivor(texts []string, patterns []pattern) (ref string, found bool) {
 	for _, p := range patterns {
-		for _, s := range decoded {
+		for _, s := range texts {
 			if holdsOutsideMarker(s, p.text) {
 				return p.ref, true
 			}
