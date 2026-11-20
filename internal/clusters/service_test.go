@@ -1,7 +1,10 @@
 package clusters
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,6 +25,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"go.uber.org/goleak"
 
+	"go.jacaudi.dev/hephaestus/internal/admin"
 	"go.jacaudi.dev/hephaestus/internal/clusters/gittest"
 	"go.jacaudi.dev/hephaestus/internal/db"
 	"go.jacaudi.dev/hephaestus/internal/db/dbtest"
@@ -1399,5 +1404,345 @@ func TestService_RefreshRenderErrorIncomplete(t *testing.T) {
 	}
 	if got := h.reported(); len(got) != 1 || !strings.HasSuffix(got[0], "the refresh is incomplete: the tree does not render") {
 		t.Errorf("reported %q, want one report that the refreshed tree does not render", got)
+	}
+}
+
+// svcCP is the control-plane host of svcFiles.
+const svcCP = "cp-01"
+
+// approvedAfterPoll polls s once and approves the pending pair it stored.
+func (h *svcHarness) approvedAfterPoll(s *Service) Pair {
+	h.t.Helper()
+	p := h.pendingAfterPoll(s)
+	approveForTest(h.t, h.d, h.id, p.ID)
+	return p
+}
+
+// ticket is a ticket of host on pair p.
+func (h *svcHarness) ticket(p Pair, host string) fleet.Ticket {
+	return fleet.Ticket{ClusterID: h.id, HostName: host, PairID: p.ID, SecretVersionID: p.SecretVersionID}
+}
+
+// hostRow is the stored render of host in the pair.
+func (h *svcHarness) hostRow(pairID, host string) HostRow {
+	h.t.Helper()
+	rows, err := h.repo.HostRows(h.t.Context(), pairID)
+	if err != nil {
+		h.t.Fatalf("HostRows(%s): %v", pairID, err)
+	}
+	for i := range rows {
+		if rows[i].Host == host {
+			return rows[i]
+		}
+	}
+	h.t.Fatalf("pair %s has no render of %s", pairID, host)
+	return HostRow{}
+}
+
+// alterHash stores another config hash for host in the pair, so the next render of it differs from the stored one.
+func (h *svcHarness) alterHash(pairID, host string) {
+	h.t.Helper()
+	execRaw(h.t, h.d, "UPDATE host_renders SET config_hash = ? WHERE pair_id = ? AND host_name = ?", "a-hash-no-render-has", pairID, host)
+}
+
+// wantDrift fails unless host's row in the pair records want, the render of the host, as its drift.
+func (h *svcHarness) wantDrift(pairID, host string, want HostRow) {
+	h.t.Helper()
+	got := h.hostRow(pairID, host)
+	if !got.Drift || got.DriftConfigHash != want.ConfigHash || got.DriftDisplayHash != want.DisplayHash || !bytes.Equal(got.DriftRedacted, want.Redacted) {
+		h.t.Errorf("drift of %s = %v (%s, %s); want true with the render's hashes (%s, %s) and redacted text",
+			host, got.Drift, got.DriftConfigHash, got.DriftDisplayHash, want.ConfigHash, want.DisplayHash)
+	}
+}
+
+// hashOf is hex(sha256(b)), as a render's config hash.
+func hashOf(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// damageVersion flips a byte of the sealed value set of the version.
+func damageVersion(t *testing.T, d *db.DB, versionID string) {
+	t.Helper()
+	sealed := scalar[[]byte](t, d, "SELECT values_sealed FROM secret_versions WHERE id = ?", versionID)
+	sealed[len(sealed)-1] ^= 0xff
+	execRaw(t, d, "UPDATE secret_versions SET values_sealed = ? WHERE id = ?", sealed, versionID)
+}
+
+func TestService_RenderUsesTicketPair(t *testing.T) {
+	srv := gittest.NewServer(t, gittest.Options{})
+	h := newSvcHarness(t, srv, "")
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	defer srv.Close()
+	srv.Commit(t, svcFiles(t), nil)
+	s := h.service(h.fake)
+	approved := h.approvedAfterPoll(s)
+
+	srv.Commit(t, map[string]string{"lab/control-plane/cp.yaml.tpl": "machine:\n  network:\n    hostname: {{ .Node.Host }}-next\n"}, nil)
+	h.now = h.now.Add(FetchInterval)
+	pending := h.pendingAfterPoll(s)
+	want := h.hostRow(approved.ID, svcCP).ConfigHash
+	if h.hostRow(pending.ID, svcCP).ConfigHash == want {
+		t.Fatal("the pending pair renders cp-01 as the approved one does")
+	}
+
+	config, err := s.Render(t.Context(), h.ticket(approved, svcCP))
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if got := hashOf(config); got != want {
+		t.Errorf("config hash = %s, want the approved pair's %s", got, want)
+	}
+}
+
+func TestService_RenderCacheMissNoDrift(t *testing.T) {
+	srv := gittest.NewServer(t, gittest.Options{})
+	h := newSvcHarness(t, srv, "")
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	defer srv.Close()
+	srv.Commit(t, svcFiles(t), nil)
+	s := h.service(h.fake)
+	approved := h.approvedAfterPoll(s)
+	s.cacheMu.Lock()
+	delete(s.cache, approved.ID)
+	s.cacheMu.Unlock()
+
+	// A pair still cached that a newer pending pair replaced in the database meanwhile.
+	srv.Commit(t, map[string]string{"lab/notes.txt": "a second head tree"}, nil)
+	h.now = h.now.Add(FetchInterval)
+	replaced := h.pendingAfterPoll(s)
+	srv.Commit(t, map[string]string{"lab/notes.txt": "a third head tree"}, nil)
+	h.now = h.now.Add(FetchInterval)
+	h.pendingAfterPoll(s)
+	if !cached(s, replaced.ID) {
+		t.Fatal("the replaced pair is no longer cached")
+	}
+
+	for _, tt := range []struct {
+		name string
+		p    Pair
+	}{
+		{"not cached", approved},
+		{"deleted meanwhile", replaced},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := s.Render(t.Context(), h.ticket(tt.p, svcCP))
+			if !errors.Is(err, ErrNoRender) {
+				t.Errorf("Render = %v, want ErrNoRender", err)
+			}
+		})
+	}
+	if row := h.hostRow(approved.ID, svcCP); row.Drift {
+		t.Error("a pair the cache lacks set drift")
+	}
+	if res := runCheck(t, s, "render:approved"); res.Status != admin.StatusPass {
+		t.Errorf("render:approved = %s (%q) after a cache miss, want pass", res.Status, res.Output)
+	}
+	s.failRender(approved.ID, svcCP)
+	if _, err := s.Render(t.Context(), h.ticket(approved, svcCP)); !errors.Is(err, ErrNoRender) {
+		t.Fatalf("Render = %v, want ErrNoRender", err)
+	}
+	if res := runCheck(t, s, "render:approved"); res.Status != admin.StatusFail {
+		t.Errorf("render:approved = %s after a cache miss over a failing render, want it still failing", res.Status)
+	}
+}
+
+func TestService_RenderDriftSetsDrift(t *testing.T) {
+	srv := gittest.NewServer(t, gittest.Options{})
+	h := newSvcHarness(t, srv, "")
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	defer srv.Close()
+	srv.Commit(t, svcFiles(t), nil)
+	s := h.service(h.fake)
+	approved := h.approvedAfterPoll(s)
+	rendered := h.hostRow(approved.ID, svcCP)
+	h.alterHash(approved.ID, svcCP)
+
+	config, err := s.Render(t.Context(), h.ticket(approved, svcCP))
+
+	if !errors.Is(err, ErrDrift) || config != nil {
+		t.Fatalf("Render = %d bytes, %v; want no config and ErrDrift", len(config), err)
+	}
+	h.wantDrift(approved.ID, svcCP, rendered)
+	if row := h.hostRow(approved.ID, "wrk-01"); row.Drift {
+		t.Error("drift set on wrk-01, whose render did not change")
+	}
+	wantOneAudit(t, h.d, "cluster.drift", fleet.ActorSystem, `{"cluster":"`+labName+`","host":"`+svcCP+`"}`)
+	if n := h.counter("hephaestus.alerts", "kind", "drift"); n != 1 {
+		t.Errorf("hephaestus.alerts{kind=drift} = %d, want 1", n)
+	}
+	if res := runCheck(t, s, "render:approved"); res.Status != admin.StatusPass {
+		t.Errorf("render:approved = %s (%q) after drift, want pass: drift is not a render error", res.Status, res.Output)
+	}
+}
+
+func TestService_DamagedSealedVersionIsRenderError(t *testing.T) {
+	srv := gittest.NewServer(t, gittest.Options{})
+	h := newSvcHarness(t, srv, "")
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	defer srv.Close()
+	srv.Commit(t, svcFiles(t), nil)
+	s := h.service(h.fake)
+	approved := h.approvedAfterPoll(s)
+	damageVersion(t, h.d, approved.SecretVersionID)
+
+	_, err := s.Render(t.Context(), h.ticket(approved, svcCP))
+
+	if err == nil || errors.Is(err, ErrDrift) || errors.Is(err, ErrNoRender) {
+		t.Fatalf("Render = %v, want a render error, neither ErrDrift nor ErrNoRender", err)
+	}
+	if row := h.hostRow(approved.ID, svcCP); row.Drift {
+		t.Error("a version that does not open set drift")
+	}
+	res := runCheck(t, s, "render:approved")
+	if res.Status != admin.StatusFail || !strings.Contains(res.Output, labName+"/"+svcCP) {
+		t.Errorf("render:approved = %s (%q), want fail naming %s/%s", res.Status, res.Output, labName, svcCP)
+	}
+}
+
+func TestService_RenderWhileGitLocked(t *testing.T) {
+	srv := gittest.NewServer(t, gittest.Options{})
+	h := newSvcHarness(t, srv, "")
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	defer srv.Close()
+	srv.Commit(t, svcFiles(t), nil)
+	s := h.service(h.fake)
+	approved := h.approvedAfterPoll(s)
+
+	s.git.mu.Lock() // a fetch holds the store
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.Render(ctx, h.ticket(approved, svcCP))
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		s.git.mu.Unlock()
+		if err != nil {
+			t.Errorf("Render while the git store is locked = %v, want a config", err)
+		}
+	case <-ctx.Done():
+		s.git.mu.Unlock()
+		<-done
+		t.Error("Render waited for the git store's mutex")
+	}
+}
+
+func TestService_StartupDetectsDrift(t *testing.T) {
+	srv := gittest.NewServer(t, gittest.Options{})
+	h := newSvcHarness(t, srv, "")
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	defer srv.Close()
+	srv.Commit(t, svcFiles(t), nil)
+	approved := h.approvedAfterPoll(h.service(h.fake))
+	rendered := h.hostRow(approved.ID, svcCP)
+	h.alterHash(approved.ID, svcCP)
+
+	h.service(h.fake)
+
+	h.wantDrift(approved.ID, svcCP, rendered)
+	wantOneAudit(t, h.d, "cluster.drift", fleet.ActorSystem, `{"cluster":"`+labName+`","host":"`+svcCP+`"}`)
+}
+
+func TestService_RefreshDetectsDrift(t *testing.T) {
+	srv := gittest.NewServer(t, gittest.Options{})
+	h := newSvcHarness(t, srv, "")
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	defer srv.Close()
+	srv.Commit(t, svcFiles(t), nil)
+	s := h.service(h.fake)
+	approved := h.approvedAfterPoll(s)
+	rendered := h.hostRow(approved.ID, svcCP)
+	h.alterHash(approved.ID, svcCP)
+
+	h.requestRefresh()
+	h.poll(s)
+
+	if c := h.cluster(); !c.LastRefreshAt.Equal(h.now) {
+		t.Fatalf("last refresh = %v, want %v; reported %q", c.LastRefreshAt, h.now, h.reported())
+	}
+	h.wantDrift(approved.ID, svcCP, rendered)
+}
+
+func TestService_UnreadableApprovedTreeFailsRender(t *testing.T) {
+	srv := gittest.NewServer(t, gittest.Options{})
+	h := newSvcHarness(t, srv, "")
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	defer srv.Close()
+	srv.Commit(t, svcFiles(t), nil)
+	approved := h.approvedAfterPoll(h.service(h.fake))
+	if err := os.RemoveAll(filepath.Join(h.gitDir, h.id+".git")); err != nil {
+		t.Fatalf("remove the cluster's repository: %v", err)
+	}
+
+	s := h.service(h.fake)
+
+	if cached(s, approved.ID) {
+		t.Fatal("the approved pair is cached without its repository")
+	}
+	res := runCheck(t, s, "render:approved")
+	if res.Status != admin.StatusFail || !strings.Contains(res.Output, labName) {
+		t.Errorf("render:approved = %s (%q), want fail naming %s", res.Status, res.Output, labName)
+	}
+}
+
+func TestService_RenderConcurrentWithPoll(t *testing.T) {
+	srv := gittest.NewServer(t, gittest.Options{})
+	h := newSvcHarness(t, srv, "")
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	defer srv.Close()
+	srv.Commit(t, svcFiles(t), nil)
+	// Render and the checks read the clock from their own goroutines, so this test's clock is safe for that.
+	var clock atomic.Int64
+	clock.Store(gitT0.UnixNano())
+	s, err := NewService(Config{
+		Repo: h.repo, Resolver: h.fake, GitDir: h.gitDir, Now: func() time.Time { return time.Unix(0, clock.Load()).UTC() },
+		OnError: h.onError, Meter: h.meter,
+	})
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+	s.git.caBundle = srv.CAPEM()
+	if err := s.Startup(t.Context()); err != nil {
+		t.Fatalf("Startup: %v", err)
+	}
+	approved := h.approvedAfterPoll(s)
+	var check admin.Check
+	for _, c := range s.Checks() {
+		if c.Name == "render:approved" {
+			check = c
+		}
+	}
+
+	// /config renders on its own goroutines while the poller stores and drops pairs in the tree cache.
+	ctx, cancel := context.WithCancel(t.Context())
+	var wg sync.WaitGroup
+	var renders, failures atomic.Int64
+	for range 2 {
+		wg.Go(func() {
+			for ctx.Err() == nil {
+				if _, err := s.Render(ctx, h.ticket(approved, svcCP)); err != nil && ctx.Err() == nil {
+					failures.Add(1)
+				}
+				renders.Add(1)
+				check.Run(ctx)
+			}
+		})
+	}
+	for i := range 3 {
+		srv.Commit(t, map[string]string{"lab/notes.txt": "head tree " + strconv.Itoa(i)}, nil)
+		clock.Add(int64(FetchInterval))
+		h.poll(s)
+	}
+	cancel()
+	wg.Wait()
+
+	if renders.Load() == 0 || failures.Load() != 0 {
+		t.Errorf("%d renders, %d failed; want some, none failed; reported %q", renders.Load(), failures.Load(), h.reported())
+	}
+	if n := len(h.fake.seen()); n != 4 {
+		t.Errorf("resolver called %d times, want 4: a pair per head tree", n)
 	}
 }

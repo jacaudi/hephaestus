@@ -33,6 +33,9 @@ const moveAsideInterval = time.Hour
 // moveAsideStamp is the time layout of the suffix of a moved-aside store; it sorts as the time does.
 const moveAsideStamp = "20060102T150405Z"
 
+// movedAsideInfix joins the store's directory name and the time in the name of a moved-aside store.
+const movedAsideInfix = ".corrupt-"
+
 // gitSource is where a cluster definition comes from.
 type gitSource struct {
 	// URL is the repository's HTTPS address.
@@ -208,7 +211,8 @@ func (g *gitStore) corrupt(tree string, err error) bool {
 
 // moveAside renames the store's directory to <dir>.corrupt-<UTC time>, keeps only the newest directory of that name
 // and forgets the expected trees. ok is false, and nothing is done, when the store was moved aside less than an hour
-// before at. A zero at is the store's clock now.
+// before at. When this process has not moved the store, the last move-aside is the time in the name of the newest
+// moved-aside directory, so the hour holds across a restart. A zero at is the store's clock now.
 func (g *gitStore) moveAside(at time.Time) (moved string, ok bool, err error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -216,11 +220,16 @@ func (g *gitStore) moveAside(at time.Time) (moved string, ok bool, err error) {
 	if at.IsZero() {
 		at = g.now()
 	}
+	if g.lastMovedAside.IsZero() {
+		if g.lastMovedAside, err = g.movedAsideAt(); err != nil {
+			return "", false, err
+		}
+	}
 	if !g.lastMovedAside.IsZero() && at.Sub(g.lastMovedAside) < moveAsideInterval {
 		return "", false, nil
 	}
 
-	moved = g.dir + ".corrupt-" + at.UTC().Format(moveAsideStamp)
+	moved = g.dir + movedAsideInfix + at.UTC().Format(moveAsideStamp)
 	if err := os.Rename(g.dir, moved); err != nil {
 		return "", false, fmt.Errorf("clusters: move the git store aside: %w", err)
 	}
@@ -233,21 +242,25 @@ func (g *gitStore) moveAside(at time.Time) (moved string, ok bool, err error) {
 	return moved, true, nil
 }
 
+// movedAsideAt is the time in the name of the newest moved-aside directory; zero when there is none.
+func (g *gitStore) movedAsideAt() (time.Time, error) {
+	dirs, err := g.movedAside()
+	if err != nil || len(dirs) == 0 {
+		return time.Time{}, err
+	}
+	at, err := time.Parse(moveAsideStamp, strings.TrimPrefix(filepath.Base(dirs[len(dirs)-1]), filepath.Base(g.dir)+movedAsideInfix))
+	if err != nil {
+		return time.Time{}, fmt.Errorf("clusters: the time of the newest moved-aside git store: %w", err)
+	}
+	return at, nil
+}
+
 // pruneMovedAside removes every moved-aside directory but the newest.
 func (g *gitStore) pruneMovedAside() error {
-	parent, prefix := filepath.Dir(g.dir), filepath.Base(g.dir)+".corrupt-"
-	entries, err := os.ReadDir(parent)
+	stale, err := g.movedAside()
 	if err != nil {
-		return fmt.Errorf("clusters: list the moved-aside git stores: %w", err)
+		return err
 	}
-
-	var stale []string
-	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), prefix) {
-			stale = append(stale, filepath.Join(parent, e.Name()))
-		}
-	}
-	// os.ReadDir sorts by name, and the suffix sorts as time does, so the newest is last.
 	if len(stale) > 0 {
 		stale = stale[:len(stale)-1]
 	}
@@ -257,6 +270,26 @@ func (g *gitStore) pruneMovedAside() error {
 		}
 	}
 	return nil
+}
+
+// movedAside returns the store's moved-aside directories, oldest first: os.ReadDir sorts by name, and the suffix sorts
+// as time does. A parent directory that does not exist holds none.
+func (g *gitStore) movedAside() ([]string, error) {
+	parent, prefix := filepath.Dir(g.dir), filepath.Base(g.dir)+movedAsideInfix
+	entries, err := os.ReadDir(parent)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("clusters: list the moved-aside git stores: %w", err)
+	}
+	var dirs []string
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), prefix) {
+			dirs = append(dirs, filepath.Join(parent, e.Name()))
+		}
+	}
+	return dirs, nil
 }
 
 func (g *gitStore) repoPath(clusterID string) string { return filepath.Join(g.dir, clusterID+".git") }

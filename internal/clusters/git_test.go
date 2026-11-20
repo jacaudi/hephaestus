@@ -326,6 +326,34 @@ func TestGit_MoveAsideKeepsNewest(t *testing.T) {
 	}
 }
 
+func TestGit_MoveAsideHourHoldsAcrossRestart(t *testing.T) {
+	srv := gittest.NewServer(t, gittest.Options{})
+	srv.Commit(t, labFiles("1"), nil)
+	g := newTestStore(t, srv)
+	if _, err := g.fetch(t.Context(), gitCluster, labSource(srv, gitLab)); err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if _, ok, err := g.moveAside(gitT0); err != nil || !ok {
+		t.Fatalf("moveAside = %v, %v; want it to move", ok, err)
+	}
+
+	// A restart: a new store over the same directory, which knows nothing of the move in memory.
+	restarted := newGitStore(g.dir, func() time.Time { return gitT0 })
+	restarted.caBundle = srv.CAPEM()
+	if _, err := restarted.fetch(t.Context(), gitCluster, labSource(srv, gitLab)); err != nil {
+		t.Fatalf("fetch after the restart: %v", err)
+	}
+	if moved, ok, err := restarted.moveAside(gitT0.Add(59 * time.Minute)); ok || err != nil {
+		t.Errorf("moveAside 59 minutes after the last one, after a restart = %q, %v, %v; want ok false", moved, ok, err)
+	}
+	if _, err := os.Stat(g.dir); err != nil {
+		t.Errorf("the store: %v; want it in place", err)
+	}
+	if moved, ok, err := restarted.moveAside(gitT0.Add(time.Hour)); !ok || err != nil {
+		t.Errorf("moveAside an hour after the last one = %q, %v, %v; want it to move", moved, ok, err)
+	}
+}
+
 func TestGit_MissingTreeAfterMoveAsideNotCorrupt(t *testing.T) {
 	srv := gittest.NewServer(t, gittest.Options{})
 	srv.Commit(t, labFiles("1"), nil)

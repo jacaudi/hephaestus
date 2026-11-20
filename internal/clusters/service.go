@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io/fs"
 	"maps"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +20,15 @@ import (
 	"go.jacaudi.dev/hephaestus/internal/render"
 	"go.jacaudi.dev/hephaestus/internal/secret"
 	"go.jacaudi.dev/hephaestus/internal/secrets"
+)
+
+var (
+	// ErrNoRender is returned by Render when the ticket's pair is not in the tree cache or is no longer stored. It
+	// sets neither drift nor render:approved.
+	ErrNoRender = errors.New("clusters: no render for this pair")
+	// ErrDrift is returned by Render when the host's render hashes differently from its stored one; the host's render
+	// row then records the drift.
+	ErrDrift = errors.New("clusters: render differs from the approved hash")
 )
 
 // Resolver resolves references in one call, with a result per reference; any error is a failure of the call as a
@@ -48,6 +58,8 @@ const (
 	alertMovedAside         = "git_store_moved_aside"
 	actionRefreshIncomplete = "cluster.refresh_incomplete"
 	alertRefreshIncomplete  = "refresh_incomplete"
+	actionDrift             = "cluster.drift"
+	alertDrift              = "drift"
 	outcomeOK               = "ok"
 	outcomeError            = "error"
 	kindMissingResult       = "missing"
@@ -66,6 +78,7 @@ const (
 	stageStore      = "store"
 	stageCache      = "cache"
 	stageRelease    = "release"
+	stageDrift      = "drift"
 )
 
 // Config holds what a Service needs.
@@ -77,9 +90,12 @@ type Config struct {
 	Counter *secrets.Counter
 	// GitDir is the directory of the git object store.
 	GitDir string
-	Now    func() time.Time
+	// Now is the clock. Render and the checks read it from their callers' goroutines, so it must be safe for
+	// concurrent use, as time.Now is.
+	Now func() time.Time
 	// OnError is told of every failure the service survives. Its errors name the stage, the cluster and, for a
-	// refused tree, the file and rule; never a resolver, render or git error's text.
+	// refused tree, the file and rule; never a resolver, render or git error's text. Render's callers reach it from
+	// their own goroutines, so it must be safe for concurrent use.
 	OnError func(context.Context, error)
 	// Meter creates the service's counters; nil is a no-op meter.
 	Meter metric.Meter
@@ -88,7 +104,8 @@ type Config struct {
 // Service polls the imported clusters, fetches their branches, turns each new head tree into a pending pair and
 // runs the refreshes their triggers ask for. It keeps the tree of every approved and pending pair, loaded, in a
 // cache. Startup and then Run are called on one goroutine, which owns the poll state and every processing mark the
-// service holds: head work and refreshes alike run on it.
+// service holds: head work, refreshes and drift detection alike run on it. Render and Checks set no mark and are safe
+// to call from any goroutine.
 type Service struct {
 	cfg     Config
 	git     *gitStore
@@ -113,6 +130,12 @@ type Service struct {
 	// one was a panic of the SDK's core.
 	clientFailures int
 	clientPanicked bool
+
+	renderMu sync.Mutex
+	// renderFailed maps a pair id to the hosts whose last render of it failed, "" standing for a tree that could not be
+	// loaded into the cache; render:approved reports those of each cluster's approved pair.
+	// ponytail: an entry stays after its pair is replaced; the check skips it, and a failed pair is rare and small.
+	renderFailed map[string][]string
 }
 
 // fetchState is a fetch of a cluster at a revision. tree is the head tree it found, or the one an earlier fetch at
@@ -157,6 +180,12 @@ type cachePair struct {
 	pairID, clusterID, cluster, tree string
 }
 
+// driftDetail is the detail of a cluster.drift audit event.
+type driftDetail struct {
+	Cluster string `json:"cluster"`
+	Host    string `json:"host"`
+}
+
 // movedDetail is the detail of a cluster.store_moved_aside audit event.
 type movedDetail struct {
 	Moved string `json:"moved"`
@@ -197,12 +226,14 @@ func NewService(cfg Config) (*Service, error) {
 	return &Service{
 		cfg: cfg, git: newGitStore(cfg.GitDir, cfg.Now), fetches: fetches, alerts: alerts,
 		fetched: map[string]fetchState{}, credentialFailed: map[string]credentialMark{}, held: map[string]struct{}{}, cache: map[string]*render.Cluster{},
+		renderFailed: map[string][]string{},
 	}, nil
 }
 
 // Startup turns a processing mark a dead process left into the failed tree "interrupted", then reads the tree of
 // every approved and pending pair into the cache. A corrupt store is moved aside, every cluster fetched afresh and
-// the pairs the cache lacks read again. A tree that cannot be read is reported and left out of the cache.
+// the pairs the cache lacks read again. A tree that cannot be read is reported and left out of the cache. Last, every
+// host of every approved pair is checked for drift.
 func (s *Service) Startup(ctx context.Context) error {
 	at := s.cfg.Now()
 	if _, err := s.cfg.Repo.ConvertInterrupted(ctx, at); err != nil {
@@ -222,7 +253,12 @@ func (s *Service) Startup(ctx context.Context) error {
 	}
 	s.git.expect(trees)
 	if s.fillCache(ctx, pairs, at) {
-		return s.refill(ctx, at)
+		if err := s.refill(ctx, at); err != nil {
+			return err
+		}
+	}
+	for i := range clusters {
+		s.detectDrift(ctx, &clusters[i], at)
 	}
 	return nil
 }
@@ -556,8 +592,8 @@ func (s *Service) resolveTree(ctx context.Context, w work, refs []string) (value
 
 // refreshIfDue runs at most one refresh of c when a trigger is due, c carries no mark and no backoff or rate limit
 // holds it back. Without a resolver nothing runs and the trigger stays pending; secrets:token reports the missing
-// token. The cluster is read again first, since the poll's work on it so far may have changed it. It reports whether
-// a corrupt read moved the store aside.
+// token. The cluster is read again first, since the poll's work on it so far may have changed it. After the refresh,
+// the hosts of its approved pair are checked for drift. It reports whether a corrupt read moved the store aside.
 func (s *Service) refreshIfDue(ctx context.Context, c *Cluster, at time.Time) (moved bool) {
 	if s.cfg.Resolver == nil {
 		return false
@@ -576,7 +612,9 @@ func (s *Service) refreshIfDue(ctx context.Context, c *Cluster, at time.Time) (m
 	if !due || fresh.ProcessingTree != "" || waiting(&fresh, at) {
 		return false
 	}
-	return s.refresh(ctx, &fresh, trigger, at)
+	moved = s.refresh(ctx, &fresh, trigger, at)
+	s.detectDrift(ctx, &fresh, at)
+	return moved
 }
 
 // refreshTrigger is the refresh trigger due for c at at: a refresh request, else the daily timer, a DailyInterval
@@ -910,7 +948,8 @@ func (s *Service) keep(pairID string, def *render.Cluster) {
 }
 
 // fillCache reads and loads each pair's tree into the cache. It stops, reporting true, when a corrupt read moved the
-// store aside; a tree that cannot be read or loaded otherwise is reported and skipped.
+// store aside; a tree that cannot be read or loaded otherwise is reported, skipped and kept for render:approved,
+// which reports it when the pair is a cluster's approved one.
 func (s *Service) fillCache(ctx context.Context, pairs []cachePair, at time.Time) (moved bool) {
 	for _, p := range pairs {
 		if ctx.Err() != nil {
@@ -925,19 +964,190 @@ func (s *Service) fillCache(ctx context.Context, pairs []cachePair, at time.Time
 				if s.moveAside(ctx, p.cluster, err, at) {
 					return true
 				}
+				s.failRender(p.pairID, "")
 				continue
 			}
 			s.report(ctx, stageCache, p.cluster, "a pair's tree cannot be read: a "+className(classifyRead(err))+" object")
+			s.failRender(p.pairID, "")
 			continue
 		}
 		def, err := render.Load(fsys)
 		if err != nil {
 			s.report(ctx, stageCache, p.cluster, "a pair's tree does not load")
+			s.failRender(p.pairID, "")
 			continue
 		}
 		s.keep(p.pairID, def)
+		s.clearRender(p.pairID)
 	}
 	return false
+}
+
+// Render returns the machine config of the ticket's host, rendered from the ticket's pair and secret version only,
+// never the cluster's current ones. It reads the tree cache and the database, never the git store, so a fetch does
+// not hold it up. A pair the cache lacks, or one no longer stored, is ErrNoRender. A render that hashes differently
+// from the host's stored one records the drift on the host's row and is ErrDrift. Any other error is a render error,
+// which keeps render:approved failing for the pair until a render of it is produced; its text can quote a secret
+// value, so it is never logged.
+func (s *Service) Render(ctx context.Context, t fleet.Ticket) ([]byte, error) {
+	config, err := s.renderTicket(ctx, t)
+	s.noteRender(ctx, t.PairID, err, t.HostName)
+	return config, err
+}
+
+// renderTicket renders the host of t from t's pair and version.
+func (s *Service) renderTicket(ctx context.Context, t fleet.Ticket) ([]byte, error) {
+	def, ok := s.cachedDef(t.PairID)
+	if !ok {
+		return nil, ErrNoRender
+	}
+	if _, err := s.cfg.Repo.Pair(ctx, t.PairID); err != nil {
+		return nil, noRender(err)
+	}
+	fresh, rows, err := s.renderPair(ctx, def, t.PairID, t.SecretVersionID)
+	if err != nil {
+		return nil, err
+	}
+	i := slices.IndexFunc(rows, func(row HostRow) bool { return row.Host == t.HostName })
+	if i < 0 {
+		return nil, ErrNoRender
+	}
+	return s.checkHost(ctx, t.ClusterID, rows[i], fresh, s.cfg.Now())
+}
+
+// detectDrift checks every host of c's approved pair for drift, as Render does, and reports a pair or host that does
+// not render. A pair the cache lacks is left alone: the cache fill reported it.
+func (s *Service) detectDrift(ctx context.Context, c *Cluster, at time.Time) {
+	def, ok := s.cachedDef(c.ApprovedPairID)
+	if !ok {
+		return
+	}
+	p, err := s.cfg.Repo.Pair(ctx, c.ApprovedPairID)
+	if err != nil {
+		if !errors.Is(err, ErrNotFound) {
+			s.fail(ctx, stageDrift, c.Name, err)
+		}
+		return
+	}
+	hosts := make([]string, len(def.Hosts))
+	for i, h := range def.Hosts {
+		hosts[i] = h.Name
+	}
+	fresh, rows, err := s.renderPair(ctx, def, p.ID, p.SecretVersionID)
+	s.noteRender(ctx, p.ID, err, hosts...)
+	if err != nil {
+		if !errors.Is(err, ErrNoRender) && ctx.Err() == nil {
+			s.report(ctx, stageDrift, c.Name, "the approved pair does not render") // the error can quote a value
+		}
+		return
+	}
+	for i := range rows {
+		if _, err := s.checkHost(ctx, c.ID, rows[i], fresh, at); err != nil && !errors.Is(err, ErrDrift) {
+			s.failRender(p.ID, rows[i].Host)
+			s.report(ctx, stageDrift, c.Name, "the approved pair renders no config for host "+rows[i].Host)
+		}
+	}
+}
+
+// renderPair renders def, the cached tree of the pair, with the values of version, and returns the render of each
+// host by name beside the pair's stored rows. A version no longer stored is ErrNoRender.
+func (s *Service) renderPair(ctx context.Context, def *render.Cluster, pairID, versionID string) (map[string]render.HostRender, []HostRow, error) {
+	values, err := s.cfg.Repo.Values(ctx, versionID)
+	if err != nil {
+		return nil, nil, noRender(err)
+	}
+	rows, err := s.cfg.Repo.HostRows(ctx, pairID)
+	if err != nil {
+		return nil, nil, err
+	}
+	renders, err := def.Render(ctx, values)
+	if err != nil {
+		return nil, nil, fmt.Errorf("clusters: render pair %s: %w", pairID, err)
+	}
+	fresh := make(map[string]render.HostRender, len(renders))
+	for i := range renders {
+		fresh[renders[i].Host] = renders[i]
+	}
+	return fresh, rows, nil
+}
+
+// checkHost returns the config of row's host from fresh when it hashes as row's; otherwise it records the drift and
+// is ErrDrift. A host fresh lacks is a render error.
+func (s *Service) checkHost(ctx context.Context, clusterID string, row HostRow, fresh map[string]render.HostRender, at time.Time) ([]byte, error) {
+	got, ok := fresh[row.Host]
+	if !ok {
+		return nil, fmt.Errorf("clusters: the render of pair %s has no host %s", row.PairID, row.Host)
+	}
+	if got.ConfigHash == row.ConfigHash {
+		return got.Config, nil
+	}
+	s.setDrift(ctx, clusterID, row, got, at)
+	return nil, ErrDrift
+}
+
+// setDrift records got as the drift of row's host, conditional on the hash row was read with, and when it wrote,
+// raises the alert drift and audits cluster.drift.
+func (s *Service) setDrift(ctx context.Context, clusterID string, row HostRow, got render.HostRender, at time.Time) {
+	set, err := s.cfg.Repo.SetDrift(ctx, SetDriftRequest{
+		PairID: row.PairID, Host: row.Host, ReadHash: row.ConfigHash,
+		Render: DriftRender{ConfigHash: got.ConfigHash, DisplayHash: got.DisplayHash, Redacted: got.Redacted},
+	})
+	if err != nil {
+		s.fail(ctx, stageDrift, "", err)
+		return
+	}
+	if !set {
+		return // another pair is approved, or the row was re-approved meanwhile
+	}
+	s.alerts.Add(ctx, 1, metric.WithAttributes(attribute.String("kind", alertDrift)))
+	c, err := findCluster(ctx, s.cfg.Repo.bdb, columnID, clusterID, false)
+	if err != nil {
+		s.fail(ctx, stageDrift, "", err)
+		return
+	}
+	ev := fleet.AuditEvent{At: at, Actor: fleet.ActorSystem, Action: actionDrift, Detail: driftDetail{Cluster: c.Name, Host: row.Host}}
+	if err := fleet.InsertAudit(ctx, s.cfg.Repo.bdb, ev); err != nil {
+		s.fail(ctx, stageDrift, c.Name, err)
+	}
+}
+
+// noteRender keeps render:approved's view of the pair after a render of it for hosts ended with err: a render that was
+// produced, served or drifted, clears the pair; a render error marks the hosts failing; no render, or a render ctx cut
+// short, changes nothing.
+func (s *Service) noteRender(ctx context.Context, pairID string, err error, hosts ...string) {
+	switch {
+	case err == nil, errors.Is(err, ErrDrift):
+		s.clearRender(pairID)
+	case errors.Is(err, ErrNoRender), ctx.Err() != nil:
+	default:
+		s.failRender(pairID, hosts...)
+	}
+}
+
+// failRender marks the hosts of the pair failing for render:approved.
+func (s *Service) failRender(pairID string, hosts ...string) {
+	s.renderMu.Lock()
+	defer s.renderMu.Unlock()
+	for _, h := range hosts {
+		if !slices.Contains(s.renderFailed[pairID], h) {
+			s.renderFailed[pairID] = append(s.renderFailed[pairID], h)
+		}
+	}
+}
+
+// clearRender marks every host of the pair rendering for render:approved.
+func (s *Service) clearRender(pairID string) {
+	s.renderMu.Lock()
+	defer s.renderMu.Unlock()
+	delete(s.renderFailed, pairID)
+}
+
+// noRender is err, or ErrNoRender when err says the pair or its version is gone: a newer approval deleted them.
+func noRender(err error) error {
+	if errors.Is(err, ErrNotFound) {
+		return ErrNoRender
+	}
+	return err
 }
 
 // release clears every processing mark the service holds; a mark it cannot clear is kept, to be cleared by the next
