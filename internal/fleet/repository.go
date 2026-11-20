@@ -580,6 +580,8 @@ func createMachine(ctx context.Context, tx bun.IDB, rec BootRecord) (Machine, er
 	m := Machine{
 		ID: rand.Text(), UUID: id.UUID, Junk: junk, Serial: id.Serial, Product: id.Product,
 		Arch: rec.Arch, State: lc.State, CreatedAt: at, LastSeenAt: at,
+		// The insert writes the whole struct, so the zero value would store false.
+		IdentityObserved: true,
 	}
 	if _, err := tx.NewInsert().Model(&m).Exec(ctx); err != nil {
 		return Machine{}, fmt.Errorf("insert machine: %w", err)

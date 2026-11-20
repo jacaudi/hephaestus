@@ -772,6 +772,27 @@ func runRepositorySuite(t *testing.T, open func(testing.TB) *db.DB) {
 			t.Fatalf("audit rows = %+v, want one settings.unknown_action local -> hold by admin", rows)
 		}
 	})
+
+	t.Run("FirstContactIdentityObserved", func(t *testing.T) {
+		d := open(t)
+		r := NewRepository(d)
+		booted := firstContact(t, r, originalIdentity(), t0)
+		obs, err := r.Observe(t.Context(), Identity{UUID: "11111111-2222-3333-4444-555555555555", MAC: macN(5), Serial: "S5", Product: "P5"}, ArchAMD64, t0)
+		if err != nil {
+			t.Fatalf("Observe: %v", err)
+		}
+		if !obs.Created {
+			t.Fatalf("Observe = %+v, want a created machine", obs)
+		}
+		for name, id := range map[string]string{"RecordBoot": booted.ID, "Observe": obs.Machine.ID} {
+			if got := scalar[bool](t, d, "SELECT identity_observed FROM machines WHERE id = ?", id); !got {
+				t.Errorf("%s: stored identity_observed = false, want true for a first-contact machine", name)
+			}
+			if got := mustGet(t, r, id); !got.IdentityObserved {
+				t.Errorf("%s: loaded IdentityObserved = false, want true", name)
+			}
+		}
+	})
 }
 
 // TestRecordBoot_Refused covers the RecordBoot refusals that need no stored data.

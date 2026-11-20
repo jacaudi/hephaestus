@@ -56,6 +56,13 @@ type Machine struct {
 	BootNext      string    `bun:"boot_next,nullzero"`
 	BootNextSetAt time.Time `bun:"boot_next_set_at,nullzero"`
 	BootNextMAC   string    `bun:"boot_next_mac,nullzero"`
+	// IdentityObserved is false for a machine created by adopting a UUID, until a
+	// boot reports its serial and product; every other machine has it true.
+	IdentityObserved bool `bun:"identity_observed"`
+	// TalosSchematic and TalosVersion are the Talos image of the machine's bound
+	// host: both nil while unbound, both set once bound.
+	TalosSchematic *string `bun:"talos_schematic"`
+	TalosVersion   *string `bun:"talos_version"`
 	// MACs are the machine's addresses, sorted. Get and Lookup fill them.
 	MACs []string `bun:"-"`
 }
