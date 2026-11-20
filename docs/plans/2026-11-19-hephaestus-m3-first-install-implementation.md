@@ -6,7 +6,7 @@
 
 **Goal:** Approve a discovered machine into a host of a git-imported Topf cluster and have it install Talos unattended: secrets from 1Password sealed in the database, a sandboxed render, prefetched boot assets, a single-use ticket and `/config` over TLS, all driven by an admin CLI.
 
-**Architecture:** New packages `clusters` (definitions, git, pairs, approval, drift, the `/config` render), `render` (load rules, template allow-list, redaction, hashes over the vendored Topf path), `secrets` (`op://` resolver over the 1Password SDK, request counter), `factory` (image-factory client) and the vendored `third_party/topf/{config,render}` and `third_party/imagefactory/schematic`. `fleet` gains bindings, tickets, the `talos_cache` repository (with the Talos tag name and asset part names) and transaction-scoped exports; `db` gains the error classifier and the retry helper; `toolcache` gains a fetch-source seam, source-neutral download helpers and a Talos source; `store` makes every tagged blob durable; `boot` feeds rows 8–10, mints tickets, serves the install script, `/t/` and `/config`; `cmd/hephaestus` wires `serve` and adds the `cluster`, `machine`, `audit` and `unknown-action` commands. Dependency direction: `cmd → boot, clusters, toolcache, factory, secrets`; `boot → clusters, fleet, store` (boot imports neither `toolcache` nor `factory`: the Talos tag and part names live in `fleet`); `clusters → render, secrets, fleet, datakey, db`; `render → third_party/*`; `toolcache → fleet, store, factory`; `factory → fleet`; `fleet` imports none of the new packages.
+**Architecture:** New packages `clusters` (definitions, git, pairs, approval, drift, the `/config` render), `render` (load rules, template allow-list, redaction, hashes over the vendored Topf path), `secrets` (`op://` resolver over the 1Password SDK, request counter), `factory` (image-factory client) and the vendored `third_party/topf/{config,render}` and `third_party/imagefactory/schematic`. `fleet` gains bindings, tickets, the `talos_cache` repository (with the Talos tag name and asset part names) and transaction-scoped exports; `db` gains the error classifier and the retry helper; `toolcache` gains a fetch-source seam, source-neutral download helpers and a Talos source; `store` makes every tagged blob durable; `boot` feeds rows 8–10, mints tickets, serves the install script, `/t/` and `/config`; `cmd/hephaestus` wires `serve` and adds the `cluster`, `machine`, `audit` and `unknown-action` commands. Dependency direction: `cmd → boot, clusters, toolcache, factory, secrets`; `boot → clusters, fleet, store` (boot imports neither `toolcache` nor `factory`: the Talos tag and part names live in `fleet`); `clusters → render, secrets, fleet, datakey, db, admin` (`admin` for `Service.Checks() []admin.Check`, Task 16; `admin` imports no internal package); `render → third_party/*`; `toolcache → fleet, store, factory`; `factory → fleet`; `fleet` imports none of the new packages.
 
 **Tech Stack:** Go 1.26.5 language level (machinery v1.14.4's floor), toolchain go1.27.4; bun, goose, modernc SQLite, pgx; Cobra/viper (cmd only); OpenTelemetry; oras-go v3.0.0; new: go-git v5.19.3, onepassword-sdk-go v0.4.1 (extism v1.7.1, wazero v1.11.0), Talos machinery v1.14.4, sprig v3.3.0, go.yaml.in/yaml/v4 `v4.0.0-rc.6.0.20260809190231-643e93b9c9be` and gopkg.in/yaml.v3 v3.0.1 (Topf's pins), pmezard/go-difflib v1.0.0; Docker (colima) for Postgres tests and the parity container.
 
@@ -51,12 +51,12 @@ Each line: the ruling, the reason, the cost if wrong. The spec's §11 items are 
 - Ruling (§11.2): the "recorded but not received" runbook has two branches: `installing` → `machine abort` then reboot; `install-unconfirmed` → `topf reset`, `machine reinstall --topf-reset-full-done`, reboot. Both are in the `config:pending` check output (Task 26) and the CLI tests (Task 28) prove both branches. Reason: spec §11.2. Cost: none.
 - Ruling (B8, S8; revises §11.3): git clones are full (no depth). The corruption predicate applies only to **local-store reads** (`readTree` and the startup and refill cache fills), never to `fetch` or any transport error: go-git turns an EOF mid-fetch into `packfile.ErrMalformedPackFile` (`plumbing/format/packfile/parser.go:590-595`), which is a dropped connection, not a corrupt store. `classifyRead(err)` is by error type: corrupt when `errors.AsType[*packfile.Error]` matches (every `packfile.NewError` value, with or without `AddDetails`) or `errors.Is` matches `packfile.ErrMalformedPackFile`, `ErrReferenceDeltaNotFound`, `ErrInvalidDelta`, `ErrDeltaCmd`, `ErrLengthOverflow`, `ErrInflatedSizeMismatch`, `idxfile.ErrMalformedIdxFile`, `idxfile.ErrUnsupportedVersion`, `object.ErrMalformedTree`, `object.ErrEntriesNotSorted`, `plumbing.ErrInvalidType`, `zlib.ErrChecksum`, `zlib.ErrHeader` or `io.ErrUnexpectedEOF`; missing when `errors.Is(err, plumbing.ErrObjectNotFound)`. A missing object moves the store aside only when that tree is in the store's **expected set** (the startup cache-fill list for a store that existed at start; after a re-clone, only trees this store has since fetched or read); otherwise it is reported through `render:approved` and never moves the store again. A move-aside raises the alert `git_store_moved_aside` (audit `cluster.store_moved_aside` + `hephaestus.alerts{kind="git_store_moved_aside"}`); at most one move-aside per hour; after the re-clone the tree cache is **refilled for missing entries only** (approved and pending pairs not already cached; nothing is evicted) before the next poll. Reason: spec §11.3 and gate B8/S8. Cost: a corruption class outside the list leaves a corrupt store reported rather than repaired.
 - Ruling (§11.4): `render:approved` is keyed on each cluster's current approved pair id: approving a new pair clears it; a cache miss sets neither drift nor `render:approved` (the §5.3 rule wins; §5.6's list loses "missing from the cache"). Cost: none.
-- Ruling (§11.5): every non-empty resolved value is redacted whole, whatever its length; the 8-character and PEM-armour skips apply only to the individual lines of a multi-line value; the fail-closed check uses the same skip set; the marker is the plain word `REDACTED`; a redacted render that does not parse as YAML refuses the pair. Cost: a 1–7 character secret also blanks equal substrings elsewhere in the display render (display only).
+- Ruling (§11.5): every non-empty resolved value is redacted whole, whatever its length; the 8-character and PEM-armour skips apply only to the individual lines of a multi-line value; the fail-closed check uses the same skip set; the marker is `HEPHAESTUS-REDACTED-0c9f` (revised by Ruling G2-M16; it was the plain word `REDACTED`); a redacted render that does not parse as YAML refuses the pair. Cost: a 1–7 character secret also blanks equal substrings elsewhere in the display render (display only).
 - Ruling (§11.6, revised): the SDK smoke test is `TestOnePassword_SmokeDummyToken` in `internal/secrets`, build tag `sdksmoke`, run by a new `go:sdk-smoke` task inside `go:ci` with `CGO_ENABLED=0`: it builds the real client with token `ops_hephaestus-smoke-test` and requires `ResolveAll` to return a `*secrets.WholeCallError` with `Panicked == false` within 60 s. Offline or online that is the expected result (a malformed token or an unreachable host are both whole-call failures), so an offline CI passes; the test proves the WASM core loads cgo-free and that a failure is classified, not the network. Cost: none.
 - Ruling (§11.7, spike run 2026-11-19 before this revision): **PASS.** In `golang:1.27.4-trixie@sha256:b54b2639de8c1bfe538ec5ffc45f29b1932235ac5f6d63c059853646677112d9`, `git clone https://github.com/postfinance/topf` + `git checkout 70cdbc83cfbadc023ce4c7c0e3180eedfa577f16` + `CGO_ENABLED=0 go build ./cmd/topf` succeeded with module downloads from the Go proxy (the build needs the network; it is not hermetic); `go version -m` showed `github.com/siderolabs/talos/pkg/machinery v1.14.4`, `github.com/Masterminds/sprig/v3 v3.3.0` and `go.yaml.in/yaml/v4 v4.0.0-rc.6.0.20260809190231-643e93b9c9be`; the image ships `git` 2.47.3 at `/usr/bin/git` and `/usr/lib/git-core/git-http-backend` (it runs; without CGI variables it prints `Status: 500`). Reason: §11.7 asked for the spike before the plan. Cost: a module-proxy outage fails `render:parity`; that is `PLAN: BLOCKED — environment: module proxy unreachable`.
 - Ruling (§11.8, minor set): the command-line bound is 2046 bytes on every platform (iPXE BIOS `bzimage.c:314`); the denied sprig list names `mustDateModify` and `must_date_modify` (there is no `dateModify`); embedded references are detected with the unanchored `ref\+[A-Za-z0-9]+://` and the accepted grammar excludes space and `+` inside the reference; row 8's create is a `clusters` transaction (`EnsureAssets`), so `boot` calls `clusters`, never `fleet`, for it; failed-tree, fetch and whole-call error text is stored sealed (columns `failed_error_sealed`, `fetch_error_sealed`, `last_call_error_sealed`), never masked; `kernel command line too long` is an alert; the format byte is `0x01`, prefixed to the sealed bytes and also bound into the additional data inside `datakey`; the canary is the settings row `data_key_canary`; dummy schematic values are `x` repeated to the real value's length (`y` when the value is all `x`), and a dummy-render error refuses the tree; upper-case host names are refused (not lowercased); a reference in `nodes[].host`, `nodes[].ip`, `schematicId` or `talosVersion` is refused; a wrong-hash present blob is replaced by writing the new blob to `ingest/` and renaming over it. Cost: none.
 - Ruling (B1): the module's go line rises to `go 1.26.5`, the floor machinery v1.14.4 requires (a full tidy with go-git v5.19.3, onepassword-sdk-go v0.4.1 and sprig v3.3.0 stays at 1.26.5); `toolchain go1.27.4` stays. Any rise above `go 1.26.5`, or a toolchain change, is `PLAN: BLOCKED — dependency raises the go line`. Reason: design §3 mandates machinery v1.14.4. Cost: none; language features above 1.26 are not used.
-- Ruling (B2): `go:noexec` checks direct imports only: `! go list -f '{{join .Imports "\n"}}' ./internal/third_party/topf/... | grep -x os/exec`. Reason: design §5.5 forbids the vendored code importing `os/exec`; machinery pulls `os/exec` transitively (`containernetworking/cni/pkg/invoke`), so `-deps` can never pass. Cost: a vendored file reaching exec through a helper package is not caught; the copy list (Tasks 1 and 2) has no such helper.
+- Ruling (B2): `go:noexec` checks direct imports only: `test -z "$(go list -f '{{"{{join .Imports \"\\n\"}}"}}' ./internal/third_party/topf/... | grep -x os/exec)"` (written for go-task's templating, Task 1). Reason: design §5.5 forbids the vendored code importing `os/exec`; machinery pulls `os/exec` transitively (`containernetworking/cni/pkg/invoke`), so `-deps` can never pass. Cost: a vendored file reaching exec through a helper package is not caught; the copy list (Tasks 1 and 2) has no such helper.
 - Ruling (B3): no Topf clone ever sits under the repository tree: every clone goes to `$HOME/.cache/hephaestus/topf-70cdbc83` (colima shares `$HOME`), and `repo:ci docker`'s `find . -name 'Dockerfile*'` therefore never meets Topf's `Dockerfile.goreleaser`. Task 1 adds `/build/parity/out/` and `/build/parity-build.log` to `.gitignore`. `build/parity/Dockerfile` passes hadolint (pinned digests, `SHELL ["/bin/bash", "-o", "pipefail", "-c"]`, no `cd`). Reason: gate B3. Cost: none.
 - Ruling (B4): `boot.ConfigSource.Approved(ctx, clusterID string) (clusters.Pair, error)`; there is no `boot.ApprovedPair` type. Reason: `boot → clusters` is the design's direction; a `boot` type returned by `clusters` is an import cycle. Cost: none.
 - Ruling (B5): `SetDrift` and `DriftRender` are produced by Task 12 (the clusters repository) with Postgres-suite subtests; the service tasks (14–16) add no exported method to `internal/clusters/repository.go`. Reason: cover:db runs every exported repository method on Postgres. Cost: none.
@@ -75,10 +75,15 @@ Each line: the ruling, the reason, the cost if wrong. The spec's §11 items are 
 - Ruling (spec silent): the clusters, pairs, versions and renders repository lives in `internal/clusters/repository.go`, so `.taskfiles/go.yml` `DB_PKGS` widens to `./internal/db/... ./internal/fleet/... ./internal/clusters/...`. Types and functions that cover:db should not police (value methods such as `Ticket.Live`, `TalosRow.Key`) live in non-repository files (`ticket.go`, `talos.go`). Cost: none.
 - Ruling (spec silent): the vendored Topf code is flattened into `internal/third_party/topf/{config,render}` and the image-factory copy into `internal/third_party/imagefactory/schematic`, because Go `internal/` visibility forbids importing Topf's `internal/topf` from `internal/render`; each copied file keeps its header and carries `// hephaestus: changed — <what>` where changed. Cost: none.
 - Ruling (spec silent): the factory base URL lives alone in `internal/factory/base.go` (`const Base = "https://factory.talos.dev"`) so the e2e overlay replaces exactly that file. Cost: none.
-- Ruling (spec silent): the e2e smart-HTTP git server and the fake factory are one Go program, `test/e2e/upstreams/main.go`, run in the `golang:1.27.4-trixie@sha256:b54b…` container (which carries `git` and `git-http-backend`, spike above) on the e2e network. Cost: none.
-- Ruling (spec silent): alerts are an audit event plus `hephaestus.alerts{kind}`; the kinds are `git_store_moved_aside`, `drift`, `refresh_incomplete` (clusters service), `talos_broken` (fleet), `cmdline_too_long` (boot) and `config_unrecorded` (boot); git fetches count under `hephaestus.git.fetches{outcome="ok"|"error"}`. Reason: gate minor. Cost: none.
+- Ruling (spec silent): the e2e smart-HTTP git server and the fake factory are one Go program, `test/e2e/upstreams/main.go`, run in the `golang:1.27.4-trixie@sha256:b54b…` container (which carries `git`, spike above) on the e2e network; it runs `git http-backend` as `cgi.Handler{Path: <exec.LookPath("git")>, Args: []string{"http-backend"}}`, as Task 13's test server does, so the same code runs on the macOS host (where no `/usr/lib/git-core/git-http-backend` exists) and in the container. Cost: none.
+- Ruling (spec silent): alerts are an audit event plus `hephaestus.alerts{kind}`; the kinds are `git_store_moved_aside`, `drift`, `refresh_incomplete` (clusters service), `talos_broken` (`cmd/hephaestus` `serve`, counted from a Talos fetch event whose `To` is broken, Task 26; the `talos.broken` audit row is written by `fleet`, Task 11), `cmdline_too_long` (boot) and `config_unrecorded` (boot); git fetches count under `hephaestus.git.fetches{outcome="ok"|"error"}`. Reason: gate minor. Cost: none.
 - Ruling (spec silent): one `fleet` constant set names the Talos store tag (`TalosKey.Tag()` = `talos/<schematic>-<arch>:<version>`) and the asset parts (`TalosKernel`, `TalosInitramfs`, `TalosCmdline`, also the layer titles), used by `toolcache`, `factory` and `boot`. Reason: DRY tier A for an on-disk contract, and it removes the `boot → toolcache` and `boot → factory` edges. Cost: none.
 - Ruling (spec silent): conditional-write and deadlock retries go through one helper, `db.RunInTxRetry`, which retries once from the start on `db.ErrConflict` or `db.IsRetryable(err)`; `db.IsUniqueViolation` names unique-index refusals. `fleet.ActorCLI` replaces `cmd`'s private `cliActor`. Reason: gate S4 and minor (DRY tier A). Cost: none.
+- Ruling (N-B2): `fetchJob` keeps its fields `f`, `row`, `entry`, `root`, `downloaded`, `reserved` and its methods `download(ctx, n)`, `reserveSpace(size, copies)`, `write(ctx, body, n, offset)` and `close(ctx)` with today's signatures; each delegates to the object-keyed `downloader` helpers, which hold the job's `root` and pointers to its `downloaded` and `reserved` fields, so the job's fields stay the one copy of that state. No test file changes, and the A/B stays one file (`internal/toolcache/fetcher.go`). Reason: `fetcher_test.go` builds `&fetchJob{f, row, entry, root}`, calls `download(ctx, 0)`, `reserveSpace(first, 2)` and `write(ctx, body, 0, 0)` and reads `j.reserved` (lines 2153–2166, 2180–2190, 2222–2224, 2490–2503). Cost: four thin delegating methods on `fetchJob`.
+- Ruling (G2-S3): the conditional identity write is a compare-and-swap like `ClearBootNext`: `fleet.BootRecord` gains `ObserveIdentity bool` (boot sets it when the machine it decided on had `IdentityObserved == false`), and `recordKnownBoot` runs `UPDATE … WHERE id = ? AND identity_observed = false` first; 0 rows returns the sentinel `fleet.ErrIdentityRace` and stores nothing. `boot` handles it in its existing `/boot` retry loop exactly as `ErrBootNextChanged` (`handlers.go:330-339`): look the machine up again and decide again, so the fresh row (observed, with a different serial) meets row 2, which records the boot event, marks the UUID junk and counts `hephaestus.alerts{kind="uuid_conflict"}`. `Observe` keeps its own comparison: a 0-row write there re-reads the row inside its transaction and applies `observe`'s serial and product check. Reason: design §5.6 says the loser re-decides from the fresh row; the comparison lives in `boot.Decide`, not in `recordKnownBoot` (`repository.go:597-632`). Cost: none; the identity flips false → true once, so one retry always suffices.
+- Ruling (G2-CNV-cmdline): the Talos job trims exactly one trailing `"\n"` (`strings.TrimSuffix(s, "\n")`) from the fetched `cmdline-metal-<arch>` before validating it; the trimmed bytes are what is recorded (size, sha256), pushed as the `cmdline` layer and served in the install script; the `cmdline` part is therefore always downloaded as an unpinned, unknown-size object (`Size: 0`, `SHA256: ""`, `Max: 4096`) and its recorded asset is compared after trimming. Reason: whether the factory's file ends with a newline could not be verified, and an untrimmed newline would fail the "no newline" rule for every row. Cost: a second trailing newline still fails validation, which is intended.
+- Ruling (G2-S5): downloads report a non-200/206 status as `toolcache.StatusError{Code int; Body string}` (Task 20, `download.go`), `Body` being `fleet.PrintableText` of the first 1024 bytes of the response body; `Error()` is `"the upstream answered " + strconv.Itoa(Code) + " " + http.StatusText(Code)` (the space and status text omitted when `StatusText` is empty), followed by `": " + Body` when `Body` is not empty. Utility downloads return it too, replacing today's `the upstream answered "<resp.Status>"`; this is the reading that keeps every existing test unchanged, because the only assertions on that text (`TestFetcher_TransientFailures` rows `status 503` and `status 404`, `fetcher_test.go:884-891`, checked with `strings.Contains(row.LastError, tt.want)` at `:1049`) look for `503` and `404` only, and `cli_test.go:1003-1045` uses its own literal causes. `factory.StatusError{Status, Body}` (Task 21) stays the registration error. Reason: gate pass 2 S5 asked for the type, package and text. Cost: utility `last_error` text loses its quotes and gains the body.
+- Ruling (G2-M16): `render.Marker` is `HEPHAESTUS-REDACTED-0c9f`; replacement and the fail-closed check both match patterns only outside occurrences of `Marker`: the text is split at every `Marker` occurrence and patterns are searched in the pieces between them, so a value that is a substring of the marker (`RED`, `E`, `0c9f`) is replaced where it stands in the render and is never found again inside a marker redaction wrote. Reason: with the plain word `REDACTED`, a short value such as `RED` or `E` could never pass the fail-closed check. Cost: a render that itself contains the marker text hides a value inside it; the marker is chosen so that no Talos config holds it.
 
 ## Global Constraints
 
@@ -97,13 +102,14 @@ Every task's requirements include these.
 - Times: UTC; functions take `at time.Time`; stored values are truncated to microseconds (`stamp`); tests use `t0 := time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)` and compare with `Equal`.
 - Databases: SQLite and Postgres both. One suite function per repository, run as `TestX_SQLite` (untagged) and `TestX_Postgres` (`//go:build integration`, `*_integration_test.go`), with a tagged `TestMain` calling `dbtest.RunWithPostgres(m)` in every package that has Postgres tests. Every exported function or method in a `db.go` or `*repository.go` file of `DB_PKGS` is called by at least one named subtest of its suite, so `cover:db` prints no `not executed:` line. Each task's Coverage line lists those functions. In a suite's test list, a line `// <Name>: <what it asserts>` is one subtest named `<Name>`; a line `// <Function>: <NameA> (…); <NameB> (…)` lists subtests `<NameA>` and `<NameB>`, each calling `<Function>`. No transaction is held across a network call, a git read or a render (SQLite has one connection).
 - Lock order in every transaction: the `clusters` row first (Postgres `SELECT … FOR UPDATE`; it serialises all work on one cluster), then within that cluster a version is inserted before the pair that references it, and a pair is deleted renders first, then the pair, then its version; then the machine side in the order `machines` (several machines: `ORDER BY id … FOR UPDATE`), `tickets`, `talos_cache`, `utility_cache`. A transaction that touches tickets locks the owning machine row first. Conditional updates re-check what was read; a 0-row match returns `db.ErrConflict`, and `db.RunInTxRetry` retries a transaction once from the start on `db.ErrConflict` or `db.IsRetryable(err)`.
-- Goroutine tests end with `defer goleak.VerifyNone(t)`; HTTP test clients set `DisableKeepAlives`.
+- Goroutine tests use the repository's convention: `defer goleak.VerifyNone(t, goleak.IgnoreCurrent())` placed directly after the harness setup (`internal/toolcache/fetcher_test.go:1412`, `cmd/hephaestus/serve_test.go:325`); a test whose server lives until `t.Cleanup` also defers that server's close **after** the goleak line, so the server and its connections are gone before the check runs. HTTP test clients set `DisableKeepAlives`; test HTTP servers that a client outside the test's control talks to (go-git's per-session transport keeps idle connections and never closes them) call `SetKeepAlivesEnabled(false)`.
+- Metrics: every package that creates the `hephaestus.alerts` counter (`boot`, `clusters`, `cmd/hephaestus`) creates it as `Int64Counter("hephaestus.alerts", metric.WithDescription("Operator alerts raised, by kind."))`, the exact form at `internal/boot/handlers.go:160-161` (no unit), so OpenTelemetry never reports a duplicate instrument with a different description.
 - Fuzz every byte parser (seeded with its table inputs); the owning task runs it once with `-fuzztime=30s`.
 - Command lines: every `Run:` line is prefixed `rtk proxy`; pipelines run as `rtk proxy sh -c "…"`. Anything needing docker runs with `DOCKER_HOST=unix://$HOME/.colima/default/docker.sock`. macOS host: no `timeout` command; colima shares only `$HOME`, so never bind-mount `/tmp`. Scratch outside the build outputs goes under `$HOME/.cache/hephaestus/` (never under the repository tree, which `repo:ci` searches for Dockerfiles). A docker failure is `PLAN: BLOCKED — environment: docker unreachable at DOCKER_HOST`; a module-download failure is `PLAN: BLOCKED — environment: module proxy unreachable`.
 - Nothing is installed on the host. `git` on the host is used by the git integration tests (it is present); its absence fails the test, never skips it.
 - RED steps: a test that cannot compile because the symbol does not exist yet is the expected failure; never add a stub to reach a different failure.
 - Commits: `rtk proxy git add <explicit paths>` then `rtk proxy git -c commit.gpgsign=false commit -m "<type>: <subject>" -m "Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>"` (fix round 2 on opus: `Claude Opus 5.5`). No `claude.ai/code/session_` URL anywhere. No comment, test name or doc mentions a review, finding or attack.
-- Gate per task: `DOCKER_HOST=unix://$HOME/.colima/default/docker.sock rtk proxy task ci` exits 0 with `0 issues.`, `No vulnerabilities found.` and no `not executed:` line.
+- Gate per task: `DOCKER_HOST=unix://$HOME/.colima/default/docker.sock rtk proxy task ci` exits 0 with `0 issues.`, `No vulnerabilities found.` and no `not executed:` line. A `govulncheck` finding (the gate prints no `No vulnerabilities found.`) is `PLAN: BLOCKED — dependency: govulncheck reports <ID> in a pinned module`, with the module and version named in the report; never bump a pin to clear it.
 
 **Dependencies** (`rtk proxy go get <module>@<version>` in the first task that imports it, then `rtk proxy go mod tidy`):
 
@@ -147,7 +153,7 @@ Kind: rewrite
 - Copied verbatim then changed (package `config`, from Topf `pkg/config/` at `70cdbc83cfbadc023ce4c7c0e3180eedfa577f16`): `topf_config.go`, `node.go`, `node_role.go`, `endpoint.go`, `patches.go`. Nothing else of Topf is copied in this task (`pkg/config/*_test.go` use host paths and are not copied).
 - Changes in the copy, each marked `// hephaestus: changed — <what>` and listed in `VENDORED.md`:
   - `topf_config.go`: `LoadFromFile(path string) (*TopfConfig, []string, error)` becomes `func Load(fsys fs.FS, values map[string]string) (*TopfConfig, error)`: it reads `topf.yaml` at the root of `fsys` through `ReadResolved`, decodes it with `go.yaml.in/yaml/v4` exactly as Topf does, keeps the `configDir` refusal and the node sort (control plane first, then host name); a set `nodesProvider` returns `errors.New("topf: nodesProvider is not supported")`; `PatchesDir` defaults to `"."` and `SecretsPath` to `"secrets.yaml"`, and a set value must pass `CleanRel` (relative to the tree root, as Topf resolves them against the config file's directory); the SOPS mask list (`[]string`) is dropped; `GetSecretsProvider` and the `providers`/`decryption` imports are removed. The `SecretsProvider` and `NodesProvider` fields stay so `render.Load` can refuse them.
-  - `patches.go`: `PatchContext` loses `DecryptCache` and gains `FS fs.FS`, `Values map[string]string`, `Funcs template.FuncMap`; `(*PatchContext).Load() ([]configpatcher.Patch, error)` (no mask list); folders are `path.Join(p.PatchesDir, "all")`, `…, string(p.Node.Role))`, `…, "node", p.Node.Host)`, walked with `fs.WalkDir(p.FS, …)` through the new unexported `collectPatchFiles(fsys fs.FS, folder string) ([]string, error)`; Topf's file pattern `.*\.ya?ml(\.tpl)?` is kept unanchored as Topf has it; a missing folder yields no files (`errors.Is(err, fs.ErrNotExist)`, as Topf's `os.IsNotExist`); a directory entry with `fs.ModeSymlink` is resolved with `fs.Stat(fsys, name)` (an `fs.FS` that implements `fs.ReadLinkFS` follows in-tree links on `Open`, as `fstest.MapFS` does at go1.27.4): a file is collected under its link name, a directory is walked under its link name, and a directory whose `EvalSymlinks` real path is already on the current walk chain returns `ErrSymlinkLoop`; `RenderTemplate(fsys fs.FS, name string, funcs template.FuncMap, data any) ([]byte, error)` reads with `fs.ReadFile` and parses with `template.New(path.Base(name)).Funcs(funcs).Option("missingkey=error")`; `loadFile` renders a `.tpl` file with `p.TemplateData()` and no reference substitution (as Topf), and reads every other file with `ReadResolved(p.FS, name, p.Values)`; `parsePatches` is unchanged (it keeps `gopkg.in/yaml.v3`, as Topf).
+  - `patches.go`: `PatchContext` loses `DecryptCache` and gains `FS fs.FS`, `Values map[string]string`, `Funcs template.FuncMap`; `(*PatchContext).Load() ([]configpatcher.Patch, error)` (no mask list); folders are `path.Join(p.PatchesDir, "all")`, `…, string(p.Node.Role))`, `…, "node", p.Node.Host)`, walked with `fs.WalkDir(p.FS, …)` through the new unexported `collectPatchFiles(fsys fs.FS, folder string) ([]string, error)`; Topf's file pattern `.*\.ya?ml(\.tpl)?` is kept unanchored as Topf has it; a missing folder yields no files (`errors.Is(err, fs.ErrNotExist)`, as Topf's `os.IsNotExist`); a directory entry with `fs.ModeSymlink` is resolved as Topf does (`filepath.EvalSymlinks` then `os.Stat(realPath)`, `pkg/config/patches.go:80-99`): `EvalSymlinks(fsys, name)` gives the real path and `fs.Stat(fsys, real)` its kind (an `fs.FS` that implements `fs.ReadLinkFS` follows in-tree links on `Open`, as `fstest.MapFS` does at go1.27.4); a file is collected under its link name when the pattern matches the **real path's base name** (Topf matches `info.Name()` of the target, not the link's name), a directory is walked under its link name, and a directory whose `EvalSymlinks` real path is already on the current walk chain returns `ErrSymlinkLoop`; `RenderTemplate(fsys fs.FS, name string, funcs template.FuncMap, data any) ([]byte, error)` reads with `fs.ReadFile` and parses with `template.New(path.Base(name)).Funcs(funcs).Option("missingkey=error")`; `loadFile` renders a `.tpl` file with `p.TemplateData()` and no reference substitution (as Topf), and reads every other file with `ReadResolved(p.FS, name, p.Values)`; `parsePatches` is unchanged (it keeps `gopkg.in/yaml.v3`, as Topf).
 - New in the copy (hephaestus-authored files, header `// hephaestus: new`):
   ```go
   // fsys.go
@@ -178,16 +184,18 @@ Kind: rewrite
   func (n *TemplateNode) Endpoint() string     // IP.String() when set, else Host (Topf's Node.Endpoint)
   func (p *PatchContext) TemplateData() TemplateData
   ```
-  `SubstituteReferences` replaces Topf's `vals eval` pipe (`internal/decryption` + `internal/vals`): when no document of `content` holds a mapping value or list item that is a string with `HasReferencePrefix` (Topf's `hasValsRefs`, decoded with `gopkg.in/yaml.v3`; a document that does not decode counts as holding none, as Topf), it returns `content` unchanged; otherwise it decodes every document into a `yaml.Node` (`gopkg.in/yaml.v3`), replaces each such non-key scalar's `Value` with `values[ref]` and sets `Tag: "!!str"` and `Style: 0` (a reference absent from `values` is a `*MissingReferenceError`), and encodes all documents with a `yaml.v3` `Encoder` with `SetIndent(2)`. Field names of `TemplateData` and `TemplateNode` equal `PatchContext`'s and `config.Node`'s, so a Topf template renders the same text; `PatchesDir`, `DecryptCache` and `Load` are not reachable from templates.
+  `SubstituteReferences` replaces Topf's `vals eval` pipe (`internal/decryption` + `internal/vals`): it scans the documents of `content` in order, as Topf's `hasValsRefs` does (`internal/vals/vals.go:60-80`, decoded with `gopkg.in/yaml.v3`); the first document holding a mapping value or list item that is a string with `HasReferencePrefix` makes the file reference-bearing, and a decode error met before such a document makes the **whole file** count as holding none (Topf returns false at the first decode error, whatever later documents hold). A file holding none is returned unchanged; otherwise it decodes every document into a `yaml.Node` (`gopkg.in/yaml.v3`), replaces each such non-key scalar's `Value` with `values[ref]` and sets `Tag: "!!str"` and `Style: 0` (a reference absent from `values` is a `*MissingReferenceError`), and encodes all documents with a `yaml.v3` `Encoder` with `SetIndent(2)`. Field names of `TemplateData` and `TemplateNode` equal `PatchContext`'s and `config.Node`'s, so a Topf template renders the same text; `PatchesDir`, `DecryptCache` and `Load` are not reachable from templates.
 - Copied verbatim (package `schematic`, from `github.com/siderolabs/image-factory` v1.7.1 `pkg/schematic/schematic.go`, MPL-2.0, header kept): no change to the copied file (it imports `github.com/siderolabs/gen/xerrors` and machinery's `imager/imageropts`). New `canonical.go` (`// hephaestus: new`):
   ```go
   func Canonical(body []byte) ([]byte, error)   // Unmarshal(body) (KnownFields, as the copy), then (*Schematic).Marshal(): the bytes image-factory hashes
   func ID(body []byte) (string, error)          // hex(sha256(Canonical(body))), equal to (*Schematic).ID()
   ```
 - `VENDORED.md` (each of the two): source URL, the full SHA (Topf) or module version (image-factory v1.7.1), licence (MIT / MPL-2.0), every copied file with its source path, every change one per line, and the pinning note of design §3 (Topf is taken from a git checkout of the full SHA, never through the module proxy, whose `v0.6.2` is commit `7aeead75…`). Task 2 appends to Topf's.
-- `.taskfiles/go.yml` `go:ci` gains `machinery` and `noexec`, in that order directly after `tidy:check`:
-  - `go:machinery`: `test "$(go list -m -f '{{.Version}}' github.com/siderolabs/talos/pkg/machinery)" = v1.14.4` and `! go list -m all | grep -E '^github.com/siderolabs/talos '`.
-  - `go:noexec`: `! go list -f '{{join .Imports "\n"}}' ./internal/third_party/topf/... | grep -x os/exec` (Ruling B2).
+- `.taskfiles/go.yml` `go:ci` gains `machinery` and `noexec`, in that order directly after `tidy:check`. go-task 3.54.0 renders every command as a Go template (so a bare `{{.Version}}` renders empty and `{{join .Imports "\n"}}` is a template error), a YAML list item starting with `! ` loses the `!` (a non-specific tag), and a negated pipeline under errexit still fails; each command is therefore one `cmds:` item, a plain YAML scalar written exactly as below (no surrounding quotes):
+  - `go:machinery`, two items:
+    - `test "$(go list -m -f '{{"{{.Version}}"}}' github.com/siderolabs/talos/pkg/machinery)" = v1.14.4`
+    - `test -z "$(go list -m all | grep -E '^github.com/siderolabs/talos ')"`
+  - `go:noexec`, one item (Ruling B2): `test -z "$(go list -f '{{"{{join .Imports \"\\n\"}}"}}' ./internal/third_party/topf/... | grep -x os/exec)"`. The same command run against `./internal/db/dbtest` (which imports `os/exec`) exits non-zero, which proves it can fail.
 - `.gitignore` gains `/build/parity/out/` and `/build/parity-build.log` (Ruling B3).
 
 - [ ] **Step 1: Check out Topf at the full SHA outside the repository** (never through the module proxy; never under the repository tree, Ruling B3).
@@ -208,7 +216,8 @@ func TestSubstituteReferences_ValueStaysString(t *testing.T)     // resolved val
 func TestSubstituteReferences_MultiLineValue(t *testing.T)       // a 3-line PEM value decodes back byte-equal
 func TestSubstituteReferences_MissingReference(t *testing.T)     // errors.AsType[*MissingReferenceError] ok, Ref "ref+op://v/i/x"
 func TestSubstituteReferences_MultiDocument(t *testing.T)        // two documents, a reference in each → both replaced, two documents out
-func TestCollectPatchFiles_FollowsInTreeSymlinks(t *testing.T)   // all/a.yaml, all/b.yaml.tpl, all/linked → "../shared" holding e.yaml, all/z.txt → ["all/a.yaml", "all/b.yaml.tpl", "all/linked/e.yaml"]
+func TestSubstituteReferences_DecodeErrorFirstHoldsNone(t *testing.T) // document 1 "a: [" then document 2 holding "ref+op://v/i/f" → bytes.Equal(out, in), err nil (Topf's hasValsRefs)
+func TestCollectPatchFiles_FollowsInTreeSymlinks(t *testing.T)   // all/a.yaml, all/b.yaml.tpl, all/linked → "../shared" holding e.yaml, all/notes → "../shared/n.yaml", all/c.yaml → "../shared/c.txt", all/z.txt → ["all/a.yaml", "all/b.yaml.tpl", "all/linked/e.yaml", "all/notes"] (a linked file is matched by its target's name)
 func TestCollectPatchFiles_SymlinkLoop(t *testing.T)            // all/loop → "." → errors.Is(err, ErrSymlinkLoop)
 func TestCollectPatchFiles_MissingFolderEmpty(t *testing.T)     // folder "node/none" → nil, nil
 func TestEvalSymlinks(t *testing.T)                    // table: "a/b.yaml" plain → same; link "l" → "a" → "a"; "l" → "../../x" → ErrEscapes; "l" → "/etc" → ErrEscapes; "p" → "q", "q" → "p" → ErrSymlinkLoop; "missing" → errors.Is(err, fs.ErrNotExist)
@@ -237,6 +246,8 @@ Run: `rtk proxy go test ./internal/third_party/topf/config/ ./internal/third_par
 Expected: PASS.
 Run: `rtk proxy task go:machinery go:noexec`
 Expected: exit 0.
+Run: `rtk proxy sh -c "test -z \"\$(go list -f '{{join .Imports \"\\n\"}}' ./internal/db/dbtest | grep -x os/exec)\"; echo exit=\$?"`
+Expected: `exit=1` (the check fails on a package that imports `os/exec`).
 
 - [ ] **Step 6: Gate and commit**
 
@@ -340,7 +351,7 @@ Kind: rewrite
 - Modify: `internal/fleet/repository_test.go`
 
 **Interfaces:**
-- Produces (schema; given in full because schema is expensive to retrofit). SQLite (`STRICT`, `TEXT` times, `INTEGER` booleans with `CHECK (x IN (0, 1))`); Postgres the same with `TIMESTAMPTZ`, `BOOLEAN`, `BYTEA` for `BLOB`, `BIGINT` for counters, partial indexes `WHERE … IS NOT NULL`, and one `ALTER TABLE machines` statement with named constraints. Down drops in reverse, indexes before the columns they cover.
+- Produces (schema; given in full because schema is expensive to retrofit). SQLite (`STRICT`, `TEXT` times, `INTEGER` booleans with `CHECK (x IN (0, 1))`); Postgres the same with `TIMESTAMPTZ`, `BOOLEAN`, `BYTEA` for `BLOB`, `BIGINT` for counters, partial indexes `WHERE … IS NOT NULL`, and one `ALTER TABLE machines` statement with named constraints. Postgres drops the `IN (0, 1)` checks of `BOOLEAN` columns and writes the drift check as `CHECK (drift = (drift_config_hash IS NOT NULL))` (`(drift = 1)` is a type error on `BOOLEAN`). Down drops in reverse, indexes before the columns they cover.
   ```sql
   ALTER TABLE machines ADD COLUMN identity_observed INTEGER NOT NULL DEFAULT 1 CHECK (identity_observed IN (0, 1));
   ALTER TABLE machines ADD COLUMN talos_schematic TEXT;
@@ -421,7 +432,7 @@ Kind: rewrite
 // new subtest "TupleBothOrNeither": machines talos_schematic set, talos_version NULL → CHECK fails
 // new subtest "Down": d.MigrateDownTo(ctx, 2) → none of the six new tables exists and machines has no identity_observed, talos_schematic or talos_version column; then d.Migrate(ctx) again → ok
 ```
-in `internal/db/errors_test.go` (SQLite) and `internal/db/errors_integration_test.go` (`TestErrors_Postgres`):
+in `internal/db/errors_test.go` (SQLite) and `internal/db/errors_integration_test.go` (`TestErrors_Postgres`), both package `db_test` (they open databases through `dbtest`, which imports `db`; from package `db` that is a test import cycle):
 ```go
 func TestIsUniqueViolation_SQLite(t *testing.T)    // a duplicate settings key insert → true; a CHECK violation → false; nil → false
 func TestIsRetryable_SQLiteBusy(t *testing.T)      // two sql.DB handles on one file with _pragma=busy_timeout(0), one holding BEGIN IMMEDIATE → the other's write error → true
@@ -539,7 +550,7 @@ Kind: rewrite
   func IsReference(s string) bool                       // whole scalar "ref+op://VAULT/ITEM/[SECTION/]FIELD": 3 or 4 non-empty segments; no "?", "#", space or "+" after "ref+op://"
   func HasEmbeddedReference(s string) bool              // unanchored `ref\+[A-Za-z0-9]+://`
   ```
-- Files Load reads (Topf's own reading, Tasks 1–2): `topf.yaml`; the secrets file (`secretsPath`, default `secrets.yaml`); the patch files Topf loads (files matching `.*\.ya?ml(\.tpl)?` under `<patchesDir>/all`, `<patchesDir>/<role>` for each role present and `<patchesDir>/node/<host>` for each host, following in-tree symlinks); each `@` schematic file. **Resolved files** are `topf.yaml`, the secrets file and the non-`.tpl` patch files; **unresolved files** are `.tpl` patch files and schematic files. Every file of the tree is read for the SOPS rule. YAML is decoded with `go.yaml.in/yaml/v4`, multi-document, into `any`, as Topf decodes.
+- Files Load reads (Topf's own reading, Tasks 1–2): `topf.yaml`; the secrets file (`secretsPath`, default `secrets.yaml`); the patch files Topf loads (files matching `.*\.ya?ml(\.tpl)?` under `<patchesDir>/all`, `<patchesDir>/<role>` for each role present and `<patchesDir>/node/<host>` for each host, following in-tree symlinks, a linked file matched by its target's name as Task 1's `collectPatchFiles` does); each `@` schematic file. **Resolved files** are `topf.yaml`, the secrets file and the non-`.tpl` patch files; **unresolved files** are `.tpl` patch files and schematic files. Every file of the tree is read for the SOPS rule. YAML is decoded with `go.yaml.in/yaml/v4`, multi-document, into `any`, as Topf decodes.
 - Load rules, in this order (each a `*RefusalError` with the rule text quoted, `File` the tree-relative path):
   1. `topf.yaml unparsable` (it is absent or does not decode into `any`; the decoder's text is not kept);
   2. `nodesProvider set`, `secretsProvider set`, `configDir set`;
@@ -609,7 +620,7 @@ Expected: one new commit.
 - Consumes: Task 2 `topfrender.Render`, `topfrender.Schematic`, `topfrender.Input`, `topfrender.ErrSecretsBundleUnparsable`; Task 5 `Cluster`, `FuncMap`, `RefusalError`.
 - Produces (package `render`):
   ```go
-  const Marker = "REDACTED"
+  const Marker = "HEPHAESTUS-REDACTED-0c9f"   // Ruling G2-M16
   var ErrRedaction = errors.New("render: a secret value survived redaction")
   type RedactionError struct{ Ref string }   // Error(): "render: the value of <ref> survived redaction"; Unwrap() → ErrRedaction
   func Redact(render []byte, values map[string]string) ([]byte, error)   // values: reference → value
@@ -624,7 +635,7 @@ Expected: one new commit.
   }
   func (c *Cluster) Render(ctx context.Context, values map[string]string) ([]HostRender, error)
   ```
-- Redaction (spec §5.5 and Ruling §11.5): the patterns of each non-empty value are the value itself, its `base64.StdEncoding`, `RawStdEncoding`, `URLEncoding` and `RawURLEncoding` forms, its lower-case hex, and, for a value with more than one line, each line trimmed of surrounding white space unless it is shorter than 8 characters or a PEM armour line (prefix `-----BEGIN ` or `-----END `). All patterns of all values are replaced by `Marker` longest first (ties in byte order). The output is then decoded as multi-document YAML (`go.yaml.in/yaml/v4`, into `any`); a decode failure is `ErrRedaction`; any decoded string scalar or mapping key that still contains a pattern is a `*RedactionError` naming that value's reference.
+- Redaction (spec §5.5 and Ruling §11.5): the patterns of each non-empty value are the value itself, its `base64.StdEncoding`, `RawStdEncoding`, `URLEncoding` and `RawURLEncoding` forms, its lower-case hex, and, for a value with more than one line, each line trimmed of surrounding white space unless it is shorter than 8 characters or a PEM armour line (prefix `-----BEGIN ` or `-----END `). All patterns of all values are replaced by `Marker` longest first (ties in byte order). Matching skips marker occurrences (Ruling G2-M16): each replacement pass and the check below split the text at every occurrence of `Marker` and search only the pieces between them, so a pattern is never matched inside, or across the edge of, a marker. The output is then decoded as multi-document YAML (`go.yaml.in/yaml/v4`, into `any`); a decode failure is `ErrRedaction`; any decoded string scalar or mapping key that still contains a pattern outside its `Marker` occurrences is a `*RedactionError` naming that value's reference.
 - `Render`: `topfrender.Render(ctx, Input{FS: c.FS, Values: values, Funcs: FuncMap()})`; `errors.Is(err, topfrender.ErrSecretsBundleUnparsable)` becomes `*RefusalError{File: <secretsPath>, Rule: "secrets bundle unparsable"}` (checked after substitution, S6); every other render error is returned wrapped, and its text is only ever stored sealed (Task 14). For each node: `Redact(node.Config, values)`, both hashes, and the schematic check (S7): when the host's schematicId is `@<path>.tpl`, `topfrender.Schematic(ctx, Input{FS: c.FS, Values: dummies, Funcs: FuncMap()}, host)` where `dummies` maps every reference to `strings.Repeat("x", len(v))` (`"y"` repeated when `v` is all `x`); an error, or a body that differs from the real one, is `*RefusalError{File: <path>, Rule: "secret reaches schematic"}`.
 
 - [ ] **Step 1: Write the failing tests** (the Task 5 base tree; values from the bundle fixture):
@@ -634,6 +645,7 @@ func TestRedact_Base64AndHex(t *testing.T)        // StdEncoding, RawURLEncoding
 func TestRedact_LongestFirst(t *testing.T)        // values "abcdefgh" and "abcdefghijkl" → no "ijkl" tail remains
 func TestRedact_YAMLQuoted(t *testing.T)          // value `p@dm1n'sPass` emitted as 'p@dm1n''sPass' → *RedactionError for its reference (the decoded scalar holds the value)
 func TestRedact_ShortValueRedacted(t *testing.T)  // value "abc" → Marker in place
+func TestRedact_ValueInsideMarker(t *testing.T)   // values "RED", "E" and "0c9f", each once in the render → nil error; exactly three Marker occurrences; none of the three outside them
 func TestRedact_EmptyValueIgnored(t *testing.T)   // "" in values → output unchanged, no error
 func TestRedact_UnparsableOutput(t *testing.T)    // a render that is not YAML → errors.Is(err, ErrRedaction)
 func TestRedact_ErrorNamesReference(t *testing.T) // survival → errors.AsType[*RedactionError] Ref equals the reference; err.Error() does not contain the value
@@ -643,7 +655,7 @@ func TestRender_UnparsableBundleRefused(t *testing.T) // values that make the su
 func TestSchematicBody_TransformedSecretRefused(t *testing.T) // "@schematic.yaml.tpl" with extraKernelArgs ["{{ .Data.x | sha256sum }}"], data.x a resolved reference → Rule "secret reaches schematic"
 func TestSchematicBody_PlainDataPasses(t *testing.T)          // the same template over a literal data value → passes; SchematicBody holds its sha256
 func TestSchematicBody_DummyRenderErrorRefused(t *testing.T)  // {{ if ne .Data.mode "secret-mode" }}{{ fail "x" }}{{ end }} with data.mode a reference resolving to "secret-mode" → Rule "secret reaches schematic"
-func FuzzRedact(f *testing.F)                     // never panics; when err == nil no non-empty value appears in a decoded string scalar
+func FuzzRedact(f *testing.F)                     // never panics; when err == nil no non-empty value appears in a decoded string scalar outside its Marker occurrences
 ```
 - [ ] **Step 2: Run to verify failure**
 
@@ -676,9 +688,11 @@ Kind: rewrite
 - Modify: `.taskfiles/go.yml`
 - Modify: `taskfile.yml`
 - Modify: `.golangci.yml`
+- Modify: `.dockerignore`
 
 **Interfaces:**
 - Consumes: Task 1 `config.SubstituteReferences`, `config.MissingReferenceError`; Task 6 `Cluster.Render`; Task 5 `Load`.
+- `.dockerignore` gains `build/parity/out` and `build/parity-build.log` (in the file's existing style, no leading slash), so the parity build's `COPY . .` never sees the previous run's outputs or its own log and its layer cache key stays the same between runs.
 - `build/parity/Dockerfile` (hadolint-clean, Ruling B3): first line `# syntax=docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e`; `FROM golang:1.27.4-trixie@sha256:b54b2639de8c1bfe538ec5ffc45f29b1932235ac5f6d63c059853646677112d9`; `SHELL ["/bin/bash", "-o", "pipefail", "-c"]`; `ARG TOPF_SHA=70cdbc83cfbadc023ce4c7c0e3180eedfa577f16`; `WORKDIR /topf`; one `RUN` that clones `https://github.com/postfinance/topf` into `.`, checks out `${TOPF_SHA}`, builds `CGO_ENABLED=0 go build -o /usr/local/bin/topf ./cmd/topf`, and runs `go version -m /usr/local/bin/topf | grep -E 'github.com/siderolabs/talos/pkg/machinery[[:space:]]+v1.14.4'`; then `WORKDIR /src`, `COPY go.mod go.sum ./`, `RUN go mod download`, `COPY . .`, `RUN CGO_ENABLED=0 go build -o /usr/local/bin/vals ./build/parity/valsstub`. No `cd`, no unpinned image.
 - `build/parity/valsstub/main.go` (package `main`, linted like the rest): accepts exactly the arguments `eval -f -` (what Topf's `internal/vals` passes) and exits 2 otherwise; reads the JSON object at the path in `VALSSTUB_VALUES`; writes `config.SubstituteReferences(stdin, values)` to stdout; a `*config.MissingReferenceError` prints `vals: unknown reference <ref>` to stderr and exits 1. Parsing is by hand (`flag` is cmd-only by depguard).
 - Root `taskfile.yml` task `render:parity` (desc "Golden parity with topf render at the pinned commit (needs DOCKER_HOST)"):
@@ -693,7 +707,7 @@ Kind: rewrite
 - [ ] **Step 1: Build the parity image** (the build the §11.7 spike proved).
 
 Run: `DOCKER_HOST=unix://$HOME/.colima/default/docker.sock rtk proxy sh -c "mkdir -p build && docker build -f build/parity/Dockerfile -t hephaestus-parity:local . > build/parity-build.log 2>&1; echo exit=\$?; grep -c 'pkg/machinery' build/parity-build.log; tail -3 build/parity-build.log"`
-Expected: `exit=0`. A network or proxy failure is `PLAN: BLOCKED — environment: module proxy unreachable`; any other failure is `PLAN: BLOCKED — every path is a guess: parity reference build`. (The Dockerfile and stub are written in this step, before the test, because the test needs the reference output; the stub compiles only against Task 1's code.)
+Expected: `exit=0`. A network or proxy failure is `PLAN: BLOCKED — environment: module proxy unreachable`; any other failure is `PLAN: BLOCKED — every path is a guess: parity reference build`. (The Dockerfile, the stub and the two `.dockerignore` lines are written in this step, before the test, because the test needs the reference output; the stub compiles only against Task 1's code.)
 
 - [ ] **Step 2: Write the failing test** `TestParity_Golden` (`//go:build parity`, package `render`): for each directory under `testdata/parity/`, `Load(os.DirFS(dir))`, `Render(ctx, values from values.json)`, and for each host `bytes.Equal(r.Config, os.ReadFile("../../build/parity/out/<case>/<host>.yaml"))`; a mismatch reports the first differing line number of each side; a missing output file fails, it never skips.
 
@@ -715,7 +729,7 @@ Run: `DOCKER_HOST=unix://$HOME/.colima/default/docker.sock rtk proxy task ci`
 Expected: exit 0; the hadolint step lints `build/parity/Dockerfile` clean.
 Run: `rtk proxy git check-ignore build/parity/out/lab/cp-01.yaml build/parity-build.log`
 Expected: both paths printed (the outputs and the build log are ignored, Task 1).
-Run: `rtk proxy git add build/parity/Dockerfile build/parity/valsstub internal/render .taskfiles/go.yml taskfile.yml .golangci.yml` then `rtk proxy git -c commit.gpgsign=false commit -m "test: golden parity with topf render at the pinned commit" -m "Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>"`
+Run: `rtk proxy git add build/parity/Dockerfile build/parity/valsstub internal/render internal/third_party .taskfiles/go.yml taskfile.yml .golangci.yml .dockerignore` then `rtk proxy git -c commit.gpgsign=false commit -m "test: golden parity with topf render at the pinned commit" -m "Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>"`
 Expected: one new commit.
 
 ---
@@ -789,6 +803,7 @@ Kind: rewrite
 
 **Files:**
 - Modify: `internal/fleet/repository.go`
+- Modify: `internal/fleet/machine.go`
 - Modify: `internal/fleet/transition.go`
 - Modify: `internal/fleet/bootnext_repository.go`
 - Modify: `internal/fleet/repository_test.go`
@@ -813,9 +828,13 @@ Kind: rewrite
   func MachinesInClusterTx(ctx context.Context, q bun.IDB, clusterID string) ([]Machine, error) // binding.go; ORDER BY id, FOR UPDATE on Postgres (bun .For("UPDATE") only when the dialect is pg)
   func SetTalosTupleTx(ctx context.Context, q bun.IDB, machineID, schematic, version string) error // binding.go
   func (r *Repository) ListMachines(ctx context.Context) ([]Machine, error)                    // repository.go; ordered by created_at, id; MACs hydrated
+  var ErrIdentityRace = errors.New("fleet: the machine's identity was observed since it was read")   // repository.go, beside ErrBootNextChanged (Ruling G2-S3)
+  // BootRecord (machine.go) gains: ObserveIdentity bool   // the caller decided on a machine with IdentityObserved == false
   ```
 - Binding columns per trigger (spec §5.2 table): `approve`, `adopt`, `adopt_by_uuid`, `rebind` set `cluster_id`, `host_name`, `talos_schematic`, `talos_version` from `Bind`; `unassign` and `unbind` set all four NULL; `host_left` keeps them; `forget` deletes the row; every other trigger leaves them. `rebind` with `Junk` true is refused with reason `junk_uuid` (a new guard in `Next`). `HostUnbound` for approve/adopt/rebind is computed by the caller with `HostBoundTx`; the unique index is the final word: an insert or update that `db.IsUniqueViolation` reports returns `*TransitionError` with reason `host_bound`.
-- Identity observation: `AdoptByUUIDTx` stores `serial = ''`, `product = ''`, `identity_observed = false`, no MACs, state `installed` (a junk-pattern UUID → `*TransitionError` reason `junk_uuid`; an existing UUID → `ErrUUIDExists`). In `observe` and `recordKnownBoot`, a machine with `IdentityObserved == false` is never marked junk or conflicted; its serial and product are written with `UPDATE … WHERE id = ? AND identity_observed = false`, setting it true, and audited `identity.observed`; a 0-row result reloads the machine and applies the normal comparison.
+- Identity observation: `AdoptByUUIDTx` stores `serial = ''`, `product = ''`, `identity_observed = false`, no MACs, state `installed` (a junk-pattern UUID → `*TransitionError` reason `junk_uuid`; an existing UUID → `ErrUUIDExists`). A machine with `IdentityObserved == false` is never marked junk or conflicted; its first report's serial and product are written with `UPDATE … WHERE id = ? AND identity_observed = false`, setting it true, and audited `identity.observed` (Ruling G2-S3):
+  - `recordKnownBoot`: when `rec.ObserveIdentity` is true, that conditional update runs first; 0 rows → `ErrIdentityRace`, and the transaction stores nothing (no boot event, no transition). The comparison that decides row 2 is `boot.Decide`'s, so `boot` re-decides from the fresh row (Task 24), as it does for `ErrBootNextChanged`. `RecordBoot` wraps it so `errors.Is(err, ErrIdentityRace)` holds.
+  - `observe` (the `/discover` path, which has its own serial and product check): a 0-row update re-reads the machine inside the same transaction and applies `observe`'s existing comparison (a different identity → junk and `ErrIdentityConflict`, as today).
 - Coverage (cover:db): the exported functions this task adds to `repository.go` each have a named subtest in `runBindingSuite`, which runs on both databases: `TransitionTx`, `InsertAudit`, `Audit`, `ListMachines`.
 
 - [ ] **Step 1: Write the failing tests** (suite `runBindingSuite(t, open, pair)`; `TestBinding_SQLite` with `dbtest.SQLite`/`dbtest.SQLitePair`, `TestBinding_Postgres` with `dbtest.Postgres`/`dbtest.PostgresPair`):
@@ -834,9 +853,11 @@ Kind: rewrite
 // AdoptByUUIDCreates: state installed, IdentityObserved false, Serial "", MACs empty, binding set
 // AdoptByUUIDJunkRefused: "00000000-0000-0000-0000-000000000000" → *TransitionError Reason "junk_uuid"
 // AdoptByUUIDExisting: existing UUID → errors.Is(err, ErrUUIDExists)
-// FirstReportFillsIdentity: adopted-by-UUID machine, a boot with serial "S1" product "P1" → stored, IdentityObserved true, Junk false, audit "identity.observed"
+// FirstReportFillsIdentity: adopted-by-UUID machine, a RecordBoot with ObserveIdentity true, serial "S1", product "P1" → stored, IdentityObserved true, Junk false, audit "identity.observed"
 // SecondReportAfterObservationConflicts: then a boot with serial "S2" → junk marked as today
-// ConcurrentFirstReports: two first reports at once (pair handles) → one fills, the other compares and marks junk only if different
+// IdentityRaceSentinel: adopted-by-UUID machine; a first report fills serial "S1"; then a RecordBoot with ObserveIdentity true and serial "S2" (decided on the stale unobserved read) → errors.Is(err, ErrIdentityRace); serial still "S1"; no boot event and no audit row added
+// ConcurrentFirstReports: two first RecordBoot calls with ObserveIdentity true at once (pair handles) → exactly one fills the identity; the other returns ErrIdentityRace
+// ConcurrentFirstObserves: two first Observe calls with different serials at once (pair handles) → one fills; the other re-reads, compares and returns ErrIdentityConflict with the UUID junk
 func TestNext_RebindJunk(t *testing.T)   // Next(orphaned lc, TriggerRebind, Guard{Junk: true, HostExists: true, HostUnbound: true}) → reason junk_uuid
 ```
 - [ ] **Step 2: Run to verify failure**
@@ -1046,7 +1067,7 @@ Kind: rewrite
       ID, Name, RepoURL, Ref, Subpath, Username, CredentialRef string
       Revision int64
       LastFetchAt time.Time; LastHeadTree string
-      ProcessingTree string; ProcessingRevision int64
+      ProcessingTree string; ProcessingRevision *int64   // nil ⇔ no mark; a pointer because revision 0 (a fresh cluster) is a real mark, which nullzero on int64 would write as NULL and fail the CHECK
       FailedTree, ApprovedPairID, PendingPairID string
       RefreshRequested, RefreshIncomplete bool
       LastRefreshAt, LastDailyAt time.Time
@@ -1107,7 +1128,7 @@ Kind: rewrite
 // List: two clusters → by name
 // Get: GetKnown (→ the row); GetUnknown (→ ErrNotFound)
 // RequestRefresh: flag 1, attempts 0, next_attempt_at and rate_limited_until NULL
-// MarkProcessing: MarkConsumesRefresh (refresh_requested 1 → TriggerRefresh → 0); MarkConsumesDaily (last_daily_at = At); MarkRefusedOnStaleRevision; MarkRefusedWhileMarked
+// MarkProcessing: MarkConsumesRefresh (refresh_requested 1 → TriggerRefresh → 0); MarkConsumesDaily (last_daily_at = At); MarkRefusedOnStaleRevision; MarkRefusedWhileMarked; MarkAtRevisionZero (a freshly imported cluster, revision 0 → true; Get shows ProcessingTree set and *ProcessingRevision == 0)
 // ClearProcessing: ClearProcessingKeepsLastHead
 // ConvertInterrupted: processing tree T → failed_tree T, Errors().Failed "interrupted", last_head_tree T, mark cleared
 // StorePending: StorePendingReplacesOlder (second StorePending deletes first pair, its renders and its version); StorePendingStaleRevision (Set between Mark and Store → stored false, nothing written); StorePendingRefreshSetsLastRefresh
@@ -1155,6 +1176,7 @@ Kind: rewrite
 - Modify: `go.sum`
 
 **Interfaces:**
+- Consumes: Task 5 `render.Load`, `render.RefusalError` (the memFS cycle test only).
 - Produces (package `clusters`, unexported; Tasks 14–16 use them):
   ```go
   type gitSource struct { URL, Ref, Subpath, Username string; Password secret.Secret }
@@ -1170,15 +1192,10 @@ Kind: rewrite
   func classifyRead(err error) readClass                                                                  // the list of Ruling §11.3, by type
   type memFS struct { /* map[string]memFile */ }   // implements fs.FS, fs.ReadDirFS, fs.ReadFileFS, fs.ReadLinkFS
   ```
-  Every `gitStore` method holds `g.mu`. Credentials are `githttp.BasicAuth{Username, Password.Expose()}`; `caBundle` goes to `FetchOptions.CABundle`. A missing subpath is an error naming it. `fetch` errors are never passed to `corrupt` (Ruling §11.3: a dropped connection mid-fetch reads as `ErrMalformedPackFile`). `memFS` follows the semantics `fstest.MapFS` has at go1.27.4, which the vendored loader relies on: `Open` follows in-tree symlinks, `ReadDir` reports a symlink entry with `fs.ModeSymlink`, `ReadLink`/`Lstat` do not follow.
-- Test server (`gitserver_test.go`, shared by Tasks 13–17): `func newGitServer(t *testing.T, opts gitServerOptions) *gitServer` — repositories made with the host `git` in `t.TempDir()`, served over TLS 1.3 by `httptest.NewUnstartedServer` running `git http-backend` through `net/http/cgi` (`GIT_PROJECT_ROOT`, `GIT_HTTP_EXPORT_ALL`); `gitServerOptions{BasicAuth *[2]string; DropAfter int}` (`DropAfter > 0` cuts every response body after that many bytes); methods `commit(t, files map[string]string, links map[string]string) string`, `url(name) string`, `caPEM() []byte`.
+  Every `gitStore` method holds `g.mu`. Credentials are `githttp.BasicAuth{Username, Password.Expose()}`; `caBundle` goes to `FetchOptions.CABundle`. A missing subpath is an error naming it. `fetch` errors are never passed to `corrupt` (Ruling §11.3: a dropped connection mid-fetch reads as `ErrMalformedPackFile`). `memFS` follows the semantics `fstest.MapFS` has at go1.27.4, which the vendored loader relies on: `Open` follows in-tree symlinks, `ReadDir` reports a symlink entry with `fs.ModeSymlink`, `ReadLink`/`Lstat` do not follow. Unlike `fstest.MapFS` (whose `resolveSymlinks`, go1.27.4 `testing/fstest/mapfs.go:122-153`, has no depth limit, so `p → q`, `q → p` overflows the stack, which no `recover` catches), every `memFS` method that resolves a path through links (`Open`, `Stat`, `ReadFile`, `ReadDir`) follows at most 40 links per call, the bound `config.EvalSymlinks` uses, and then returns a `*fs.PathError` whose `Err` matches `fs.ErrNotExist`. So a definition with a link cycle anywhere, including on `topf.yaml` itself (Load rule 1 reads it before rule 11's bounded symlink check), is refused, never a crash of `serve`.
+- Test server (`gitserver_test.go`, shared by Tasks 13–17): `func newGitServer(t *testing.T, opts gitServerOptions) *gitServer` — repositories made with the host `git` in `t.TempDir()`, served over TLS 1.3 by `httptest.NewUnstartedServer` with `cgi.Handler{Path: <exec.LookPath("git")>, Args: []string{"http-backend"}, Env: []string{"GIT_PROJECT_ROOT=<dir>", "GIT_HTTP_EXPORT_ALL=1"}}` (`net/http/cgi`; a missing `git` fails the test); `SetKeepAlivesEnabled(false)` is called on the server before it starts, because go-git clones its transport per session with the CA bundle (`plumbing/transport/http/common.go:312-323`) and never closes idle connections; `gitServerOptions{BasicAuth *[2]string; DropAfter int}` (`DropAfter > 0` cuts every response body after that many bytes); methods `commit(t, files map[string]string, links map[string]string) string`, `url(name) string`, `caPEM() []byte` and `close()` (closes the server; idempotent, and also registered with `t.Cleanup`, so a test can close it before its goleak check, Global Constraints).
 
-- [ ] **Step 1: Add go-git**
-
-Run: `rtk proxy sh -c "go get github.com/go-git/go-git/v5@v5.19.3 && go mod tidy && grep -E '^go ' go.mod"`
-Expected: `go 1.26.5`.
-
-- [ ] **Step 2: Write the failing tests**
+- [ ] **Step 1: Write the failing tests**
 ```go
 func TestGit_FetchReturnsSubtreeHash(t *testing.T)       // commit A with lab/ → tree hash equals `git rev-parse A:lab`
 func TestGit_CommitOutsideSubpathSameTree(t *testing.T)  // commit B touching other/ only → same tree hash
@@ -1192,24 +1209,29 @@ func TestGit_MissingTreeAfterMoveAsideNotCorrupt(t *testing.T) // after moveAsid
 func TestGit_ExpectedTreeMissingIsCorrupt(t *testing.T)  // expect([T]) on a store whose objects for T were deleted → corrupt(T, err) true
 func TestClassifyRead(t *testing.T)                      // packfile.ErrInvalidObject.AddDetails("x") → readCorrupt; fmt.Errorf("w: %w", packfile.ErrMalformedPackFile) → readCorrupt; zlib.ErrChecksum → readCorrupt; plumbing.ErrObjectNotFound → readMissing; context.Canceled and a *url.Error → readOther
 func TestMemFS_FSTest(t *testing.T)                      // testing/fstest.TestFS passes over a tree with a file symlink and a directory symlink
+func TestMemFS_SymlinkCycleBounded(t *testing.T)         // p → q, q → p: Open, Stat, ReadFile and ReadDir of p return errors.Is(err, fs.ErrNotExist), no stack overflow; a chain of 40 links resolves, a chain of 41 does not
+func TestMemFS_LoadTopfInCycle(t *testing.T)             // memFS with topf.yaml → a, a → topf.yaml: render.Load returns *render.RefusalError Rule "topf.yaml unparsable", File "topf.yaml"; the process does not crash
 func FuzzMemFSPaths(f *testing.F)                        // fuzzed Open names never panic and never resolve outside the tree
 ```
 If `TestGit_CorruptPackMovesAside` shows a `readTree` error that `classifyRead` does not class as corrupt, print its chain with `%T` per `errors.Unwrap` step; add the sentinel to `classifyRead` only when it is declared in `plumbing/format/...` or `plumbing/object` as a decode error, and name it in the report; any other class is `PLAN: BLOCKED — every path is a guess: git corruption class`.
-- [ ] **Step 3: Run to verify failure**
+- [ ] **Step 2: Run to verify failure**
 
 Run: `rtk proxy go test ./internal/clusters/ -run 'TestGit|TestClassifyRead|TestMemFS' -v`
-Expected: FAIL, compile errors.
+Expected: FAIL, compile errors (the go-git packages are not yet required by `go.mod`, and `gitStore`, `memFS` are undefined).
 
-- [ ] **Step 4: Implement.**
+- [ ] **Step 3: Implement**, then add go-git now that `git.go` imports it (a `go mod tidy` before any import would remove it again):
 
-- [ ] **Step 5: Run to verify pass, then fuzz**
+Run: `rtk proxy sh -c "go get github.com/go-git/go-git/v5@v5.19.3 && go mod tidy && grep -E '^go |go-git/go-git/v5 ' go.mod"`
+Expected: `go 1.26.5` and `github.com/go-git/go-git/v5 v5.19.3`.
+
+- [ ] **Step 4: Run to verify pass, then fuzz**
 
 Run: `rtk proxy go test ./internal/clusters/ -race -v`
 Expected: PASS.
 Run: `rtk proxy go test ./internal/clusters/ -run '^$' -fuzz=FuzzMemFSPaths -fuzztime=30s`
 Expected: PASS.
 
-- [ ] **Step 6: Gate and commit**
+- [ ] **Step 5: Gate and commit**
 
 Run: `DOCKER_HOST=unix://$HOME/.colima/default/docker.sock rtk proxy task ci`
 Expected: exit 0.
@@ -1251,7 +1273,7 @@ Expected: one new commit.
 - A process-wide count of consecutive whole-call failures, and whether the last one had `Panicked`, is kept for `secrets:client` (Task 16); a success resets it.
 - Logs and `OnError` carry stage, cluster name, file and rule only, never resolver, render or git error text (Global Constraints).
 
-- [ ] **Step 1: Write the failing tests** (SQLite; a fake `Resolver` recording its calls; `newGitServer`; `t0` clock advanced by hand; every `Run` test ends with `defer goleak.VerifyNone(t)`):
+- [ ] **Step 1: Write the failing tests** (SQLite; a fake `Resolver` recording its calls; `newGitServer`; `t0` clock advanced by hand; every `Run` test, in this order, creates its `newGitServer` and other harness, then `defer goleak.VerifyNone(t, goleak.IgnoreCurrent())`, then `defer srv.close()`, so the git server and go-git's connections to it are gone before the check runs, Global Constraints):
 ```go
 func TestService_NewHeadTreeBecomesPending(t *testing.T)    // Run one poll → a pending pair whose tree hash equals the subpath tree; the fake saw the fixture Refs once
 func TestService_CommitOutsideSubpathNoPair(t *testing.T)   // a commit to other/ → no second resolve, pending pair unchanged
@@ -1265,7 +1287,7 @@ func TestService_SetSameHeadTreeYieldsPending(t *testing.T) // Set to another UR
 func TestService_HeadWholeCallBacksOff(t *testing.T)        // fake returns *WholeCallError → attempts 1, mark cleared; a poll before next_attempt_at does not call the fake; one after does
 func TestService_CredentialResolvedBeforeFetch(t *testing.T) // credential reference set, server needs basic auth → the fake sees the credential first, then the fetch succeeds
 func TestService_MistypedCredentialNotRetried(t *testing.T) // per-reference failure on the credential → git:fetch error recorded; ten more polls → the fake called once
-func TestService_FetchDropNoMoveAside(t *testing.T)         // DropAfter set → RecordFetch error; no store.corrupt-* sibling exists
+func TestService_FetchDropNoMoveAside(t *testing.T)         // DropAfter set → RecordFetch error; filepath.Glob(GitDir + ".corrupt-*") is empty (the name moveAside gives, Task 13) and GitDir still exists
 func TestService_MoveAsideRefillsCache(t *testing.T)        // approved pair cached; truncate the pack, restart the Service → Startup moves aside once, re-fetches, cache holds the approved pair again; audit cluster.store_moved_aside
 func TestService_CacheDropsReplacedPairs(t *testing.T)      // a second head tree replaces the pending pair → the first pair's cache entry is gone
 ```
@@ -1420,7 +1442,7 @@ Kind: rewrite
   func (r *Repository) ApproveDrift(ctx context.Context, req DriftApproveRequest) error         // ErrStale unless drift_config_hash == Hash
   type HostDiff struct { Host string; Old, New []byte; OldHash, NewHash string; SecretValuesChanged bool }
   func (r *Repository) Diff(ctx context.Context, cluster string) (pairID string, hosts []HostDiff, err error)   // pending vs approved, redacted renders opened; a host only on one side has nil on the other
-  func (r *Repository) DriftDiff(ctx context.Context, cluster, host string) (HostDiff, error)  // stored vs drift render of the approved row
+  func (r *Repository) DriftDiff(ctx context.Context, cluster, host string) (HostDiff, error)  // stored vs drift render of the approved row: Old/OldHash the stored, New/NewHash the drift; a host without drift → ErrNotFound
   type HostRef struct{ Cluster, Host string }
   func (r *Repository) UnboundHosts(ctx context.Context) ([]HostRef, error)                    // hosts of approved pairs with no bound machine
   func (r *Repository) ApprovedPair(ctx context.Context, clusterID string) (Pair, error)        // ErrNotFound when the cluster has no approved pair
@@ -1445,6 +1467,8 @@ Kind: rewrite
 // WantAssetsRearmsBroken: broken row → wanted, attempts 0, recorded assets kept; absent → created with body
 // DriftApproveMatching: HostRows then holds the former drift hashes and Redacted equals the former drift render; drift cleared
 // DriftApproveStale: other hash → ErrStale
+// Drift: DriftReadsApprovedRow (a machine bound to lab/cp-01: false before SetDrift on the approved pair's cp-01 row, true after; SetDrift on the pending pair's cp-01 row instead → false)
+// DriftDiff: DriftDiffStoredVsDrift (after SetDrift on the approved cp-01 row: Old equals the stored redacted render, New the drift render, OldHash and NewHash the stored and drift config hashes; wrk-01 without drift → errors.Is(err, ErrNotFound))
 // DiffSecretValuesChanged: same display hash, different config hash → SecretValuesChanged true
 // UnboundHosts: one bound and one unbound host → only the unbound
 // ApprovedPairNone, ApprovedPairCurrent
@@ -1478,7 +1502,6 @@ Kind: rewrite
 
 **Files:**
 - Modify: `internal/store/store.go`
-- Modify: `internal/store/store_test.go`
 - Create: `internal/store/durable.go`, `internal/store/durable_test.go`
 
 **Interfaces:**
@@ -1536,11 +1559,11 @@ Kind: refactor
   ```go
   // source.go
   type claimClass int
-  const ( classUrgent claimClass = iota; classAssigned; classRest; classOther )
+  const ( claimUrgent claimClass = iota; claimAssigned; claimRest; claimOther )   // not class*: classOther = "other" already names a failure class (fetcher.go:58)
   // .golangci.yml: interfacebloat max 5, and ireturn forbids returning a non-stdlib interface, so a claim is a concrete struct holding two small interfaces.
   type fetchRun interface {                           // the download side of one claimed row
       run(ctx context.Context) error                  // today's fetchJob.run
-      downloaded() int64
+      received() int64                                // bytes this run received; not downloaded(), which would collide with fetchJob's downloaded field
       discard(ctx context.Context)
       close(ctx context.Context)
   }
@@ -1573,17 +1596,34 @@ Kind: refactor
       Size      int64    // > 0 in this task (pinned)
       SHA256    string   // the pinned hex digest
   }
-  type downloader struct { /* f *Fetcher; root *os.Root; downloaded int64; reserved uint64; bytes metric.Int64Counter; progress func(ctx context.Context, done, total int64) */ }
-  func (f *Fetcher) newDownloader(bytes metric.Int64Counter, progress func(ctx context.Context, done, total int64)) (*downloader, error)   // opens the spool root
+  type downloader struct {          // Ruling N-B2: the state stays in the owning job's fields
+      f          *Fetcher
+      root       *os.Root                                     // the job's spool handle (the job opens it, as fetchJob.run does today)
+      downloaded *int64                                       // the job's received-byte count
+      reserved   *uint64                                      // the job's reservation, also counted in f.reserved
+      bytes      metric.Int64Counter
+      progress   func(ctx context.Context, done, total int64)
+  }
   func (d *downloader) fetch(ctx context.Context, o object) error        // today's download: resume point, reservation (2 copies, 1 when the spool is whole), transfer, accept, write
+  func (d *downloader) reserveSpace(size int64, copies uint64) error     // today's reserveSpace, updating *d.reserved and f.reserved
+  func (d *downloader) write(ctx context.Context, body io.Reader, o object, offset int64) error   // today's write
   func (d *downloader) verify(ctx context.Context, o object) error       // today's verify
   func (d *downloader) open(o object) (*os.File, error)                  // the spool file, for extraction or a push
   func (d *downloader) discard(ctx context.Context, objects []object) error   // removes SpoolName, SpoolName+".etag" and +".etag.tmp" of each; ErrNotExist ignored
-  func (d *downloader) close(ctx context.Context)                        // releases the reservation, closes the root
+  func (d *downloader) close(ctx context.Context)                        // today's fetchJob.close: releases *d.reserved from f.reserved, closes the root
   // utility_source.go
   type utilitySource struct{ f *Fetcher }
+  // fetcher.go: fetchJob keeps its fields f, row, entry, root, downloaded, reserved, and these methods with today's signatures (tests call them):
+  func (j *fetchJob) dl() *downloader                                     // &downloader{f: j.f, root: j.root, downloaded: &j.downloaded, reserved: &j.reserved, bytes: j.f.bytes (hephaestus.utility.fetch.bytes), progress: j.progress}
+  func (j *fetchJob) download(ctx context.Context, n int) error          // j.dl().fetch(ctx, j.object(n))
+  func (j *fetchJob) reserveSpace(size int64, copies uint64) error       // j.dl().reserveSpace(size, copies)
+  func (j *fetchJob) write(ctx context.Context, body io.Reader, n int, offset int64) error   // j.dl().write(ctx, body, j.object(n), offset)
+  func (j *fetchJob) close(ctx context.Context)                          // j.dl().close(ctx)
+  func (j *fetchJob) object(n int) object                                 // from entry.Pin.Objects[n] with SpoolName(pin, n)
   ```
-- The worker asks `f.sources` (today only `utilitySource`) for each class in order `classUrgent, classAssigned, classRest, classOther` and runs the first job claimed. `utilitySource.claim` returns today's `Repo.ClaimFetch` result for `classUrgent` and nothing for the other classes, which reproduces today's order exactly. The utility job is today's `fetchJob` (its name kept), which implements both `fetchRun` and `settler`, building its `object`s from `entry.Pin.Objects[n]` with `SpoolName(pin, n)`; `resumePoint`, `reset`, `dropETag`, `keepETag`, `reserveSpace`, `transfer`, `accept` and `write` move onto `downloader`, keyed by `object` instead of `(pin, n)`; `retryHeld` keeps its error text (`"the outcome of %s could not be stored twice and the row went back to wanted: %w"` with `claimed.name` = `"<entry>/<arch>"`, the same bytes as today). `FetchEvent`, metric names, log lines, error texts and every exported symbol are unchanged. No existing file other than `fetcher.go` changes; an unexported name a test reaches keeps its name.
+- The worker asks `f.sources` (today only `utilitySource`) for each class in order `claimUrgent, claimAssigned, claimRest, claimOther` and runs the first job claimed. `utilitySource.claim` returns today's `Repo.ClaimFetch` result for `claimUrgent` and nothing for the other classes, which reproduces today's order exactly. The utility job is today's `fetchJob` (its name, fields and the four methods above kept, Ruling N-B2), which implements both `fetchRun` and `settler`, building its `object`s with `j.object(n)`; the bodies of `resumePoint`, `reset`, `dropETag`, `keepETag`, `reserveSpace`, `transfer`, `accept`, `write` and `verify` move onto `downloader`, keyed by `object` instead of `(pin, n)`, and `fetchJob` keeps delegating `download`, `reserveSpace`, `write` and `close` with today's signatures (the others exist only on `downloader`; no test calls them on `fetchJob`); `extract` and `progress` stay on `fetchJob`; `retryHeld` keeps its error text (`"the outcome of %s could not be stored twice and the row went back to wanted: %w"` with `claimed.name` = `"<entry>/<arch>"`, the same bytes as today). `FetchEvent`, metric names, log lines, error texts and every exported symbol are unchanged. No existing file other than `fetcher.go` changes; an unexported name a test reaches keeps its name.
+
+- The blind A/B brief (feature-workflow Phase 3) carries, besides the before and after `internal/toolcache/fetcher.go`, the three new files `internal/toolcache/source.go`, `internal/toolcache/utility_source.go` and `internal/toolcache/download.go`, and a moved-code map: one line per moved function or type, `fetcher.go:<old line range> <old name> → <new file>:<name>` (for example `fetchJob.transfer → download.go: downloader.transfer`), plus the four delegating `fetchJob` methods, so the comparison never reads a gutted `fetcher.go` as deleted behaviour.
 
 - [ ] **Step 1: Run the existing tests as the baseline.**
 
@@ -1592,7 +1632,7 @@ Expected: PASS.
 Run: `rtk proxy sh -c "go test ./internal/toolcache/ -race -count=1 -v 2>&1 | grep -c -- '--- PASS'"`
 Expected: a number N; record it.
 
-- [ ] **Step 2: Refactor** to the types above. No test file changes.
+- [ ] **Step 2: Refactor** to the types above. No test file changes; write the moved-code map as you move each function and put it in the task report, from which the A/B brief takes it.
 
 - [ ] **Step 3: Run to verify behaviour is preserved**
 
@@ -1627,6 +1667,7 @@ Kind: rewrite
   - `object` gains `Max int64 // cap when Size == 0`; `Size == 0` means unknown: `fetch` makes the reservation after the response headers from `responseSize` (2 copies), refuses a size of 0 or above `Max` as an integrity error, and `write` caps the body at that size; `SHA256 == ""` means unpinned: `verify` checks only the size.
   - `func (d *downloader) digest(ctx context.Context, o object) (sha256Hex string, size int64, err error)` hashes the whole spool (used by the Talos job to record and compare hashes).
   - `func responseSize(resp *http.Response) (int64, error)`: on 200 `Content-Length` (must be ≥ 1), on 206 the total of `Content-Range` (must be known, not `*`); anything else an error.
+  - `type StatusError struct { Code int; Body string }` (exported, package `toolcache`, Ruling G2-S5): `accept` returns `*StatusError` for any status other than 200 and 206, `Body` being `fleet.PrintableText` of the first 1024 bytes of the response body; `Error()` is `"the upstream answered <Code> <http.StatusText(Code)>"` (the space and status text omitted when `StatusText` is empty), then `": <Body>"` when `Body` is not empty. It replaces today's `fmt.Errorf("the upstream answered %q", resp.Status)` for utilities too; the existing assertions on that text (`TestFetcher_TransientFailures` rows `status 503` and `status 404`, matched by `strings.Contains` on `503` and `404`) pass unchanged.
 - Unchanged for utilities: every pinned object keeps today's checks and reservation before the request.
 
 - [ ] **Step 1: Write the failing tests**
@@ -1638,11 +1679,12 @@ func TestDownloader_UnknownSizeReservesAfterHeaders(t *testing.T) // object{Size
 func TestDownloader_UnknownSizeOverMaxIsIntegrity(t *testing.T)   // Content-Length Max+1 → *IntegrityError; nothing reserved afterwards
 func TestDownloader_UnknownSizeResumeFromContentRange(t *testing.T) // half spooled with ETag "A", server answers 206 "bytes h-(n-1)/n" ETag "A" → size n, spool whole
 func TestDownloader_UnpinnedVerifyAndDigest(t *testing.T)          // SHA256 "" → verify nil; digest returns sha256 of the body and its size
+func TestDownloader_StatusError(t *testing.T)                      // 404 with body "unknown schematic\x1b[2J" + 2 KiB → errors.AsType[*StatusError] Code 404, len(Body) ≤ 1024, Body printable; Error() starts "the upstream answered 404 Not Found: unknown schematic"; 503 with no body → Error() == "the upstream answered 503 Service Unavailable"
 ```
 - [ ] **Step 2: Run to verify failure**
 
 Run: `rtk proxy go test ./internal/toolcache/ -run 'TestFetcher_206|TestResponseSize|TestDownloader_' -v`
-Expected: FAIL (the first test fails on the spliced hash; `responseSize`, `digest` and `object.Max` undefined).
+Expected: FAIL, compile errors (`responseSize`, `digest`, `StatusError` and `object.Max` undefined; the package does not compile, so no test runs). `TestFetcher_206WithOtherETagRestarts` is the test that pins the spliced-hash bug: in Step 4 it must pass.
 
 - [ ] **Step 3: Implement.**
 
@@ -1715,23 +1757,21 @@ Kind: rewrite
 - Create: `internal/toolcache/talos_source.go`, `internal/toolcache/talos_source_test.go`
 - Modify: `internal/toolcache/fetcher.go`
 - Modify: `internal/toolcache/utility_source.go`
-- Modify: `internal/toolcache/download.go`
 - Modify: `internal/fleet/utility_repository.go`
 - Modify: `internal/fleet/utility_repository_test.go`
 
 **Interfaces:**
-- Consumes: Task 11 `fleet.TalosKey`, `TalosRow`, `TalosAssets`, `TalosAsset`, `TalosPart` constants, `ClaimTalos`, `TalosAssigned`, `TalosOther`, `MarkTalosReady`, `RecordTalosFailure`, `TalosFailure`, `ResetTalosFetchingRow`, `RecordTalosProgress`; Task 19–20 `source`, `claimed`, `fetchRun`, `settler`, `outcome`, `object`, `downloader`, `responseSize`; Task 21 `factory.Client`, `factory.StatusError`.
+- Consumes: Task 11 `fleet.TalosKey`, `TalosRow`, `TalosAssets`, `TalosAsset`, `TalosPart` constants, `ClaimTalos`, `TalosAssigned`, `TalosOther`, `MarkTalosReady`, `RecordTalosFailure`, `TalosFailure`, `ResetTalosFetchingRow`, `RecordTalosProgress`; Task 19–20 `source`, `claimed`, `claimClass` (`claimAssigned`, `claimOther`), `fetchRun`, `settler`, `outcome`, `object`, `downloader`, `responseSize`, `StatusError`; Task 21 `factory.Client`, `factory.StatusError` (registration only).
 - Produces (package `fleet`, `utility_repository.go`): `func (r *Repository) ClaimFetchAtPriority(ctx context.Context, priority int, at time.Time) (CacheRow, bool, error)` (today's claim, restricted to that priority).
-- Produces (package `toolcache`): `FetcherConfig` gains `Talos *factory.Client` (nil disables the Talos source); `FetchEvent` gains `Source string` (`"utility"` or `"talos"`) and `Talos fleet.TalosKey`; `func TalosSpoolName(key fleet.TalosKey, n int) string` = `"talos-" + key.Schematic[:12] + "-" + key.Version + "-" + string(key.Arch) + "-" + strconv.Itoa(n)` (the 64-hex rule of Task 5 makes `[:12]` safe; a shorter schematic is refused by the job as an integrity error before any slice); `const TalosArtifactType = "application/vnd.hephaestus.talos.v1"`; `const TalosMaxAsset = 1 << 30`. `utilitySource.claim` now serves `classUrgent` with `ClaimFetchAtPriority(1)` and `classRest` with `ClaimFetchAtPriority(0)`; `talosSource.claim` serves `classAssigned` (`fleet.TalosAssigned`) and `classOther` (`fleet.TalosOther`). Talos metrics: `hephaestus.talos.fetch.bytes` and `hephaestus.talos.fetch.failures{class}`.
-- `download.go` change: a status other than 200/206 returns `*StatusError{Status, Body}` (the body's first 1 KiB, printable) whose `Error()` is today's text (`the upstream answered "<status>"`), so utility errors read the same.
+- Produces (package `toolcache`): `FetcherConfig` gains `Talos *factory.Client` (nil disables the Talos source); `FetchEvent` gains `Source string` (`"utility"` or `"talos"`) and `Talos fleet.TalosKey`; `func TalosSpoolName(key fleet.TalosKey, n int) string` = `"talos-" + key.Schematic[:min(12, len(key.Schematic))] + "-" + key.Version + "-" + string(key.Arch) + "-" + strconv.Itoa(n)` (guarded, because Task 23's keep-set calls it for every stored row, whatever its schematic; the job still refuses a schematic that is not 64 lower-case hex as an integrity error before any download); `const TalosArtifactType = "application/vnd.hephaestus.talos.v1"`; `const TalosMaxAsset = 1 << 30`. `utilitySource.claim` now serves `claimUrgent` with `ClaimFetchAtPriority(1)` and `claimRest` with `ClaimFetchAtPriority(0)`; `talosSource.claim` serves `claimAssigned` (`fleet.TalosAssigned`) and `claimOther` (`fleet.TalosOther`). Talos metrics: `hephaestus.talos.fetch.bytes` and `hephaestus.talos.fetch.failures{class}`.
 - The Talos job (spec §5.7 steps 1–7), parts in the order kernel (n 0), initramfs (1), cmdline (2):
   1. **Shortcut** only when the row has all three recorded assets: `Store.CheckLayers(key.Tag())` passes and the tag's layer digests equal the recorded sha256s → ready, no download.
   2. **Register** when the row has a body: `Register` under a 2-minute deadline; a returned id ≠ `key.Schematic` → integrity.
-  3. **Fetch** each part through the downloader with `object{URL: Talos.URL(…), SpoolName: TalosSpoolName(key, n), Size: <recorded size or 0>, Max: TalosMaxAsset, SHA256: <recorded sha or "">}`; a `*StatusError` 404 → integrity with the cause `factory: <Body>`; every request goes to the factory URL, so a resume after the signed URL expired is redirected afresh.
-  4. **Record or compare**: `digest` each spool; on a first fetch (no recorded asset) the size and hash are recorded; otherwise a differing hash → integrity.
-  5. **Cmdline**: printable ASCII only, no `$`, no newline, no token starting `#`, no `;`, `&&` or `||`, at most 2046 bytes (`validCmdline(s string) error`); a violation → integrity.
-  6. **Push and tag**: each spool through `Store.PushBlob` with `store.Layer(string(part), size, sha)`; `Store.TagArtifact(key.Tag(), TalosArtifactType, layers)`; `CheckLayers` again; `MarkTalosReady(key, assets)`.
-- The Talos job implements `fetchRun` and `settler`; `record`/`giveBack` for Talos use `MarkTalosReady`, `RecordTalosFailure` and `ResetTalosFetchingRow`; Talos events carry `Source: "talos"` and `Talos: key`.
+  3. **Fetch** each part through the downloader: kernel and initramfs with `object{URL: Talos.URL(…), SpoolName: TalosSpoolName(key, n), Size: <recorded size or 0>, Max: TalosMaxAsset, SHA256: <recorded sha or "">}`; the cmdline always with `Size: 0`, `SHA256: ""`, `Max: 4096` (its recorded asset is of the trimmed form, step 4, so it cannot pin the download; Ruling G2-CNV-cmdline); a `*StatusError` (Task 20) with `Code` 404 → integrity with the cause `factory: <Body>`; every request goes to the factory URL, so a resume after the signed URL expired is redirected afresh.
+  4. **Record or compare**: `digest` the kernel and initramfs spools; the cmdline spool is read whole (≤ 4096 bytes) and `strings.TrimSuffix(s, "\n")` removes exactly one trailing newline, and the trimmed bytes' size and sha256 are its asset; on a first fetch (no recorded asset) the sizes and hashes are recorded; otherwise a differing hash → integrity.
+  5. **Cmdline**: the trimmed form must be printable ASCII only, no `$`, no newline, no token starting `#`, no `;`, `&&` or `||`, at most 2046 bytes (`validCmdline(s string) error`, called on the trimmed string); a violation → integrity.
+  6. **Push and tag**: the kernel and initramfs spools, and the trimmed cmdline bytes (`bytes.NewReader`), through `Store.PushBlob` with `store.Layer(string(part), size, sha)`; `Store.TagArtifact(key.Tag(), TalosArtifactType, layers)`; `CheckLayers` again; `MarkTalosReady(key, assets)`. The `cmdline` layer therefore holds the trimmed line, which is what Task 24 serves, and every layer digest equals its recorded sha256 (the shortcut, Task 23 and Task 24 compare them).
+- The Talos job implements `fetchRun` and `settler`; it holds its own `root`, `downloaded` and `reserved` fields and builds its `downloader` over them, as `fetchJob` does (Ruling N-B2); `record`/`giveBack` for Talos use `MarkTalosReady`, `RecordTalosFailure` and `ResetTalosFetchingRow`; Talos events carry `Source: "talos"` and `Talos: key`.
 
 - [ ] **Step 1: Write the failing tests** (Task 21's `factorytest.Fake` behind a TLS 1.3 `httptest` server whose CA the test client trusts; a real store in `t.TempDir()`):
 ```go
@@ -1742,7 +1782,9 @@ func TestTalosSource_RecordedHashMismatchIsIntegrity(t *testing.T) // RequeueTal
 func TestTalosSource_UnknownSchematicBroken(t *testing.T)       // 404 → broken at once; LastError holds "factory: " and the factory body
 func TestTalosSource_RegisterIDMismatchBroken(t *testing.T)     // fake returns another id → broken
 func TestTalosSource_RegisterOnlyWithBody(t *testing.T)         // a literal-id row (no body) → no POST /schematics
-func TestTalosSource_CmdlineRejected(t *testing.T)              // table: "#x", "a;b", "a && b", "a || b", "a$b", "a\nb", a 2047-byte line → broken
+func TestTalosSource_CmdlineRejected(t *testing.T)              // table: "#x", "a;b", "a && b", "a || b", "a$b", "a\nb", "a\n\n" (only one newline is trimmed), a 2047-byte line → broken
+func TestTalosSource_CmdlineTrailingNewlineTrimmed(t *testing.T) // factory serves "console=tty0\n" → ready; the cmdline layer holds "console=tty0"; Assets[cmdline] is its size 12 and sha256; a second fetch of the same bytes compares equal
+func TestTalosSpoolName(t *testing.T)                           // plain id, v1.12.11, amd64, n 0 → "talos-376567988ad3-v1.12.11-amd64-0"; schematic "abcde" → "talos-abcde-v1.12.11-amd64-0", no panic
 func TestTalosSource_ShortcutNeedsRecordedHashes(t *testing.T)  // tag present and row without assets → downloads; with matching assets → ready with no request
 func TestFetcher_ClaimOrderAcrossSources(t *testing.T)          // utility p1, talos assigned, utility p0, talos other, all wanted → claimed in that order (Workers: 1)
 func FuzzValidCmdline(f *testing.F)                             // never panics; nil result implies printable ASCII, ≤ 2046 bytes, no forbidden token
@@ -1750,7 +1792,7 @@ func FuzzValidCmdline(f *testing.F)                             // never panics;
 and in `internal/fleet/utility_repository_test.go` (`runUtilitySuite`, both databases): subtest `ClaimFetchAtPriority`: rows at priority 1 and 0 → `ClaimFetchAtPriority(0)` claims only the priority-0 row.
 - [ ] **Step 2: Run to verify failure**
 
-Run: `rtk proxy go test ./internal/toolcache/ ./internal/fleet/ -run 'TestTalosSource|TestFetcher_ClaimOrderAcrossSources|TestUtilityRepository_SQLite' -v`
+Run: `rtk proxy go test ./internal/toolcache/ ./internal/fleet/ -run 'TestTalosSource|TestTalosSpoolName|TestFetcher_ClaimOrderAcrossSources|TestUtilityRepository_SQLite' -v`
 Expected: FAIL, compile errors.
 
 - [ ] **Step 3: Implement.**
@@ -1789,16 +1831,17 @@ Kind: rewrite
   func ReconcileTalos(ctx context.Context, cfg ReconcileConfig) (TalosReport, error)   // run after Reconcile
   ```
   `ReconcileTalos`: `ResetTalosFetching(cfg.At)` (count → `Interrupted`); for each row of `TalosRows`: `ready` whose tag is lost (`store.ContentLost`) or whose layer digests differ from the recorded hashes → `RequeueTalos` (`Requeued`); `broken` stays; `wanted` or `failed` with all three recorded assets whose tag passes and matches → `MarkTalosReady` (`Restored`); a non-lost check error stops reconciliation with that error.
-- `reconcile.go` change: `sweepSpool` also keeps `TalosSpoolName(key, n)` and its `.etag` (n = 0, 1, 2) for every `TalosRows` row that is not `ready`, because `Reconcile` sweeps before `ReconcileTalos` runs.
+- `reconcile.go` change: `sweepSpool(cfg)` becomes `sweepSpool(ctx context.Context, cfg ReconcileConfig)` (`Reconcile` passes its own `ctx`) and also keeps `TalosSpoolName(key, n)` and its `.etag` (n = 0, 1, 2) for every `TalosRows` row that is not `ready`, because `Reconcile` sweeps before `ReconcileTalos` runs. `TalosRows` is read before anything is removed; its error stops the sweep with **nothing removed** (the keep-set is unknown) and is returned as the sweep's error, so it lands in `ReconcileReport.SpoolErr` and `Reconcile` still returns nil, as for every other sweep failure today (`reconcile.go:45-47, 101`).
 
 - [ ] **Step 1: Write the failing tests**
 ```go
 func TestReconcileTalos(t *testing.T)               // table: fetching → wanted; ready with a lost tag → wanted; ready with a digest mismatch → wanted; broken stays; wanted with matching assets and tag → ready; report counts equal
 func TestSweepSpool_KeepsTalosSpools(t *testing.T)  // reconcile_test.go: spool holds a wanted row's three spools and etags, a ready row's spool and an unknown file → only the ready row's spool and the unknown file are removed
+func TestSweepSpool_TalosRowsErrorRemovesNothing(t *testing.T) // reconcile_test.go: sweepSpool(ctx, cfg) with cfg.Repo over a closed database → an error; the unknown file and every spool file are still present
 ```
 - [ ] **Step 2: Run to verify failure**
 
-Run: `rtk proxy go test ./internal/toolcache/ -run 'TestReconcileTalos|TestSweepSpool_KeepsTalosSpools' -v`
+Run: `rtk proxy go test ./internal/toolcache/ -run 'TestReconcileTalos|TestSweepSpool_KeepsTalosSpools|TestSweepSpool_TalosRowsErrorRemovesNothing' -v`
 Expected: FAIL, compile errors (`ReconcileTalos` undefined).
 
 - [ ] **Step 3: Implement.**
@@ -1829,7 +1872,7 @@ Kind: rewrite
 - Create: `internal/boot/install.go`, `internal/boot/install_test.go`, `internal/boot/talos_artifact.go`, `internal/boot/talos_artifact_test.go`
 
 **Interfaces:**
-- Consumes: Task 9 `fleet.Repository.Audit`, `AuditEvent`, `ActorSystem`; Task 10 `MintTicket`, `MintRequest`; Task 11 `TalosKey`, `TalosKey.Tag`, `Talos`, `RequeueTalos`, `TalosKernel`, `TalosInitramfs`, `TalosCmdline`; Task 12 `clusters.Pair`; Task 16 `clusters.ErrNoRender`, `clusters.ErrDrift`; Task 17 `Service.Drift`, `Service.EnsureAssets`, `Service.Approved`.
+- Consumes: Task 9 `fleet.Repository.Audit`, `AuditEvent`, `ActorSystem`, `ErrIdentityRace`, `BootRecord.ObserveIdentity`; Task 10 `MintTicket`, `MintRequest`; Task 11 `TalosKey`, `TalosKey.Tag`, `Talos`, `RequeueTalos`, `TalosKernel`, `TalosInitramfs`, `TalosCmdline`; Task 12 `clusters.Pair`; Task 16 `clusters.ErrNoRender`, `clusters.ErrDrift`; Task 17 `Service.Drift`, `Service.EnsureAssets`, `Service.Approved`.
 - Produces (package `boot`):
   ```go
   type ConfigSource interface {                                            // *clusters.Service implements it; tests use a double
@@ -1853,7 +1896,7 @@ Kind: rewrite
   boot
   ```
   Its length check counts `len("k ") + len(cmdline) + len(" talos.halt_if_installed=1 talos.config=https://") + len(fqdn) + len("/config?u=") + 36 + len("&t=") + 43` against `MaxCommandLine`.
-- `Decide`: row 2's mismatch test is skipped when `!in.Machine.IdentityObserved`. `decideAndRecord`, for an `assigned` machine with a tuple and `Configs` set: `Input.AssetsReady` = its `talos_cache` row is `ready`, `CheckLayers(key.Tag())` passes, and the tag's layer digests (by title) equal the recorded sha256s (a lost layer → `RequeueTalos`, not ready; any other store error → 500); `Input.Drift` = `Configs.Drift`; a not-ready machine calls `Configs.EnsureAssets` once per request. `fallback` and `reasonNoTicket` are removed. When `Decide` returns row 10 install, the cached cmdline layer is read (at most 2047 bytes) and the line is checked with a 43-character placeholder token **before** `RecordBoot`: a line that cannot fit becomes `Decision{Row: 10, Action: ActionHold, Reason: "kernel command line too long"}`, is recorded as such, audited `alert.cmdline_too_long` (`Repo.Audit`, actor system, detail machine id and length) and counted `hephaestus.alerts{kind="cmdline_too_long"}`, and mints nothing. After `RecordBoot`, a row-10 install calls `Configs.Approved(clusterID)` and `MintTicket` with that pair's id and version, then serves `InstallScript` with the minted token; a mint or approved-pair failure is a 500. Every minted ticket increments `hephaestus.tickets.minted`.
+- `Decide`: row 2's mismatch test is skipped when `!in.Machine.IdentityObserved`. `decideAndRecord` sets `rec.ObserveIdentity = s.found && !s.m.IdentityObserved`, and its retry loop treats `errors.Is(err, fleet.ErrIdentityRace)` exactly as `fleet.ErrBootNextChanged` (`handlers.go:330-339`): look the machine up again and decide again on the fresh row (Ruling G2-S3); the fresh row is observed, so a differing serial or product now meets row 2, which records the boot event with `Conflict`, marks the UUID junk and counts `hephaestus.alerts{kind="uuid_conflict"}` as today. It is not reported as `ErrBootNextRace`; one retry suffices, because the identity is observed only once. `decideAndRecord`, for an `assigned` machine with a tuple and `Configs` set: `Input.AssetsReady` = its `talos_cache` row is `ready`, `CheckLayers(key.Tag())` passes, and the tag's layer digests (by title) equal the recorded sha256s (a lost layer, `store.ContentLost`, → `RequeueTalos`, reported through the error handler, not ready; any other store error → reported through the error handler and not ready, the row left untouched, as row 3 does for utilities, `row3.go:38-63`); `Input.Drift` = `Configs.Drift`; a not-ready machine calls `Configs.EnsureAssets` once per request. `fallback` and `reasonNoTicket` are removed. When `Decide` returns row 10 install, the cached cmdline layer is read (at most 2047 bytes) and the line is checked with a 43-character placeholder token **before** `RecordBoot`: a line that cannot fit becomes `Decision{Row: 10, Action: ActionHold, Reason: "kernel command line too long"}`, is recorded as such, audited `alert.cmdline_too_long` (`Repo.Audit`, actor system, detail machine id and length) and counted `hephaestus.alerts{kind="cmdline_too_long"}`, and mints nothing. After `RecordBoot`, a row-10 install calls `Configs.Approved(clusterID)` and `MintTicket` with that pair's id and version, then serves `InstallScript` with the minted token; a mint or approved-pair failure is a 500. Every minted ticket increments `hephaestus.tickets.minted`.
 - `/t/{schematic}/{version}/{arch}/{asset}` (asset `kernel` or `initramfs`) on `PlainHTTP()` and `TLS()`, under the subnet guard: resolves `TalosKey{…}.Tag()`, finds the layer titled by the asset, checks its size and that its digest equals the row's recorded sha256, serves with `http.ServeContent` through `idleWriter`; lost content → `RequeueTalos` and 404; anything unknown (another asset name, a row not `ready`) → 404.
 
 - [ ] **Step 1: Write the failing tests**
@@ -1867,6 +1910,8 @@ func TestBoot_AssignedReadyServesInstallScript(t *testing.T)      // row 10; the
 func TestBoot_CmdlineTooLongHolds(t *testing.T)                   // row 10 hold "kernel command line too long"; no tickets row; audit alert.cmdline_too_long
 func TestBoot_ReadyRowLostLayerRequeues(t *testing.T)             // ready row, kernel blob deleted → row 8 hold; the row is wanted again
 func TestBoot_ReadyRowDigestMismatchNotReady(t *testing.T)        // recorded sha differs from the tag's layer digest → row 8 hold
+func TestBoot_ReadyRowUnreadableNotReady(t *testing.T)            // CheckLayers fails with a non-lost error (the blob made unreadable, chmod 0) → row 8 hold, the row still ready, one error-handler report, no 500
+func TestBoot_IdentityRaceRedecidesRow2(t *testing.T)             // handlers_test.go: a machine created by fleet.AdoptByUUIDTx (IdentityObserved false, state installed); the rig's clock hook (as TestBoot_Row3CLIChangeRedecides) fills its identity with serial "S1" between the lookup and the record; the request reports serial "S2" → one boot event, row 2; the UUID junk; one alert.uuid_conflict audit row and hephaestus_alerts_total{kind="uuid_conflict"} 1; no ErrBootNextRace reported
 func TestBoot_NoConfigSourceHolds(t *testing.T)                   // Configs nil → assigned machine holds at row 8 (M2 behaviour)
 func TestTalosArtifact_ServesKernelWithRange(t *testing.T)        // Range bytes=10- → 206 with the tail
 func TestTalosArtifact_UnknownAsset404(t *testing.T)              // asset "cmdline" or "x" → 404
@@ -1957,7 +2002,7 @@ Kind: rewrite
 **Interfaces:**
 - Consumes: Task 4 `datakey.EnsureCanary`, `serveConfig.DataKey`, `serveConfig.OPToken`; Task 8 `secrets.NewOnePassword`, `secrets.NewCounter`; Task 10 `PendingTickets`, `PruneTickets`; Task 11 `TalosRows`; Task 12 `clusters.NewRepository`; Task 14–16 `clusters.NewService`, `Startup`, `Run`, `Checks`; Task 21 `factory.New`, `factory.Base`; Task 22 `FetcherConfig.Talos`, `FetchEvent.Source`, `FetchEvent.Talos`; Task 23 `toolcache.ReconcileTalos`; Task 24–25 `boot.Config.Configs`, `Handlers.RunRecorder`.
 - Produces (package `main`): `func setupDefaultTransport(counter *secrets.Counter)` — mutates the original `*http.Transport` behind `http.DefaultTransport` in place (`TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS13}`, dial timeout 10 s via a `net.Dialer`, `TLSHandshakeTimeout` 10 s, `ResponseHeaderTimeout` 60 s) and sets `http.DefaultClient.Transport = counter` wrapping it (`//nolint:forbidigo // the 1Password SDK sends through http.DefaultClient`); idempotent; called first in `listenAndServe`, before `toolcache.NewHTTPClient`. `checks.go`: `func talosCacheCheck(repo *fleet.Repository) admin.Check` (warn on any `broken` row, naming the tuple) and `func configPendingCheck(repo *fleet.Repository, now func() time.Time) admin.Check` (warn listing each ticket live and unrequested for 30 min with its machine id, and the two-branch runbook text of Ruling §11.2: `installing: machine abort, then reboot` and `install-unconfirmed: topf reset, machine reinstall --topf-reset-full-done, then reboot`).
-- `runServe` order: `db.Migrate` → `datakey.EnsureCanary` (failure stops serve, naming `HEPHAESTUS_DATA_KEY`) → `store.Open` → utility `Reconcile` and GC → `toolcache.ReconcileTalos` → `clusters.NewRepository`, `clusters.NewService` (`Resolver` = `secrets.NewOnePassword(cfg.OPToken, buildVersion())` only when the token is set; `GitDir` = `<data>/git`) → `svc.Startup` → `NewFetcher` with `Talos: factory.New(factory.Base, deps.client)` → checks (`svc.Checks()`, `talosCacheCheck`, `configPendingCheck`) → `boot.NewHandlers` with `Configs: svc` → listeners. The `work` stage gains the goroutines `clusters` (`svc.Run`), `config recorder` (`handlers.RunRecorder`) and `ticket pruning` (hourly `PruneTickets(now - 7 days)`); they stop before the store and the database close. Fetch events log `source`; Talos events log the tuple; a Talos event with `To` broken also increments `hephaestus.alerts{kind="talos_broken"}`. An `Int64ObservableGauge` `hephaestus.secrets.requests` reports `counter.Last24h()`. `serve --help` lists `HEPHAESTUS_DATA_KEY`, `HEPHAESTUS_DATA_KEY_FILE`, `HEPHAESTUS_OP_TOKEN`, `HEPHAESTUS_OP_TOKEN_FILE`.
+- `runServe` order: `db.Migrate` → `datakey.EnsureCanary` (failure stops serve, naming `HEPHAESTUS_DATA_KEY`) → `store.Open` → utility `Reconcile` and GC → `toolcache.ReconcileTalos` → `clusters.NewRepository`, `clusters.NewService` (`Resolver` = `secrets.NewOnePassword(cfg.OPToken, buildVersion())` only when the token is set; `GitDir` = `<data>/git`) → `svc.Startup` → `NewFetcher` with `Talos: factory.New(factory.Base, deps.client)` → checks (`svc.Checks()`, `talosCacheCheck`, `configPendingCheck`) → `boot.NewHandlers` with `Configs: svc` → listeners. The `work` stage gains the goroutines `clusters` (`svc.Run`), `config recorder` (`handlers.RunRecorder`) and `ticket pruning` (hourly `PruneTickets(now - 7 days)`); they stop before the store and the database close. Fetch events log `source`; Talos events log the tuple; a Talos event with `To` broken also increments `hephaestus.alerts{kind="talos_broken"}` (the counter created with the Global Constraints' exact description). An `Int64ObservableGauge` `hephaestus.secrets.requests` reports `counter.Last24h()`. `serve --help` lists `HEPHAESTUS_DATA_KEY`, `HEPHAESTUS_DATA_KEY_FILE`, `HEPHAESTUS_OP_TOKEN`, `HEPHAESTUS_OP_TOKEN_FILE`.
 
 - [ ] **Step 1: Write the failing tests**
 ```go
@@ -2007,7 +2052,7 @@ Kind: rewrite
 - Create: `cmd/hephaestus/clustercmd.go`, `cmd/hephaestus/clustercmd_test.go`, `cmd/hephaestus/auditcmd.go`, `cmd/hephaestus/auditcmd_test.go`
 
 **Interfaces:**
-- Consumes: Task 9 `fleet.ActorCLI`; Task 12 `clusters.NewRepository`, `Import`, `Set`, `Remove`, `List`, `Get`, `Errors`, `RequestRefresh`; Task 17 `ApproveCluster`, `ApproveDrift`, `Diff`, `DriftDiff`.
+- Consumes: Task 9 `fleet.ActorCLI`; Task 12 `clusters.NewRepository`, `Import`, `Set`, `Remove`, `List`, `Get`, `Errors`, `RequestRefresh`, `SetDrift` (the drift diff test); Task 17 `ApproveCluster`, `ApproveDrift`, `Diff`, `DriftDiff`.
 - Produces (package `main`, `cli.go`): `openCLI` is replaced by `func openCLI(cmd *cobra.Command, deps cliDeps) (cliStores, func() error, error)` with `type cliStores struct { Fleet *fleet.Repository; Clusters *clusters.Repository; Catalog *catalog.Catalog }` (the database and the data key only; never the content store or the git store), and `withCLI` becomes `func withCLI(cmd *cobra.Command, deps cliDeps, run func(cliStores) error) error`; the five call sites in `bootnext.go` and `utilitycmd.go` change only to read `s.Fleet` and `s.Catalog`. The private `cliActor` constant is removed; every command audits with `fleet.ActorCLI` (DRY tier A).
 - Produces (package `fleet`, `repository.go`): `type AuditRecord struct { At time.Time; Actor, Action, MachineID, Detail string }` and `func (r *Repository) AuditEvents(ctx context.Context, since time.Time, machineID string) ([]AuditRecord, error)` (`at >= since`, `machineID` "" for all, ordered by id).
 - Produces (package `main`): `newClusterCmd(deps)` with `import <name> --repo --ref --path [--username --credential]`, `set <name> [--repo --ref --path --username --credential]`, `remove <name>`, `list`, `diff <name> [--host <host>]`, `approve <name> <pair id>` or `approve <name> --host <host> --hash <hash>`, `refresh <name>`; `newAuditCmd(deps)` with `list [--since <duration>] [--machine <mac|uuid>]`. Every command takes `--json`; text output uses `writeTable`/`safeText`; JSON uses `fleet.PrintableText` for stored text. `cluster list` shows name, repo, ref, path, revision, approved and pending pair ids, failed tree, last fetch time, `refresh_incomplete`, and the three opened error texts (made printable). `cluster diff` prints, per host, `github.com/pmezard/go-difflib/difflib` `GetUnifiedDiffString` of the redacted renders (`FromFile: "approved/<host>"`, `ToFile: "pending/<host>"`, `Context: 3`; with `--host`, `stored/<host>` and `drift/<host>`) and the line `secret values changed` where `SecretValuesChanged`.
@@ -2021,6 +2066,7 @@ func TestClusterRemove_InUse(t *testing.T)
 func TestClusterList_ShowsErrors(t *testing.T)     // a stored failed-tree error appears in --json "failed_error"
 func TestClusterDiff_PendingVsApproved(t *testing.T) // a unified diff with "--- approved/cp-01" and "+++ pending/cp-01"; never prints a fixture secret value
 func TestClusterDiff_SecretValuesChanged(t *testing.T)
+func TestClusterDiff_HostDrift(t *testing.T)       // clusters.Repository.SetDrift on the approved lab/cp-01 row → `cluster diff lab --host cp-01` prints "--- stored/cp-01" and "+++ drift/cp-01" and the changed line; never prints a fixture secret value; --host wrk-01 (no drift) → an error naming the host
 func TestClusterApprove_Stale(t *testing.T)        // exit code of a usage-class error and "no longer pending"
 func TestClusterApprove_DriftHash(t *testing.T)
 func TestClusterRefresh_SetsFlag(t *testing.T)
@@ -2107,7 +2153,8 @@ Kind: rewrite
 
 **Interfaces:**
 - Consumes: Task 21 `factorytest.New`, `factorytest.Options`; Task 8 `secrets` exported API; Tasks 27–28 the CLI.
-- `test/e2e/upstreams/main.go` (package main): one TLS 1.3 server for `factory.e2e.test` (`factorytest.Fake` with small fake kernel, initramfs and cmdline files) and `git.e2e.test` (smart HTTP via `net/http/cgi` + `git http-backend` at `/usr/lib/git-core/git-http-backend`, over a repository built from `test/e2e/fixture-cluster/` with `git` at start). It runs in the `golang:1.27.4-trixie@sha256:b54b2639de8c1bfe538ec5ffc45f29b1932235ac5f6d63c059853646677112d9` container (git 2.47.3 present, Ruling §11.7) at a new fixed address `10.99.0.13` on the e2e network.
+- `test/e2e/upstreams/main.go` (package main): one TLS 1.3 server for `factory.e2e.test` (`factorytest.Fake` with small fake kernel, initramfs and cmdline files) and `git.e2e.test` (smart HTTP via `net/http/cgi` as `cgi.Handler{Path: <exec.LookPath("git")>, Args: []string{"http-backend"}}` with `GIT_PROJECT_ROOT` and `GIT_HTTP_EXPORT_ALL`, the same form in the container and on the macOS host, where `TestUpstreams_GitSmartHTTP` runs in `task ci` and no `/usr/lib/git-core/git-http-backend` exists; over a repository built from the fixture directory with `git` at start). The certificate for each name is picked by SNI from `tls.Config.Certificates`.
+- Configuration is by environment only (depguard bans `flag` outside `cmd/`; the program reads `os.Getenv` in `main` and passes a config struct down), each variable required, a missing one exiting 2 with its name on stderr: `UPSTREAMS_ADDR` (listen address, `:443` in the harness), `UPSTREAMS_FACTORY_CERT_FILE` and `UPSTREAMS_FACTORY_KEY_FILE` (the `factory.e2e.test` leaf), `UPSTREAMS_GIT_CERT_FILE` and `UPSTREAMS_GIT_KEY_FILE` (the `git.e2e.test` leaf), `UPSTREAMS_FIXTURE_DIR` (the Topf tree to commit, `test/e2e/fixture-cluster` mounted read-only) and `UPSTREAMS_WORK_DIR` (a writable directory where the repository `lab.git` is built). `run.sh` sets all seven on the container. The tests build that config struct directly and call the program's `run(ctx, cfg)`; `TestUpstreams_MissingEnv` covers the exit-2 path. It runs in the `golang:1.27.4-trixie@sha256:b54b2639de8c1bfe538ec5ffc45f29b1932235ac5f6d63c059853646677112d9` container (git 2.47.3 present, Ruling §11.7) at a new fixed address `10.99.0.13` on the e2e network.
 - `gen-certs.sh` also issues `factory.e2e.test` and `git.e2e.test` leaves.
 - Overlays (copied into the temporary tree like `catalog.go.in`): `base.go.in` → `internal/factory/base.go` (`const Base = "https://factory.e2e.test"`); `resolver.go.in` → `internal/secrets/onepassword.go` with the same exported API, resolving from an embedded `e2e_values.json`; `run.sh` copies `test/e2e/fixture-cluster/values.json` to `internal/secrets/e2e_values.json` in the temporary tree, next to the overlaid file, because `//go:embed` paths are relative to the package directory. The harness sets `HEPHAESTUS_OP_TOKEN=e2e-dummy` and `HEPHAESTUS_DATA_KEY` to the fixture key.
 - New flow after the M2 utility phase: `heph cluster import lab --repo https://git.e2e.test/lab.git --ref main --path lab`; wait for a pending pair (`heph cluster list --json`); `heph cluster approve lab <pair id>`; `heph machine approve 52:54:00:e2:e0:03 lab/cp-01`; boot `ovmf`; checks: the Talos row reaches `ready`; `/boot` answers row 10 with an install script; the server log shows `GET /t/<schematic>/v1.12.11/amd64/kernel` and `/initramfs`; `heph machine show` reports a live ticket. Replace `seed_hold` with `heph unknown-action set hold --yes`.
@@ -2118,6 +2165,7 @@ Kind: rewrite
 func TestUpstreams_FactoryRedirectAndRange(t *testing.T) // 302 → asset; Range honoured; a mismatched If-Range still 206
 func TestUpstreams_RegisterSchematic(t *testing.T)       // POST /schematics → 201 with the id
 func TestUpstreams_GitSmartHTTP(t *testing.T)            // go-git clones the fixture repository through it (host git required; its absence fails)
+func TestUpstreams_MissingEnv(t *testing.T)               // the config loader with UPSTREAMS_GIT_KEY_FILE unset → an error naming UPSTREAMS_GIT_KEY_FILE (main exits 2 on it)
 ```
 - [ ] **Step 2: Run to verify failure**
 
