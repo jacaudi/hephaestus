@@ -315,7 +315,7 @@ func TestService_NewHeadTreeBecomesPending(t *testing.T) {
 		t.Errorf("last head tree = %q, want %s", c.LastHeadTree, tree)
 	}
 	wantNoMark(t, c)
-	want := [][]string{slices.Sorted(maps.Keys(svcValues(t)))}
+	want := [][]string{svcRefs(t)}
 	if got := h.fake.seen(); !slices.EqualFunc(got, want, slices.Equal) {
 		t.Errorf("resolver calls = %q, want %q", got, want)
 	}
@@ -899,5 +899,505 @@ func TestService_UnreleasedMarkRetried(t *testing.T) {
 	wantNoMark(t, c)
 	if c.PendingPairID == "" {
 		t.Errorf("lab: no pending pair once its mark could be cleared; reported %q", h.reported())
+	}
+}
+
+const (
+	// svcSecretRef is a reference of the bundle only, whose value the refresh tests change.
+	svcSecretRef = "ref+op://lab/bundle/cluster.secret"
+	// svcChanged is a new value for svcSecretRef: base64 of 32 bytes, as the value it replaces.
+	svcChanged = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI="
+	// svcNewPassword is the read credential after its rotation in 1Password.
+	svcNewPassword = "git-read-token-9c2b"
+)
+
+// svcRefs is every reference of svcFiles, in the order Load gives them.
+func svcRefs(t *testing.T) []string {
+	t.Helper()
+	return slices.Sorted(maps.Keys(svcValues(t)))
+}
+
+// requestRefresh asks for a refresh of cluster lab, then moves the clock to the next poll.
+func (h *svcHarness) requestRefresh() {
+	h.t.Helper()
+	if err := h.repo.RequestRefresh(h.t.Context(), labName, h.now); err != nil {
+		h.t.Fatalf("RequestRefresh: %v", err)
+	}
+	h.now = h.now.Add(PollInterval)
+}
+
+// values opens a secret version.
+func (h *svcHarness) values(versionID string) map[string]string {
+	h.t.Helper()
+	v, err := h.repo.Values(h.t.Context(), versionID)
+	if err != nil {
+		h.t.Fatalf("Values(%s): %v", versionID, err)
+	}
+	return v
+}
+
+// pendingAfterPoll polls s once and returns the pending pair it stored.
+func (h *svcHarness) pendingAfterPoll(s *Service) Pair {
+	h.t.Helper()
+	h.poll(s)
+	id := h.cluster().PendingPairID
+	if id == "" {
+		h.t.Fatalf("no pending pair; reported %q", h.reported())
+	}
+	return h.pair(id)
+}
+
+func TestService_RefreshOrder(t *testing.T) {
+	srv := gittest.NewServer(t, gittest.Options{})
+	h := newSvcHarness(t, srv, "")
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	defer srv.Close()
+	t3 := srv.Tree(t, srv.Commit(t, svcFiles(t), nil), gitLab)
+	h.fake.set(func(f *fakeResolver) { f.fail[svcFailRef] = svcKind })
+	s := h.service(h.fake)
+	h.poll(s)
+	if c := h.cluster(); c.FailedTree != t3 {
+		t.Fatalf("failed tree = %q, want %s; reported %q", c.FailedTree, t3, h.reported())
+	}
+
+	h.fake.set(func(f *fakeResolver) { delete(f.fail, svcFailRef) })
+	t4 := srv.Tree(t, srv.Commit(t, map[string]string{"lab/notes.txt": "a newer good tree"}, nil), gitLab)
+	h.now = h.now.Add(FetchInterval)
+	old := h.pendingAfterPoll(s)
+	if c := h.cluster(); old.TreeHash != t4 || c.FailedTree != "" {
+		t.Fatalf("pending tree = %s, failed = %q; want %s and none", old.TreeHash, c.FailedTree, t4)
+	}
+
+	h.fake.set(func(f *fakeResolver) { f.values[svcSecretRef] = svcChanged })
+	h.requestRefresh()
+	h.poll(s)
+
+	c := h.cluster()
+	if c.PendingPairID == "" || c.PendingPairID == old.ID {
+		t.Fatalf("pending pair = %q after a refresh with a changed value; want a new pair (was %s); reported %q", c.PendingPairID, old.ID, h.reported())
+	}
+	p := h.pair(c.PendingPairID)
+	if p.TreeHash != t4 || p.SecretVersionID == old.SecretVersionID {
+		t.Errorf("new pair = (%s, %s); want (%s, a new version)", p.TreeHash, p.SecretVersionID, t4)
+	}
+	if got := h.values(p.SecretVersionID)[svcSecretRef]; got != svcChanged {
+		t.Errorf("new version holds %s = %q, want the changed value", svcSecretRef, got)
+	}
+	if n := count(t, h.d, "secret_versions", "id = ?", old.SecretVersionID); n != 0 {
+		t.Errorf("the old version row is still stored (%d rows)", n)
+	}
+	if c.RefreshRequested || !c.LastRefreshAt.Equal(h.now) || c.LastHeadTree != t4 {
+		t.Errorf("refresh requested = %v, last refresh = %v, last head = %q; want false, %v, %s", c.RefreshRequested, c.LastRefreshAt, c.LastHeadTree, h.now, t4)
+	}
+	wantNoMark(t, c)
+	if !cached(s, p.ID) {
+		t.Error("the refreshed pair is not in the tree cache")
+	}
+}
+
+func TestService_RefreshRetriesFailedTreeFirst(t *testing.T) {
+	srv := gittest.NewServer(t, gittest.Options{})
+	h := newSvcHarness(t, srv, "")
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	defer srv.Close()
+	// The approved tree's only reference is svcFailRef; the failed tree adds the bundle's.
+	approvedFiles := literalFiles(t)
+	approvedFiles["lab/all/base.yaml"] = svcFiles(t)["lab/all/base.yaml"]
+	srv.Commit(t, approvedFiles, nil)
+	s := h.service(h.fake)
+	approved := h.pendingAfterPoll(s)
+	approveForTest(t, h.d, h.id, approved.ID)
+
+	h.fake.set(func(f *fakeResolver) { f.fail[svcSecretRef] = svcKind })
+	t3 := srv.Tree(t, srv.Commit(t, svcFiles(t), nil), gitLab)
+	h.now = h.now.Add(FetchInterval)
+	h.poll(s)
+	if c := h.cluster(); c.FailedTree != t3 {
+		t.Fatalf("failed tree = %q, want %s; reported %q", c.FailedTree, t3, h.reported())
+	}
+
+	h.fake.set(func(f *fakeResolver) { delete(f.fail, svcSecretRef) })
+	before := len(h.fake.seen())
+	h.requestRefresh()
+	h.poll(s)
+
+	if got, want := h.fake.seen()[before:], [][]string{svcRefs(t)}; !slices.EqualFunc(got, want, slices.Equal) {
+		t.Errorf("resolver calls of the refresh = %q, want the failed tree's references only, %q", got, want)
+	}
+	c := h.cluster()
+	if c.PendingPairID == "" || h.pair(c.PendingPairID).TreeHash != t3 {
+		t.Fatalf("pending pair = %q, want a pair of the failed tree %s; reported %q", c.PendingPairID, t3, h.reported())
+	}
+	if c.FailedTree != "" || h.errors().Failed != "" || c.ApprovedPairID != approved.ID {
+		t.Errorf("failed tree = %q (%q), approved = %q; want none and %s", c.FailedTree, h.errors().Failed, c.ApprovedPairID, approved.ID)
+	}
+	if !c.LastRefreshAt.Equal(h.now) || c.RefreshRequested {
+		t.Errorf("last refresh = %v, refresh requested = %v; want %v, false", c.LastRefreshAt, c.RefreshRequested, h.now)
+	}
+	wantNoMark(t, c)
+}
+
+func TestService_RefreshFailedThenGoodTree(t *testing.T) {
+	srv := gittest.NewServer(t, gittest.Options{})
+	h := newSvcHarness(t, srv, "")
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	defer srv.Close()
+	t1 := srv.Tree(t, srv.Commit(t, svcFiles(t), nil), gitLab)
+	s := h.service(h.fake)
+	approved := h.pendingAfterPoll(s)
+	approveForTest(t, h.d, h.id, approved.ID)
+
+	t2 := srv.Tree(t, srv.Commit(t, map[string]string{"lab/topf.yaml": svcTopf + "nodesProvider: /bin/x\n"}, nil), gitLab)
+	h.now = h.now.Add(FetchInterval)
+	h.poll(s)
+	if c := h.cluster(); c.FailedTree != t2 {
+		t.Fatalf("failed tree = %q, want %s; reported %q", c.FailedTree, t2, h.reported())
+	}
+
+	h.fake.set(func(f *fakeResolver) { f.values[svcSecretRef] = svcChanged })
+	before := len(h.fake.seen())
+	h.requestRefresh()
+	h.poll(s)
+
+	c := h.cluster()
+	if c.PendingPairID == "" {
+		t.Fatalf("no pending pair after the refresh; reported %q", h.reported())
+	}
+	p := h.pair(c.PendingPairID)
+	if p.TreeHash != t1 || p.SecretVersionID == approved.SecretVersionID || h.values(p.SecretVersionID)[svcSecretRef] != svcChanged {
+		t.Errorf("pending pair = (%s, %s); want (%s, a new version with the changed value)", p.TreeHash, p.SecretVersionID, t1)
+	}
+	if c.FailedTree != t2 || !strings.Contains(h.errors().Failed, "nodesProvider set") {
+		t.Errorf("failed tree = %q (%q); want %s kept with its refusal", c.FailedTree, h.errors().Failed, t2)
+	}
+	if c.ApprovedPairID != approved.ID || c.LastHeadTree != t2 {
+		t.Errorf("approved = %q, last head = %q; want %s and %s", c.ApprovedPairID, c.LastHeadTree, approved.ID, t2)
+	}
+	if got, want := h.fake.seen()[before:], [][]string{svcRefs(t)}; !slices.EqualFunc(got, want, slices.Equal) {
+		t.Errorf("resolver calls of the refresh = %q, want the approved tree's only, %q", got, want)
+	}
+	wantNoMark(t, c)
+}
+
+func TestService_RefreshUnchangedValuesNoPair(t *testing.T) {
+	srv := gittest.NewServer(t, gittest.Options{})
+	h := newSvcHarness(t, srv, "")
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	defer srv.Close()
+	srv.Commit(t, svcFiles(t), nil)
+	s := h.service(h.fake)
+	first := h.pendingAfterPoll(s)
+	execRaw(t, h.d, "UPDATE clusters SET refresh_incomplete = ? WHERE id = ?", true, h.id)
+
+	h.requestRefresh()
+	h.poll(s)
+
+	c := h.cluster()
+	if c.PendingPairID != first.ID {
+		t.Errorf("pending pair = %q, want %s unchanged", c.PendingPairID, first.ID)
+	}
+	if n := count(t, h.d, "secret_versions", "cluster_id = ?", h.id); n != 1 {
+		t.Errorf("%d secret versions stored, want 1", n)
+	}
+	if !c.LastRefreshAt.Equal(h.now) || c.RefreshIncomplete || c.RefreshRequested {
+		t.Errorf("last refresh = %v, incomplete = %v, requested = %v; want %v, false, false", c.LastRefreshAt, c.RefreshIncomplete, c.RefreshRequested, h.now)
+	}
+	if n := len(h.fake.seen()); n != 2 {
+		t.Errorf("resolver called %d times, want 2", n)
+	}
+	wantNoMark(t, c)
+}
+
+func TestService_PerReferenceFailureNoBackoff(t *testing.T) {
+	srv := gittest.NewServer(t, gittest.Options{})
+	h := newSvcHarness(t, srv, "")
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	defer srv.Close()
+	srv.Commit(t, svcFiles(t), nil)
+	s := h.service(h.fake)
+	first := h.pendingAfterPoll(s)
+
+	h.fake.set(func(f *fakeResolver) { f.fail[svcFailRef] = svcKind })
+	h.requestRefresh()
+	h.poll(s)
+
+	c := h.cluster()
+	if !c.RefreshIncomplete {
+		t.Errorf("refresh incomplete = false after a failed reference; reported %q", h.reported())
+	}
+	if c.Attempts != 0 || !c.NextAttemptAt.IsZero() || c.RefreshRequested {
+		t.Errorf("attempts = %d, next = %v, requested = %v; want 0, none, false", c.Attempts, c.NextAttemptAt, c.RefreshRequested)
+	}
+	if c.PendingPairID != first.ID || c.FailedTree != "" {
+		t.Errorf("pending = %q, failed = %q; want %s unchanged and none", c.PendingPairID, c.FailedTree, first.ID)
+	}
+	wantNoMark(t, c)
+	wantOneAudit(t, h.d, "cluster.refresh_incomplete", fleet.ActorSystem, `{"name":"`+labName+`"}`)
+	if n := h.counter("hephaestus.alerts", "kind", "refresh_incomplete"); n != 1 {
+		t.Errorf("hephaestus.alerts{kind=refresh_incomplete} = %d, want 1", n)
+	}
+	for _, got := range h.reported() {
+		if strings.Contains(got, svcFailRef) || strings.Contains(got, svcKind) {
+			t.Errorf("report %q quotes the reference or its failure", got)
+		}
+	}
+
+	h.now = h.now.Add(FetchInterval)
+	h.poll(s)
+	if n := len(h.fake.seen()); n != 2 {
+		t.Errorf("resolver called %d times, want 2: a failed reference waits for the next trigger", n)
+	}
+}
+
+func TestService_WholeCallBackoffPersists(t *testing.T) {
+	srv := gittest.NewServer(t, gittest.Options{})
+	h := newSvcHarness(t, srv, "")
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	defer srv.Close()
+	srv.Commit(t, svcFiles(t), nil)
+	s := h.service(h.fake)
+	h.pendingAfterPoll(s)
+
+	h.fake.set(func(f *fakeResolver) { f.whole = &secrets.WholeCallError{Err: errors.New("transport")} })
+	h.requestRefresh()
+	h.poll(s)
+
+	at := h.now
+	c := h.cluster()
+	if c.Attempts != 1 || !c.NextAttemptAt.Equal(at.Add(fleet.Backoff(1))) || !c.RefreshRequested {
+		t.Fatalf("attempts = %d, next = %v, requested = %v; want 1, %v, true; reported %q",
+			c.Attempts, c.NextAttemptAt, c.RefreshRequested, at.Add(fleet.Backoff(1)), h.reported())
+	}
+	wantNoMark(t, c)
+	if h.errors().LastCall == "" {
+		t.Error("no last call error stored")
+	}
+
+	h.fake.set(func(f *fakeResolver) { f.whole = nil })
+	restarted := h.service(h.fake)
+	h.now = at.Add(fleet.Backoff(1) - time.Second)
+	h.poll(restarted)
+	if n := len(h.fake.seen()); n != 2 {
+		t.Fatalf("resolver called %d times before next_attempt_at after a restart, want 2", n)
+	}
+
+	h.now = at.Add(fleet.Backoff(1))
+	h.poll(restarted)
+	if n := len(h.fake.seen()); n != 3 {
+		t.Fatalf("resolver called %d times at next_attempt_at, want 3", n)
+	}
+	c = h.cluster()
+	if c.Attempts != 0 || c.RefreshRequested || !c.LastRefreshAt.Equal(h.now) || h.errors().LastCall != "" {
+		t.Errorf("after the retry: attempts = %d, requested = %v, last refresh = %v, last call = %q; want 0, false, %v, none",
+			c.Attempts, c.RefreshRequested, c.LastRefreshAt, h.errors().LastCall, h.now)
+	}
+}
+
+func TestService_RateLimitPausesUntilDaily(t *testing.T) {
+	srv := gittest.NewServer(t, gittest.Options{})
+	h := newSvcHarness(t, srv, "")
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	defer srv.Close()
+	srv.Commit(t, svcFiles(t), nil)
+	s := h.service(h.fake)
+	h.pendingAfterPoll(s)
+
+	limited := fmt.Errorf("%w: %w", secrets.ErrRateLimited, &secrets.WholeCallError{Err: errors.New("429")})
+	h.fake.set(func(f *fakeResolver) { f.whole = limited })
+	h.requestRefresh()
+	h.poll(s)
+
+	at := h.now
+	if c := h.cluster(); !c.RateLimitedUntil.Equal(at.Add(DailyInterval)) || !c.RefreshRequested {
+		t.Fatalf("rate limited until %v, requested = %v; want %v, true; reported %q", c.RateLimitedUntil, c.RefreshRequested, at.Add(DailyInterval), h.reported())
+	}
+	h.fake.set(func(f *fakeResolver) { f.whole = nil })
+	for _, d := range []time.Duration{fleet.Backoff(1), time.Hour, DailyInterval - time.Minute} {
+		h.now = at.Add(d)
+		h.poll(s)
+	}
+	if n := len(h.fake.seen()); n != 2 {
+		t.Fatalf("resolver called %d times while rate limited, want 2", n)
+	}
+
+	h.requestRefresh()
+	if c := h.cluster(); !c.RateLimitedUntil.IsZero() || !c.NextAttemptAt.IsZero() {
+		t.Fatalf("after cluster refresh: rate limited until %v, next attempt %v; want both cleared", c.RateLimitedUntil, c.NextAttemptAt)
+	}
+	h.poll(s)
+	if n := len(h.fake.seen()); n != 3 {
+		t.Fatalf("resolver called %d times after cluster refresh, want 3", n)
+	}
+	if c := h.cluster(); !c.LastRefreshAt.Equal(h.now) || c.Attempts != 0 {
+		t.Errorf("last refresh = %v, attempts = %d; want %v, 0", c.LastRefreshAt, c.Attempts, h.now)
+	}
+}
+
+func TestService_DailyTimer(t *testing.T) {
+	srv := gittest.NewServer(t, gittest.Options{})
+	h := newSvcHarness(t, srv, "")
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	defer srv.Close()
+	srv.Commit(t, svcFiles(t), nil)
+	s := h.service(h.fake)
+	h.pendingAfterPoll(s)
+
+	h.now = gitT0.Add(23 * time.Hour)
+	h.poll(s)
+	if n := len(h.fake.seen()); n != 1 {
+		t.Fatalf("resolver called %d times 23 hours after import, want 1", n)
+	}
+
+	h.now = gitT0.Add(DailyInterval)
+	h.poll(s)
+	if n := len(h.fake.seen()); n != 2 {
+		t.Fatalf("resolver called %d times a day after import, want 2; reported %q", n, h.reported())
+	}
+	c := h.cluster()
+	if !c.LastDailyAt.Equal(h.now) || !c.LastRefreshAt.Equal(h.now) {
+		t.Errorf("last daily = %v, last refresh = %v; want both %v", c.LastDailyAt, c.LastRefreshAt, h.now)
+	}
+
+	h.now = h.now.Add(PollInterval)
+	h.poll(s)
+	if n := len(h.fake.seen()); n != 2 {
+		t.Errorf("resolver called %d times on the poll after the daily refresh, want 2", n)
+	}
+}
+
+func TestService_CredentialReResolvedAtRefresh(t *testing.T) {
+	srv := gittest.NewServer(t, gittest.Options{BasicAuth: &[2]string{svcUser, svcPassword}})
+	h := newSvcHarness(t, srv, svcCredRef)
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	defer srv.Close()
+	srv.Commit(t, svcFiles(t), nil)
+	h.fake.set(func(f *fakeResolver) { f.values[svcCredRef] = svcPassword })
+	s := h.service(h.fake)
+	h.pendingAfterPoll(s)
+
+	h.fake.set(func(f *fakeResolver) { f.values[svcCredRef] = svcNewPassword })
+	before := len(h.fake.seen())
+	h.requestRefresh()
+	h.poll(s)
+
+	got, ok, err := h.repo.Credential(t.Context(), h.id)
+	if err != nil || !ok || got.Expose() != svcNewPassword {
+		t.Errorf("stored credential ok = %v, err = %v, rotated = %v; want the new value", ok, err, got.Expose() == svcNewPassword)
+	}
+	if calls := h.fake.seen()[before:]; len(calls) == 0 || !slices.Equal(calls[0], []string{svcCredRef}) {
+		t.Errorf("resolver calls of the refresh = %q, want the credential first, in its own call", calls)
+	}
+	if c := h.cluster(); !c.LastRefreshAt.Equal(h.now) {
+		t.Errorf("last refresh = %v, want %v", c.LastRefreshAt, h.now)
+	}
+}
+
+func TestService_RefreshWithoutTokenSkipped(t *testing.T) {
+	srv := gittest.NewServer(t, gittest.Options{})
+	h := newSvcHarness(t, srv, "")
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	defer srv.Close()
+	srv.Commit(t, svcFiles(t), nil)
+	h.pendingAfterPoll(h.service(h.fake))
+
+	s := h.service(nil)
+	h.requestRefresh()
+	h.poll(s)
+	h.now = gitT0.Add(DailyInterval)
+	h.poll(s)
+
+	c := h.cluster()
+	if !c.RefreshRequested || !c.LastDailyAt.IsZero() || !c.LastRefreshAt.IsZero() {
+		t.Errorf("requested = %v, last daily = %v, last refresh = %v; want the triggers left pending", c.RefreshRequested, c.LastDailyAt, c.LastRefreshAt)
+	}
+	wantNoMark(t, c)
+	if got := h.reported(); len(got) != 0 {
+		t.Errorf("reported %q, want nothing: secrets:token reports a missing token", got)
+	}
+}
+
+func TestService_RefreshOnHeadPollKeepsNewTree(t *testing.T) {
+	srv := gittest.NewServer(t, gittest.Options{})
+	h := newSvcHarness(t, srv, "")
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	defer srv.Close()
+	srv.Commit(t, svcFiles(t), nil)
+	h.fake.set(func(f *fakeResolver) { f.fail[svcFailRef] = svcKind })
+	s := h.service(h.fake)
+	h.poll(s)
+	if h.cluster().FailedTree == "" {
+		t.Fatalf("no failed tree; reported %q", h.reported())
+	}
+
+	// One poll fetches a newer good tree while a refresh is due: the refresh must see the pair the head work stored.
+	h.fake.set(func(f *fakeResolver) { delete(f.fail, svcFailRef) })
+	t4 := srv.Tree(t, srv.Commit(t, map[string]string{"lab/notes.txt": "a newer good tree"}, nil), gitLab)
+	h.requestRefresh()
+	h.now = h.now.Add(FetchInterval)
+	h.poll(s)
+
+	c := h.cluster()
+	if c.PendingPairID == "" || h.pair(c.PendingPairID).TreeHash != t4 {
+		t.Fatalf("pending pair = %q; want a pair of the new head tree %s; reported %q", c.PendingPairID, t4, h.reported())
+	}
+	if c.FailedTree != "" || c.RefreshRequested || !c.LastRefreshAt.Equal(h.now) {
+		t.Errorf("failed = %q, requested = %v, last refresh = %v; want none, false, %v", c.FailedTree, c.RefreshRequested, c.LastRefreshAt, h.now)
+	}
+	wantNoMark(t, c)
+}
+
+func TestService_RefreshWithoutTreeWaits(t *testing.T) {
+	srv := gittest.NewServer(t, gittest.Options{BasicAuth: &[2]string{svcUser, svcPassword}})
+	h := newSvcHarness(t, srv, svcCredRef)
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	defer srv.Close()
+	srv.Commit(t, map[string]string{"other/note.txt": "no cluster definition yet"}, nil)
+	h.fake.set(func(f *fakeResolver) { f.values[svcCredRef] = svcPassword })
+	s := h.service(h.fake)
+	h.poll(s)
+
+	h.requestRefresh()
+	for range 3 {
+		h.poll(s)
+		h.now = h.now.Add(PollInterval)
+	}
+
+	if calls := h.fake.seen(); len(calls) != 1 {
+		t.Errorf("resolver calls = %q; want the first credential resolution only, while there is no tree to refresh", calls)
+	}
+	if c := h.cluster(); !c.RefreshRequested {
+		t.Error("the refresh request was consumed with no tree to refresh")
+	}
+}
+
+func TestService_RefreshRenderErrorIncomplete(t *testing.T) {
+	srv := gittest.NewServer(t, gittest.Options{})
+	h := newSvcHarness(t, srv, "")
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	defer srv.Close()
+	t1 := srv.Tree(t, srv.Commit(t, svcFiles(t), nil), gitLab)
+	s := h.service(h.fake)
+	first := h.pendingAfterPoll(s)
+
+	// A value the bundle cannot hold: the tree resolves, but does not render.
+	h.fake.set(func(f *fakeResolver) { f.values["ref+op://lab/bundle/certs.os.crt"] = "not a certificate" })
+	h.requestRefresh()
+	h.poll(s)
+
+	c := h.cluster()
+	if !c.RefreshIncomplete || c.RefreshRequested {
+		t.Errorf("incomplete = %v, requested = %v; want true, false; reported %q", c.RefreshIncomplete, c.RefreshRequested, h.reported())
+	}
+	if c.FailedTree != "" || h.errors().Failed != "" || c.LastHeadTree != t1 || c.PendingPairID != first.ID {
+		t.Errorf("failed = %q (%q), last head = %q, pending = %q; want none, %s, %s unchanged",
+			c.FailedTree, h.errors().Failed, c.LastHeadTree, c.PendingPairID, t1, first.ID)
+	}
+	wantNoMark(t, c)
+	wantOneAudit(t, h.d, "cluster.refresh_incomplete", fleet.ActorSystem, `{"name":"`+labName+`"}`)
+	if n := h.counter("hephaestus.alerts", "kind", "refresh_incomplete"); n != 1 {
+		t.Errorf("hephaestus.alerts{kind=refresh_incomplete} = %d, want 1", n)
+	}
+	if got := h.reported(); len(got) != 1 || !strings.HasSuffix(got[0], "the refresh is incomplete: the tree does not render") {
+		t.Errorf("reported %q, want one report that the refreshed tree does not render", got)
 	}
 }

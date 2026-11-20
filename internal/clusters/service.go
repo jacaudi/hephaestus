@@ -1,6 +1,7 @@
 package clusters
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -42,12 +43,14 @@ const (
 )
 
 const (
-	errNoToken        = "HEPHAESTUS_OP_TOKEN is not set" //nolint:gosec // G101: names the token variable, holds no credential
-	actionMovedAside  = "cluster.store_moved_aside"
-	alertMovedAside   = "git_store_moved_aside"
-	outcomeOK         = "ok"
-	outcomeError      = "error"
-	kindMissingResult = "missing"
+	errNoToken              = "HEPHAESTUS_OP_TOKEN is not set" //nolint:gosec // G101: names the token variable, holds no credential
+	actionMovedAside        = "cluster.store_moved_aside"
+	alertMovedAside         = "git_store_moved_aside"
+	actionRefreshIncomplete = "cluster.refresh_incomplete"
+	alertRefreshIncomplete  = "refresh_incomplete"
+	outcomeOK               = "ok"
+	outcomeError            = "error"
+	kindMissingResult       = "missing"
 	// releaseDeadline bounds the clearing of a held processing mark once Run's context has ended.
 	releaseDeadline = 10 * time.Second
 
@@ -59,6 +62,7 @@ const (
 	stageLoad       = "load"
 	stageResolve    = "resolve"
 	stageRender     = "render"
+	stageRefresh    = "refresh"
 	stageStore      = "store"
 	stageCache      = "cache"
 	stageRelease    = "release"
@@ -81,9 +85,10 @@ type Config struct {
 	Meter metric.Meter
 }
 
-// Service polls the imported clusters, fetches their branches and turns each new head tree into a pending pair. It
-// keeps the tree of every approved and pending pair, loaded, in a cache. Startup and then Run are called on one
-// goroutine, which owns the poll state and any processing mark the service holds.
+// Service polls the imported clusters, fetches their branches, turns each new head tree into a pending pair and
+// runs the refreshes their triggers ask for. It keeps the tree of every approved and pending pair, loaded, in a
+// cache. Startup and then Run are called on one goroutine, which owns the poll state and every processing mark the
+// service holds: head work and refreshes alike run on it.
 type Service struct {
 	cfg     Config
 	git     *gitStore
@@ -136,6 +141,15 @@ func (m *credentialMark) holds(c *Cluster) bool {
 		return true
 	}
 	return m.refresh
+}
+
+// work is a piece of work on c's tree, started by trigger at at; it holds the tree's processing mark once marked.
+// tree is "" for work that holds no mark (a credential resolution).
+type work struct {
+	c       *Cluster
+	tree    string
+	trigger Trigger
+	at      time.Time
 }
 
 // cachePair is a pair the cache should hold.
@@ -232,8 +246,9 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 }
 
-// poll reads the clusters, drops the cache entries no cluster uses, and fetches and processes each cluster in turn.
-// After a move-aside every cluster is fetched afresh and the cache refilled before the poll ends.
+// poll reads the clusters, drops the cache entries no cluster uses, and fetches, processes and refreshes each cluster
+// in turn. After a move-aside no refresh runs; every cluster is fetched afresh and the cache refilled before the poll
+// ends.
 func (s *Service) poll(ctx context.Context) {
 	at := s.cfg.Now()
 	s.release(ctx) // a mark an earlier poll could not clear
@@ -252,6 +267,9 @@ func (s *Service) poll(ctx context.Context) {
 		c := &clusters[i]
 		s.fetchIfDue(ctx, c, at)
 		moved = s.processHead(ctx, c, at) || moved
+		if !moved {
+			moved = s.refreshIfDue(ctx, c, at)
+		}
 	}
 	if moved && ctx.Err() == nil {
 		if err := s.refill(ctx, at); err != nil {
@@ -345,14 +363,14 @@ func (s *Service) credential(ctx context.Context, c *Cluster, at time.Time) (pas
 	results, err := s.resolve(ctx, []string{c.CredentialRef})
 	if err != nil {
 		if ctx.Err() == nil {
-			s.recordWholeCall(ctx, c, wholeCallFailure(c, "", TriggerCredential, err, at))
+			s.recordWholeCall(ctx, c, wholeCallFailure(work{c: c, trigger: TriggerCredential, at: at}, err))
 		}
 		return "", false
 	}
 	s.resetAttempts(ctx, c)
 	password, kind := lookup(results, c.CredentialRef)
 	if kind != "" {
-		s.credentialFailure(ctx, c, "credential "+c.CredentialRef+": "+kind, at)
+		s.credentialFailure(ctx, c, credentialText(c.CredentialRef, kind), at)
 		return "", false
 	}
 	if err := s.cfg.Repo.SetCredential(ctx, c.ID, password, at); err != nil {
@@ -382,75 +400,103 @@ func (s *Service) processHead(ctx context.Context, c *Cluster, at time.Time) (mo
 	if f.revision != c.Revision {
 		tree = ""
 	}
-	if _, unreleased := s.held[c.ID]; unreleased {
-		return false
-	}
 	if tree == "" || tree == c.LastHeadTree || c.ProcessingTree != "" || waiting(c, at) {
 		return false
 	}
-	ok, err := s.cfg.Repo.MarkProcessing(ctx, MarkRequest{ClusterID: c.ID, Tree: tree, Revision: c.Revision, Trigger: TriggerHead, At: at})
-	if err != nil {
-		s.fail(ctx, stageStore, c.Name, err)
+	w := work{c: c, tree: tree, trigger: TriggerHead, at: at}
+	if !s.mark(ctx, w) {
 		return false
 	}
+	fsys, moved, ok := s.readMarked(ctx, w)
 	if !ok {
-		return false
-	}
-	s.held[c.ID] = struct{}{}
-
-	fsys, err := s.git.readTree(ctx, c.ID, tree)
-	if err != nil {
-		if ctx.Err() != nil {
-			return false // Run clears the mark
+		if ctx.Err() == nil { // on shutdown Run clears the mark
+			s.release(ctx)
 		}
-		if s.git.corrupt(tree, err) {
-			moved = s.moveAside(ctx, c.Name, err, at)
-		} else {
-			s.report(ctx, stageRead, c.Name, "the head tree cannot be read")
-		}
-		s.release(ctx)
 		return moved
 	}
-	s.buildPair(ctx, c, tree, fsys, at)
+	s.buildPair(ctx, w, fsys)
 	return false
 }
 
-// buildPair loads, resolves and renders the tree c holds the mark on, and stores the result: the pending pair, or the
-// failed tree with its error sealed. A whole-call failure is recorded for the backoff instead.
-func (s *Service) buildPair(ctx context.Context, c *Cluster, tree string, fsys fs.FS, at time.Time) {
+// mark records w's tree as processing, consuming w's trigger, and reports whether it did. A cluster whose mark the
+// service could not release is not marked again until the release succeeds.
+func (s *Service) mark(ctx context.Context, w work) bool {
+	if _, unreleased := s.held[w.c.ID]; unreleased {
+		return false
+	}
+	ok, err := s.cfg.Repo.MarkProcessing(ctx, MarkRequest{ClusterID: w.c.ID, Tree: w.tree, Revision: w.c.Revision, Trigger: w.trigger, At: w.at})
+	if err != nil {
+		s.fail(ctx, stageStore, w.c.Name, err)
+		return false
+	}
+	if ok {
+		s.held[w.c.ID] = struct{}{}
+	}
+	return ok
+}
+
+// readMarked reads w's tree. When it cannot, ok is false and the mark is left for the caller: after a corrupt read
+// the store is moved aside (moved reports whether it was), otherwise the failure is reported; on shutdown neither.
+func (s *Service) readMarked(ctx context.Context, w work) (fsys fs.FS, moved, ok bool) {
+	fsys, err := s.git.readTree(ctx, w.c.ID, w.tree)
+	if err == nil {
+		return fsys, false, true
+	}
+	if ctx.Err() != nil {
+		return nil, false, false
+	}
+	if s.git.corrupt(w.tree, err) {
+		return nil, s.moveAside(ctx, w.c.Name, err, w.at), false
+	}
+	s.report(ctx, stageRead, w.c.Name, "the tree cannot be read")
+	return nil, false, false
+}
+
+// buildPair loads, resolves and renders the tree w holds the mark on, and stores the result: the pending pair, or the
+// failed tree with its error sealed. A whole-call failure is recorded for the backoff instead. Work other than a head
+// tree stores the pair as a refresh. It reports whether it stored the failed tree.
+func (s *Service) buildPair(ctx context.Context, w work, fsys fs.FS) (failed bool) {
+	c := w.c
 	def, err := render.Load(fsys)
 	if err != nil {
-		s.storeFailed(ctx, c, tree, err.Error(), at)
+		failed = s.storeFailed(ctx, w, err.Error())
 		if refusal, isRefusal := errors.AsType[*render.RefusalError](err); isRefusal {
 			s.report(ctx, stageLoad, c.Name, "the tree is refused: "+refusal.File+": "+refusal.Rule)
 		} else {
 			s.report(ctx, stageLoad, c.Name, "the tree does not load")
 		}
-		return
+		return failed
 	}
 	if s.cfg.Resolver == nil {
-		s.storeFailed(ctx, c, tree, errNoToken, at)
+		failed = s.storeFailed(ctx, w, errNoToken)
 		s.report(ctx, stageResolve, c.Name, errNoToken)
-		return
+		return failed
 	}
 
-	values, ok := s.resolveTree(ctx, c, tree, def.Refs, at)
+	values, failures, ok := s.resolveTree(ctx, w, def.Refs)
 	if !ok {
-		return
+		return false
+	}
+	if len(failures) > 0 {
+		failed = s.storeFailed(ctx, w, strings.Join(failures, "; "))
+		s.report(ctx, stageResolve, c.Name, fmt.Sprintf("%d references did not resolve", len(failures)))
+		return failed
 	}
 
 	renders, err := def.Render(ctx, values)
 	if err != nil {
 		if ctx.Err() != nil {
-			return
+			return false
 		}
-		s.storeFailed(ctx, c, tree, err.Error(), at)
+		failed = s.storeFailed(ctx, w, err.Error())
 		s.report(ctx, stageRender, c.Name, "the tree does not render")
-		return
+		return failed
 	}
 	s.storePending(ctx, c, def, StorePendingRequest{
-		ClusterID: c.ID, Tree: tree, Revision: c.Revision, Values: values, TalosVersion: def.TalosVersion, Renders: renders, At: at,
+		ClusterID: c.ID, Tree: w.tree, Revision: c.Revision, Values: values, TalosVersion: def.TalosVersion, Renders: renders,
+		Refresh: w.trigger != TriggerHead, At: w.at,
 	})
+	return false
 }
 
 // storePending stores the pending pair and caches its definition. A store that found the mark stale writes nothing,
@@ -463,21 +509,20 @@ func (s *Service) storePending(ctx context.Context, c *Cluster, def *render.Clus
 	}
 	delete(s.held, c.ID)
 	if stored {
-		s.cacheMu.Lock()
-		s.cache[pairID] = def
-		s.cacheMu.Unlock()
+		s.keep(pairID, def)
 	}
 }
 
-// storeFailed records tree as c's failed tree with text sealed. A store that found the mark stale writes nothing,
-// and the mark is then not the service's to clear.
-func (s *Service) storeFailed(ctx context.Context, c *Cluster, tree, text string, at time.Time) {
-	_, err := s.cfg.Repo.StoreFailed(ctx, StoreFailedRequest{ClusterID: c.ID, Tree: tree, Revision: c.Revision, Error: text, At: at})
+// storeFailed records w's tree as c's failed tree with text sealed, and reports whether it did. A store that found
+// the mark stale writes nothing, and the mark is then not the service's to clear.
+func (s *Service) storeFailed(ctx context.Context, w work, text string) bool {
+	stored, err := s.cfg.Repo.StoreFailed(ctx, StoreFailedRequest{ClusterID: w.c.ID, Tree: w.tree, Revision: w.c.Revision, Error: text, At: w.at})
 	if err != nil {
-		s.storeError(ctx, c, err)
-		return
+		s.storeError(ctx, w.c, err)
+		return false
 	}
-	delete(s.held, c.ID)
+	delete(s.held, w.c.ID)
+	return stored
 }
 
 // storeError handles a store that failed: on shutdown Run clears the mark; otherwise the mark is cleared now, so the
@@ -490,35 +535,249 @@ func (s *Service) storeError(ctx context.Context, c *Cluster, err error) {
 	s.release(ctx)
 }
 
-// resolveTree resolves the references of the tree c holds the mark on. A tree without references needs no call. ok
-// is false when the work ended here: a whole-call failure recorded for the backoff, or a failed reference stored.
-func (s *Service) resolveTree(ctx context.Context, c *Cluster, tree string, refs []string, at time.Time) (values map[string]string, ok bool) {
+// resolveTree resolves refs, the references of the tree w holds the mark on: the value of each, and
+// "reference <ref>: <kind>" for each that failed. A tree without references needs no call. ok is false when the call
+// failed as a whole, which is recorded for the backoff, or was cut short by ctx's end.
+func (s *Service) resolveTree(ctx context.Context, w work, refs []string) (values map[string]string, failures []string, ok bool) {
 	if len(refs) == 0 {
-		return map[string]string{}, true
+		return map[string]string{}, nil, true
 	}
 	results, err := s.resolve(ctx, refs)
 	if err != nil {
 		if ctx.Err() == nil {
-			s.recordWholeCall(ctx, c, wholeCallFailure(c, tree, TriggerHead, err, at))
+			s.recordWholeCall(ctx, w.c, wholeCallFailure(w, err))
 		}
-		return nil, false
+		return nil, nil, false
 	}
-	s.resetAttempts(ctx, c)
-	values, failures := resolved(results, refs)
-	if len(failures) > 0 {
-		s.storeFailed(ctx, c, tree, strings.Join(failures, "; "), at)
-		s.report(ctx, stageResolve, c.Name, fmt.Sprintf("%d references did not resolve", len(failures)))
-		return nil, false
-	}
-	return values, true
+	s.resetAttempts(ctx, w.c)
+	values, failures = resolved(results, refs)
+	return values, failures, true
 }
 
-// wholeCallFailure is the record of callErr, a whole-call failure of work on c that held the mark on tree ("" for
-// none).
-func wholeCallFailure(c *Cluster, tree string, trigger Trigger, callErr error, at time.Time) WholeCallFailure {
+// refreshIfDue runs at most one refresh of c when a trigger is due, c carries no mark and no backoff or rate limit
+// holds it back. Without a resolver nothing runs and the trigger stays pending; secrets:token reports the missing
+// token. The cluster is read again first, since the poll's work on it so far may have changed it. It reports whether
+// a corrupt read moved the store aside.
+func (s *Service) refreshIfDue(ctx context.Context, c *Cluster, at time.Time) (moved bool) {
+	if s.cfg.Resolver == nil {
+		return false
+	}
+	if _, due := refreshTrigger(c, at); !due {
+		return false
+	}
+	fresh, err := s.cfg.Repo.Get(ctx, c.Name)
+	if err != nil {
+		if !errors.Is(err, ErrNotFound) {
+			s.fail(ctx, stageRefresh, c.Name, err)
+		}
+		return false
+	}
+	trigger, due := refreshTrigger(&fresh, at)
+	if !due || fresh.ProcessingTree != "" || waiting(&fresh, at) {
+		return false
+	}
+	return s.refresh(ctx, &fresh, trigger, at)
+}
+
+// refreshTrigger is the refresh trigger due for c at at: a refresh request, else the daily timer, a DailyInterval
+// after the last daily refresh or, before the first, after the import.
+func refreshTrigger(c *Cluster, at time.Time) (Trigger, bool) {
+	if c.RefreshRequested {
+		return TriggerRefresh, true
+	}
+	since := c.LastDailyAt
+	if since.IsZero() {
+		since = c.CreatedAt
+	}
+	if !at.Before(since.Add(DailyInterval)) {
+		return TriggerDaily, true
+	}
+	return "", false
+}
+
+// refresh runs one refresh of c, started by trigger (design 5.4): it resolves the read credential again, retries the
+// failed tree, and when there is none or it fails again, resolves the newest good tree. A cluster with no tree to
+// mark runs nothing, so its trigger stays until one is stored. It reports whether a corrupt read moved the store
+// aside.
+func (s *Service) refresh(ctx context.Context, c *Cluster, trigger Trigger, at time.Time) (moved bool) {
+	if c.FailedTree == "" && c.PendingPairID == "" && c.ApprovedPairID == "" {
+		return false
+	}
+	if !s.refreshCredential(ctx, c, trigger, at) {
+		return false
+	}
+	if c.FailedTree != "" {
+		next, moved := s.retryFailed(ctx, work{c: c, tree: c.FailedTree, trigger: trigger, at: at})
+		if !next {
+			return moved
+		}
+		trigger = TriggerContinue
+	}
+	return s.refreshGood(ctx, c, trigger, at)
+}
+
+// refreshCredential resolves c's read credential again, in its own call, and stores a changed value. A failed
+// reference is recorded as the fetch error and the refresh goes on with the stored value. It reports whether the
+// refresh goes on: not after a whole-call failure, which is recorded for the backoff.
+func (s *Service) refreshCredential(ctx context.Context, c *Cluster, trigger Trigger, at time.Time) bool {
+	if c.CredentialRef == "" {
+		return true
+	}
+	results, err := s.resolve(ctx, []string{c.CredentialRef})
+	if err != nil {
+		if ctx.Err() == nil {
+			s.recordWholeCall(ctx, c, wholeCallFailure(work{c: c, trigger: trigger, at: at}, err))
+		}
+		return false
+	}
+	s.resetAttempts(ctx, c)
+	value, kind := lookup(results, c.CredentialRef)
+	if kind != "" {
+		if err := s.cfg.Repo.RecordFetch(ctx, c.ID, errors.New(credentialText(c.CredentialRef, kind)), at); err != nil {
+			s.fail(ctx, stageCredential, c.Name, err)
+		}
+		s.report(ctx, stageCredential, c.Name, "the credential did not resolve; the fetch error says why")
+		return true
+	}
+	stored, ok, err := s.cfg.Repo.Credential(ctx, c.ID)
+	if err != nil {
+		s.fail(ctx, stageCredential, c.Name, err)
+		return true
+	}
+	if ok && stored == value {
+		return true
+	}
+	if err := s.cfg.Repo.SetCredential(ctx, c.ID, value, at); err != nil {
+		s.fail(ctx, stageCredential, c.Name, err)
+	}
+	return true
+}
+
+// retryFailed is step 1 of a refresh: the failed tree is processed again, and stored as the pending pair when it now
+// succeeds. next reports whether step 2 follows: when the tree failed again, or could not be read.
+func (s *Service) retryFailed(ctx context.Context, w work) (next, moved bool) {
+	if !s.mark(ctx, w) {
+		return false, false
+	}
+	fsys, moved, ok := s.readMarked(ctx, w)
+	if !ok {
+		if ctx.Err() != nil {
+			return false, false
+		}
+		s.release(ctx)
+		return !moved, moved
+	}
+	return s.buildPair(ctx, w, fsys), false
+}
+
+// refreshGood is step 2 of a refresh: the newest good pair, the pending one else the approved one, is resolved again
+// and its values compared with the pair's version. It reports whether a corrupt read moved the store aside.
+func (s *Service) refreshGood(ctx context.Context, c *Cluster, trigger Trigger, at time.Time) (moved bool) {
+	pairID := cmp.Or(c.PendingPairID, c.ApprovedPairID)
+	if pairID == "" {
+		return false
+	}
+	p, err := s.cfg.Repo.Pair(ctx, pairID)
+	if err != nil {
+		if !errors.Is(err, ErrNotFound) {
+			s.fail(ctx, stageRefresh, c.Name, err)
+		}
+		return false
+	}
+	w := work{c: c, tree: p.TreeHash, trigger: trigger, at: at}
+	if !s.mark(ctx, w) {
+		return false
+	}
+	def, ok := s.cachedDef(pairID)
+	if !ok {
+		fsys, moved, read := s.readMarked(ctx, w)
+		if !read {
+			if ctx.Err() == nil {
+				s.incomplete(ctx, w, "the tree cannot be read")
+			}
+			return moved
+		}
+		if def, err = render.Load(fsys); err != nil {
+			s.incomplete(ctx, w, "the tree does not load")
+			return false
+		}
+		s.keep(pairID, def)
+	}
+	s.refreshValues(ctx, w, def, p.SecretVersionID)
+	return false
+}
+
+// refreshValues resolves def's references for w and, when a value differs from version's, renders def with the new
+// values and stores the result as the pending pair (w's tree, a new version). Equal values record a complete refresh
+// that stores nothing; a failed reference, a stored version that does not open or a render error record an
+// incomplete one, which keeps the failed tree and the last head tree as they are.
+func (s *Service) refreshValues(ctx context.Context, w work, def *render.Cluster, versionID string) {
+	values, failures, ok := s.resolveTree(ctx, w, def.Refs)
+	if !ok {
+		return
+	}
+	if len(failures) > 0 {
+		s.incomplete(ctx, w, fmt.Sprintf("%d references did not resolve", len(failures)))
+		return
+	}
+	old, err := s.cfg.Repo.Values(ctx, versionID)
+	if err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		s.fail(ctx, stageRefresh, w.c.Name, err)
+		s.incomplete(ctx, w, "the pair's version cannot be read")
+		return
+	}
+	if maps.Equal(values, old) {
+		s.recordRefresh(ctx, w, false)
+		return
+	}
+	renders, err := def.Render(ctx, values)
+	if err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		s.incomplete(ctx, w, "the tree does not render") // the render error can quote a value: it is not kept
+		return
+	}
+	s.storePending(ctx, w.c, def, StorePendingRequest{
+		ClusterID: w.c.ID, Tree: w.tree, Revision: w.c.Revision, Values: values, TalosVersion: def.TalosVersion, Renders: renders,
+		Refresh: true, At: w.at,
+	})
+}
+
+// incomplete records w as a refresh that could not finish, audits it as cluster.refresh_incomplete and raises the
+// alert refresh_incomplete. why is reported and must quote no third-party text.
+func (s *Service) incomplete(ctx context.Context, w work, why string) {
+	if !s.recordRefresh(ctx, w, true) {
+		return
+	}
+	ev := fleet.AuditEvent{At: w.at, Actor: fleet.ActorSystem, Action: actionRefreshIncomplete, Detail: nameDetail{Name: w.c.Name}}
+	if err := fleet.InsertAudit(ctx, s.cfg.Repo.bdb, ev); err != nil {
+		s.fail(ctx, stageRefresh, w.c.Name, err)
+	}
+	s.alerts.Add(ctx, 1, metric.WithAttributes(attribute.String("kind", alertRefreshIncomplete)))
+	s.report(ctx, stageRefresh, w.c.Name, "the refresh is incomplete: "+why)
+}
+
+// recordRefresh records w as a refresh that stores no pair, which clears its mark, and reports whether it did. A
+// record that found the mark stale writes nothing, and the mark is then not the service's to clear.
+func (s *Service) recordRefresh(ctx context.Context, w work, incomplete bool) bool {
+	recorded, err := s.cfg.Repo.RecordRefresh(ctx, RefreshRecord{ClusterID: w.c.ID, Tree: w.tree, Revision: w.c.Revision, Incomplete: incomplete, At: w.at})
+	if err != nil {
+		s.storeError(ctx, w.c, err)
+		return false
+	}
+	delete(s.held, w.c.ID)
+	return recorded
+}
+
+// wholeCallFailure is the record of callErr, a whole-call failure of w.
+func wholeCallFailure(w work, callErr error) WholeCallFailure {
 	return WholeCallFailure{
-		ClusterID: c.ID, Tree: tree, Trigger: trigger, RateLimited: errors.Is(callErr, secrets.ErrRateLimited),
-		NextDaily: nextDaily(c, at), Error: callErr.Error(), At: at,
+		ClusterID: w.c.ID, Tree: w.tree, Trigger: w.trigger, RateLimited: errors.Is(callErr, secrets.ErrRateLimited),
+		NextDaily: nextDaily(w.c, w.at), Error: callErr.Error(), At: w.at,
 	}
 }
 
@@ -616,7 +875,10 @@ func (s *Service) missingPairs(ctx context.Context, clusters []Cluster) ([]cache
 	for i := range clusters {
 		c := &clusters[i]
 		for _, id := range []string{c.ApprovedPairID, c.PendingPairID} {
-			if id == "" || s.cached(id) {
+			if id == "" {
+				continue
+			}
+			if _, ok := s.cachedDef(id); ok {
 				continue
 			}
 			p, err := s.cfg.Repo.Pair(ctx, id)
@@ -632,11 +894,19 @@ func (s *Service) missingPairs(ctx context.Context, clusters []Cluster) ([]cache
 	return out, nil
 }
 
-func (s *Service) cached(pairID string) bool {
+// cachedDef returns the cached definition of the pair.
+func (s *Service) cachedDef(pairID string) (*render.Cluster, bool) {
 	s.cacheMu.Lock()
 	defer s.cacheMu.Unlock()
-	_, ok := s.cache[pairID]
-	return ok
+	def, ok := s.cache[pairID]
+	return def, ok
+}
+
+// keep caches def as the definition of the pair.
+func (s *Service) keep(pairID string, def *render.Cluster) {
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	s.cache[pairID] = def
 }
 
 // fillCache reads and loads each pair's tree into the cache. It stops, reporting true, when a corrupt read moved the
@@ -665,9 +935,7 @@ func (s *Service) fillCache(ctx context.Context, pairs []cachePair, at time.Time
 			s.report(ctx, stageCache, p.cluster, "a pair's tree does not load")
 			continue
 		}
-		s.cacheMu.Lock()
-		s.cache[p.pairID] = def
-		s.cacheMu.Unlock()
+		s.keep(p.pairID, def)
 	}
 	return false
 }
@@ -714,6 +982,11 @@ func nextDaily(c *Cluster, at time.Time) time.Time {
 		next = at.Add(DailyInterval)
 	}
 	return next
+}
+
+// credentialText is the fetch error of a credential reference that failed with kind.
+func credentialText(ref, kind string) string {
+	return "credential " + ref + ": " + kind
 }
 
 // lookup returns the value of ref in results, or the kind of its failure: a *secrets.ReferenceError's Kind, or
