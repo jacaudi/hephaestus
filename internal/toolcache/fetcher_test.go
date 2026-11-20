@@ -766,6 +766,69 @@ func TestFetcher_Resume(t *testing.T) {
 	}
 }
 
+// TestFetcher_206WithOtherETagRestarts pins that a resume is never spliced
+// from two upstream versions: an upstream that answers 206 under another ETag
+// than the spool was started under (some ignore If-Range) sends bytes that
+// belong to another object, so the spool is emptied and the whole object is
+// fetched again within the same attempt.
+func TestFetcher_206WithOtherETagRestarts(t *testing.T) {
+	var half int
+	r := runScenario(t, func(t *testing.T, base string) scenario {
+		t.Helper()
+		sc := liveOf(t, base, func(object []byte) http.Handler { return otherVersionAfterRange(t, object) })
+		half = len(sc.object) / 2
+		sc.seed = func(t *testing.T, h *harness, e catalog.Entry) {
+			t.Helper()
+			seedSpool(t, h, e, sc.object[:half], `"A"`)
+		}
+		return sc
+	})
+
+	r.fetchOnce()
+
+	r.wantRow(tliveAMD64(), fleet.CacheReady, 0)
+	r.wantStored(r.e, r.files())
+	r.wantSpool()
+	seen := r.up.seen()
+	if len(seen) != 2 {
+		t.Fatalf("requests = %+v, want the ranged one and one restart", seen)
+	}
+	if want := fmt.Sprintf("bytes=%d-", half); seen[0].Range != want || seen[0].IfRange != `"A"` {
+		t.Errorf("first request Range, If-Range = %q, %q; want %q, %q", seen[0].Range, seen[0].IfRange, want, `"A"`)
+	}
+	if seen[1].Range != "" || seen[1].IfRange != "" {
+		t.Errorf("restart Range, If-Range = %q, %q; want neither", seen[1].Range, seen[1].IfRange)
+	}
+}
+
+func TestFetcher_206WithSameETagResumes(t *testing.T) {
+	var half int
+	r := runScenario(t, func(t *testing.T, base string) scenario {
+		t.Helper()
+		sc := liveOf(t, base, func(object []byte) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("ETag", `"A"`)
+				http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(object))
+			})
+		})
+		half = len(sc.object) / 2
+		sc.seed = func(t *testing.T, h *harness, e catalog.Entry) {
+			t.Helper()
+			seedSpool(t, h, e, sc.object[:half], `"A"`)
+		}
+		return sc
+	})
+
+	r.fetchOnce()
+
+	r.wantRow(tliveAMD64(), fleet.CacheReady, 0)
+	r.wantStored(r.e, r.files())
+	seen := r.up.seen()
+	if want := fmt.Sprintf("bytes=%d-", half); len(seen) != 1 || seen[0].Range != want {
+		t.Errorf("requests = %+v, want one with Range %q", seen, want)
+	}
+}
+
 func TestFetcher_IntegrityFailures(t *testing.T) {
 	tests := []struct {
 		name string

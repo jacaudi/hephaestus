@@ -11,19 +11,50 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 
 	"go.opentelemetry.io/otel/metric"
+
+	"go.jacaudi.dev/hephaestus/internal/fleet"
 )
+
+// errRestart is accept's answer to a response that cannot continue the spool:
+// the spool is emptied, and fetch asks again from byte zero, once.
+var errRestart = errors.New("the upstream does not continue the spool")
+
+// StatusError is a download answered with a status other than 200 and 206.
+type StatusError struct {
+	// Code is the HTTP status code.
+	Code int
+	// Body is the start of the response body as printable text, at most
+	// fleet.MaxCauseBytes long: an upstream often says there why it refused.
+	Body string
+}
+
+// Error implements error.
+func (e *StatusError) Error() string {
+	s := "the upstream answered " + strconv.Itoa(e.Code)
+	if text := http.StatusText(e.Code); text != "" {
+		s += " " + text
+	}
+	if e.Body != "" {
+		s += ": " + e.Body
+	}
+	return s
+}
 
 // object is one file a download brings into the spool.
 type object struct {
 	URL string
 	// SpoolName is the spool file; its ETag sidecar is SpoolName + ".etag".
 	SpoolName string
-	// Size is the pinned size.
+	// Size is the pinned size; 0 means it is not known, and the response's
+	// headers give it.
 	Size int64
-	// SHA256 is the pinned hex digest.
+	// Max is the largest size an object of unknown size may have.
+	Max int64
+	// SHA256 is the pinned hex digest; empty means the object is not pinned.
 	SHA256 string
 	// Index is the object's place among its row's objects, named in error text.
 	Index int
@@ -31,6 +62,15 @@ type object struct {
 
 // etagName is the sidecar that holds the strong ETag the spool was started under.
 func (o object) etagName() string { return o.SpoolName + ".etag" }
+
+// limit is the most bytes the object may have: its size, or Max when the size
+// is not known.
+func (o object) limit() int64 {
+	if o.Size == 0 {
+		return o.Max
+	}
+	return o.Size
+}
 
 // downloader brings objects into the spool for one job. The state is the
 // job's: root is its spool handle, and downloaded and reserved point at its
@@ -45,30 +85,40 @@ type downloader struct {
 	progress   func(ctx context.Context, done, total int64)
 }
 
-// fetch brings o into its spool file in full.
+// fetch brings o into its spool file in full. A pinned o has its space
+// reserved before the request; one of unknown size has it reserved once the
+// response says how big it is.
 func (d *downloader) fetch(ctx context.Context, o object) error {
 	have, etag, err := d.resumePoint(o)
 	if err != nil {
 		return err
 	}
-	if have == o.Size {
-		// Whole already, so nothing is downloaded, but its extraction still writes
-		// about its size into the store.
-		if err := d.reserveSpace(o.Size, 1); err != nil {
+	if o.Size != 0 {
+		if have == o.Size {
+			// Whole already, so nothing is downloaded, but its extraction still writes
+			// about its size into the store.
+			if err := d.reserveSpace(o.Size, 1); err != nil {
+				return err
+			}
+			d.progress(ctx, o.Size, o.Size)
+			return nil
+		}
+		if err := d.reserveSpace(o.Size, 2); err != nil {
 			return err
 		}
-		d.progress(ctx, o.Size, o.Size)
-		return nil
 	}
-	if err := d.reserveSpace(o.Size, 2); err != nil {
-		return err
+	err = d.transfer(ctx, o, have, etag)
+	if errors.Is(err, errRestart) {
+		// accept emptied the spool; the second try asks for no range, so it cannot
+		// restart again, and a second mismatch is an ordinary error.
+		err = d.transfer(ctx, o, 0, "")
 	}
-	return d.transfer(ctx, o, have, etag)
+	return err
 }
 
 // resumePoint says how much of o is already in its spool and under which
-// strong ETag. A spool longer than the pin, or one with no strong ETag to
-// resume under, is emptied.
+// strong ETag. A spool longer than the object may be, or one with no strong
+// ETag to resume under, is emptied.
 func (d *downloader) resumePoint(o object) (have int64, etag string, err error) {
 	fi, err := d.root.Stat(o.SpoolName)
 	if errors.Is(err, fs.ErrNotExist) {
@@ -78,10 +128,10 @@ func (d *downloader) resumePoint(o object) (have int64, etag string, err error) 
 		return 0, "", fmt.Errorf("stat the spool: %w", err)
 	}
 	have = fi.Size()
-	if have == o.Size || have == 0 {
+	if have == 0 || have == o.Size {
 		return have, "", nil
 	}
-	if have < o.Size {
+	if have < o.limit() {
 		raw, err := d.root.ReadFile(o.etagName())
 		if err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return 0, "", fmt.Errorf("read the ETag sidecar: %w", err)
@@ -193,9 +243,15 @@ func (d *downloader) transfer(ctx context.Context, o object, have int64, etag st
 	}
 	defer func() { err = errors.Join(err, resp.Body.Close()) }()
 
-	offset, err := d.accept(resp, o, have)
+	offset, size, err := d.accept(resp, o, have, etag)
 	if err != nil {
 		return err
+	}
+	if o.Size == 0 {
+		o.Size = size
+		if err := d.reserveSpace(size, 2); err != nil {
+			return err
+		}
 	}
 	body := newIdleReader(resp.Body, d.f.idle, cancel)
 	defer body.Stop()
@@ -204,38 +260,101 @@ func (d *downloader) transfer(ctx context.Context, o object, have int64, etag st
 	return d.write(ctx, newFloorReader(body, d.f.now), o, offset)
 }
 
-// accept checks the response to o's request against the pin and returns the
-// spool offset its body continues at. A 206 is checked in this order: the
-// Content-Range start, then its total, then its end, then the Content-Length.
-func (d *downloader) accept(resp *http.Response, o object, have int64) (int64, error) {
-	size := o.Size
+// accept checks the response to o's request, made from byte have under etag
+// when etag is set, and returns the spool offset its body continues at and the
+// size of the object: the pin's, or for an object of unknown size the one the
+// headers give, which Max bounds. A 416 to a ranged request means the range
+// starts at or past the end of what the upstream has, so the spool is emptied
+// and errRestart returned.
+func (d *downloader) accept(resp *http.Response, o object, have int64, etag string) (offset, size int64, err error) {
+	if resp.StatusCode == http.StatusRequestedRangeNotSatisfiable && etag != "" {
+		return 0, 0, errors.Join(errRestart, d.reset(o))
+	}
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+		return 0, 0, statusError(resp)
+	}
+	size = o.Size
+	if size == 0 {
+		if size, err = responseSize(resp); err != nil {
+			return 0, 0, err
+		}
+		if size > o.Max {
+			return 0, 0, integrityf("the upstream says the object is %d bytes, over the %d it may be", size, o.Max)
+		}
+	}
+	if resp.StatusCode == http.StatusPartialContent {
+		return have, size, d.acceptRange(resp, o, size, have, etag)
+	}
+	if resp.ContentLength >= 0 && resp.ContentLength != size {
+		return 0, 0, integrityf("the upstream sent %d bytes for an object pinned at %d", resp.ContentLength, size)
+	}
+	return 0, size, d.keepETag(o, resp.Header.Get("ETag"))
+}
+
+// acceptRange checks a 206 to o's request for the bytes from have on, against
+// size. It is checked in this order: the Content-Range start, then its total,
+// then its end, then the Content-Length, then that its strong ETag is the
+// sidecar's etag. A 206 under another ETag comes from other bytes than the
+// spool holds, so the spool is emptied and errRestart returned.
+func (d *downloader) acceptRange(resp *http.Response, o object, size, have int64, etag string) error {
+	header := resp.Header.Get("Content-Range")
+	start, end, total, err := parseContentRange(header)
+	if err != nil || start != have {
+		return errors.Join(fmt.Errorf("a 206 with Content-Range %q does not continue at byte %d", header, have), err, d.reset(o))
+	}
+	if total != size {
+		return integrityf("Content-Range %q says the object is %d bytes, pinned at %d", header, total, size)
+	}
+	// Only the total is a fact about the object (minor-16): a range that
+	// stops short is a misbehaving server, which a retry may not meet. It is
+	// checked before the Content-Length, which a short range also disagrees with.
+	if end != size-1 {
+		return fmt.Errorf("a 206 with Content-Range %q ends at byte %d, not at the last byte %d", header, end, size-1)
+	}
+	if resp.ContentLength >= 0 && resp.ContentLength != size-have {
+		return integrityf("the upstream sent %d bytes for the %d the range asked for", resp.ContentLength, size-have)
+	}
+	switch got := resp.Header.Get("ETag"); {
+	case etag == "":
+		return errors.New("a 206 answered a request that asked for no range")
+	case got != etag:
+		// Some upstreams answer 206 whatever If-Range says (RFC 9110 section 13.1.5
+		// says they must not); the bytes they send may belong to another version.
+		return errors.Join(errRestart, d.reset(o))
+	}
+	return nil
+}
+
+// statusError is the *StatusError for resp, its body read up to
+// fleet.MaxCauseBytes. A body that breaks off is noted after the status, which
+// stays the error.
+func statusError(resp *http.Response) error {
+	text, err := io.ReadAll(io.LimitReader(resp.Body, fleet.MaxCauseBytes))
+	se := &StatusError{Code: resp.StatusCode, Body: fleet.PrintableText(string(text))}
+	if err != nil {
+		return fmt.Errorf("%w (its body broke off: %w)", se, err)
+	}
+	return se
+}
+
+// responseSize is the size of the object a 200 or a 206 says it has: the
+// Content-Length of a 200, the total of a 206's Content-Range. Either must be
+// stated, and an object has at least one byte.
+func responseSize(resp *http.Response) (int64, error) {
 	switch resp.StatusCode {
 	case http.StatusOK:
-		if resp.ContentLength >= 0 && resp.ContentLength != size {
-			return 0, integrityf("the upstream sent %d bytes for an object pinned at %d", resp.ContentLength, size)
+		if resp.ContentLength < 1 {
+			return 0, integrityf("the upstream does not give a size for the object (Content-Length %d)", resp.ContentLength)
 		}
-		return 0, d.keepETag(o, resp.Header.Get("ETag"))
+		return resp.ContentLength, nil
 	case http.StatusPartialContent:
-		header := resp.Header.Get("Content-Range")
-		start, end, total, err := parseContentRange(header)
-		if err != nil || start != have {
-			return 0, errors.Join(fmt.Errorf("a 206 with Content-Range %q does not continue at byte %d", header, have), err, d.reset(o))
+		_, _, total, err := parseContentRange(resp.Header.Get("Content-Range"))
+		if err != nil {
+			return 0, integrityf("the upstream does not give a size for the object: %w", err)
 		}
-		if total != size {
-			return 0, integrityf("Content-Range %q says the object is %d bytes, pinned at %d", header, total, size)
-		}
-		// Only the total is a fact about the object (minor-16): a range that
-		// stops short is a misbehaving server, which a retry may not meet. It is
-		// checked before the Content-Length, which a short range also disagrees with.
-		if end != size-1 {
-			return 0, fmt.Errorf("a 206 with Content-Range %q ends at byte %d, not at the last byte %d", header, end, size-1)
-		}
-		if resp.ContentLength >= 0 && resp.ContentLength != size-have {
-			return 0, integrityf("the upstream sent %d bytes for the %d the range asked for", resp.ContentLength, size-have)
-		}
-		return have, nil
+		return total, nil
 	default:
-		return 0, fmt.Errorf("the upstream answered %q", resp.Status)
+		return 0, fmt.Errorf("a %d response has no object size", resp.StatusCode)
 	}
 }
 
@@ -277,26 +396,36 @@ func (d *downloader) write(ctx context.Context, body io.Reader, o object, offset
 	return nil
 }
 
-// verify checks that o's whole spool is the pinned size and sha256.
-func (d *downloader) verify(ctx context.Context, o object) (err error) {
+// verify checks o's whole spool against the pin: its size unless that is
+// unknown, and its sha256 unless o is unpinned.
+func (d *downloader) verify(ctx context.Context, o object) error {
+	sum, size, err := d.digest(ctx, o)
+	if err != nil {
+		return err
+	}
+	if o.Size != 0 && size != o.Size {
+		return integrityf("the spool holds %d bytes, the pin says %d", size, o.Size)
+	}
+	if o.SHA256 != "" && sum != o.SHA256 {
+		return integrityf("the object's sha256 is %s, the pin says %s", sum, o.SHA256)
+	}
+	return nil
+}
+
+// digest hashes o's whole spool and returns the hex sha256 and the size.
+func (d *downloader) digest(ctx context.Context, o object) (sha256Hex string, size int64, err error) {
 	f, err := d.open(o)
 	if err != nil {
-		return fmt.Errorf("open the spool: %w", err)
+		return "", 0, fmt.Errorf("open the spool: %w", err)
 	}
 	defer func() { err = errors.Join(err, f.Close()) }()
 
 	h := sha256.New()
-	size, err := io.Copy(h, ctxReader{r: f, err: ctx.Err})
+	size, err = io.Copy(h, ctxReader{r: f, err: ctx.Err})
 	if err != nil {
-		return fmt.Errorf("hash the spool: %w", err)
+		return "", 0, fmt.Errorf("hash the spool: %w", err)
 	}
-	if size != o.Size {
-		return integrityf("the spool holds %d bytes, the pin says %d", size, o.Size)
-	}
-	if got := hex.EncodeToString(h.Sum(nil)); got != o.SHA256 {
-		return integrityf("the object's sha256 is %s, the pin says %s", got, o.SHA256)
-	}
-	return nil
+	return hex.EncodeToString(h.Sum(nil)), size, nil
 }
 
 // open opens o's spool file for reading, for extraction or a push.
