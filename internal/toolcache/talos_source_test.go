@@ -3,6 +3,7 @@ package toolcache
 import (
 	"bytes"
 	"cmp"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -69,6 +70,9 @@ type talosSetup struct {
 	urlTTL time.Duration
 	// cut is the file whose first full answer is cut off after half its bytes.
 	cut fleet.TalosPart
+	// pause is the file whose first full answer stops after half its bytes until
+	// resume is called, and then sends the rest.
+	pause fleet.TalosPart
 }
 
 // talosRig is a harness with the Talos source over a fake factory behind TLS
@@ -87,6 +91,16 @@ type talosRig struct {
 	cutDone bool
 	// onRequest, when set, runs with each request's "<method> <path>" before it is served.
 	onRequest func(path string)
+
+	// paused is closed once the pause file's answer has sent its first half, and
+	// resume lets the rest follow. pausing is set in between: the requests that
+	// arrive then are kept in duringPause, and each puts a value in interloper
+	// when it has room.
+	paused      chan struct{}
+	resume      func()
+	pausing     bool
+	duringPause []string
+	interloper  chan struct{}
 }
 
 func newTalosRig(t *testing.T, s talosSetup) *talosRig {
@@ -110,19 +124,35 @@ func newTalosRig(t *testing.T, s talosSetup) *talosRig {
 		},
 	})
 	var cut []byte
-	if s.cut != "" {
-		cut = r.files[factory.FileName(s.cut, fleet.ArchAMD64)]
+	if p := cmp.Or(s.cut, s.pause); p != "" {
+		cut = r.files[factory.FileName(p, fleet.ArchAMD64)]
+	}
+	var resumed chan struct{}
+	if s.pause != "" {
+		resumed = make(chan struct{})
+		r.paused, r.interloper = make(chan struct{}), make(chan struct{}, 1)
+		r.resume = sync.OnceFunc(func() { close(resumed) })
 	}
 	srv := startTLS(t, http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		r.mu.Lock()
 		r.seenReq = append(r.seenReq, seenRequest{Path: req.Method + " " + req.URL.Path, Range: req.Header.Get("Range"), IfRange: req.Header.Get("If-Range")})
+		if r.pausing {
+			r.duringPause = append(r.duringPause, req.Method+" "+req.URL.Path)
+			select {
+			case r.interloper <- struct{}{}:
+			default:
+			}
+		}
 		hook := r.onRequest
 		r.mu.Unlock()
 		if hook != nil {
 			hook(req.Method + " " + req.URL.Path)
 		}
-		r.serve(t, w, req, cut)
+		r.serve(t, w, req, cut, resumed)
 	}), false)
+	if r.resume != nil {
+		t.Cleanup(r.resume) // before the server closes, so a paused answer ends
+	}
 	client := NewHTTPClient(testUserAgent, poolOf(srv))
 	t.Cleanup(client.CloseIdleConnections)
 	r.harness = newHarnessFor(t, FetcherConfig{
@@ -136,8 +166,9 @@ func newTalosRig(t *testing.T, s talosSetup) *talosRig {
 
 // serve passes req to the fake, except the first unranged answer that carries
 // cut: that one is sent with its status, size and ETag but only half its body,
-// and the connection is closed.
-func (r *talosRig) serve(t *testing.T, w http.ResponseWriter, req *http.Request, cut []byte) {
+// and the connection is closed. When resumed is set, the rest of the body
+// follows once it is closed.
+func (r *talosRig) serve(t *testing.T, w http.ResponseWriter, req *http.Request, cut []byte, resumed <-chan struct{}) {
 	t.Helper()
 	r.mu.Lock()
 	cutting := cut != nil && !r.cutDone && req.Header.Get("Range") == ""
@@ -157,6 +188,21 @@ func (r *talosRig) serve(t *testing.T, w http.ResponseWriter, req *http.Request,
 	r.mu.Lock()
 	r.cutDone = true
 	r.mu.Unlock()
+	if resumed != nil {
+		maps.Copy(w.Header(), rec.Header())
+		w.WriteHeader(rec.Code)
+		send(t, w, cut[:len(cut)/2])
+		flush(t, w)
+		r.setPausing(true)
+		close(r.paused)
+		select {
+		case <-resumed:
+		case <-req.Context().Done():
+		}
+		r.setPausing(false)
+		send(t, w, cut[len(cut)/2:])
+		return
+	}
 	hijackSend(t, w, fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Length: %d\r\nETag: %s\r\n\r\n%s", len(cut), rec.Header().Get("ETag"), cut[:len(cut)/2]))
 }
 
@@ -171,6 +217,35 @@ func (r *talosRig) setOnRequest(fn func(path string)) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.onRequest = fn
+}
+
+func (r *talosRig) setPausing(on bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.pausing = on
+}
+
+// runOnceAsync runs w.runOnce on its own goroutine and closes the returned
+// channel once it has returned, failing the test unless it settled a row.
+func (r *talosRig) runOnceAsync(w *worker) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if claimed, err := w.runOnce(r.t.Context()); err != nil || !claimed {
+			r.t.Errorf("runOnce = %v, %v; want true, nil", claimed, err)
+		}
+	}()
+	return done
+}
+
+// await fails the test unless ch is closed within 10 seconds.
+func (r *talosRig) await(what string, ch <-chan struct{}) {
+	r.t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(10 * time.Second):
+		r.t.Fatalf("timed out waiting for %s", what)
+	}
 }
 
 func (r *talosRig) setFakeNow(at time.Time) {
@@ -665,4 +740,152 @@ func TestTalosSource_PushReservesSpace(t *testing.T) {
 	if _, err := r.store.Resolve(t.Context(), r.key.Tag()); !errors.Is(err, store.ErrNotFound) {
 		t.Errorf("Resolve(%s) = %v; want ErrNotFound", r.key.Tag(), err)
 	}
+}
+
+// secondJobGrace is how long a test gives a second job on a key another job
+// holds to show it does not wait: one that does not wait sends its first
+// request well within it.
+const secondJobGrace = 300 * time.Millisecond
+
+// wantReadyWith fails unless the rig's row is ready with the assets of files,
+// its tag holds files' bytes, the cmdline trimmed, and the spool is empty.
+func (r *talosRig) wantReadyWith(files map[string][]byte) {
+	r.t.Helper()
+	parts := map[fleet.TalosPart][]byte{}
+	want := fleet.TalosAssets{}
+	for _, p := range fleet.TalosParts() {
+		b := files[factory.FileName(p, fleet.ArchAMD64)]
+		if p == fleet.TalosCmdline {
+			b = bytes.TrimSuffix(b, []byte("\n"))
+		}
+		parts[p], want[p] = b, assetOf(b)
+	}
+	if row := r.wantTalosRow(fleet.CacheReady, 0); !maps.Equal(row.Assets, want) {
+		r.t.Errorf("Assets = %v, want those of the served bytes %v", row.Assets, want)
+	}
+	r.wantLayers(parts)
+	r.wantSpool()
+}
+
+func TestTalosSource_ResetDuringDownloadOneJobAtATime(t *testing.T) {
+	r := newTalosRig(t, talosSetup{pause: fleet.TalosInitramfs})
+	firstDone := r.runOnceAsync(r.w)
+	r.await("the first job to be halfway through the initramfs", r.paused)
+
+	// The admin resets the hashes and a second worker claims the row while the
+	// first job is mid-download. Nothing is pinned now, so a second job that
+	// wrote the first one's spool files would record whatever they then held.
+	if moved, err := r.repo.ResetTalosHash(t.Context(), r.key, fleet.ActorCLI, fetchT0()); err != nil || !moved {
+		t.Errorf("ResetTalosHash during the fetch = %v, %v; want true, nil", moved, err)
+	}
+	secondDone := r.runOnceAsync(&worker{f: r.f})
+	select {
+	case <-r.interloper:
+	case <-time.After(secondJobGrace):
+	}
+	r.resume()
+	r.await("the first job", firstDone)
+	r.await("the second job", secondDone)
+
+	r.mu.Lock()
+	during := slices.Clone(r.duringPause)
+	r.mu.Unlock()
+	if len(during) != 0 {
+		t.Errorf("requests %q came while the first job was mid-download; want none before it ended", during)
+	}
+	for _, s := range r.seen() {
+		if s.Range != "" {
+			t.Errorf("request %+v resumed a spool file; want the second job to start once the first removed its own", s)
+		}
+	}
+	r.wantReadyWith(r.files)
+}
+
+func TestTalosSource_ResetDuringFetchSparesSecondJobSpool(t *testing.T) {
+	r := newTalosRig(t, talosSetup{})
+	r.fetchOnce()
+	r.wantTalosRow(fleet.CacheReady, 0)
+	r.requeue(true)
+
+	// The factory rebuilt the kernel at another size, so the first job's pinned
+	// download is an integrity failure, and its discard removes the key's spool
+	// files. The admin trusts the new build and resets the hashes while that job
+	// waits for its answer, and a second worker claims the row.
+	files := maps.Clone(r.files)
+	files[factory.FileName(fleet.TalosKernel, fleet.ArchAMD64)] = bytes.Repeat([]byte("rebuilt kernel."), 20_000)
+	r.fake.SetAssets(files)
+	firstAsked, releaseFirst, firstEnded := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	secondAtInitramfs := make(chan struct{}, 1)
+	var kernelAsks atomic.Int32
+	r.setOnRequest(func(path string) {
+		switch path {
+		case r.imagePath(fleet.TalosKernel):
+			if kernelAsks.Add(1) == 1 {
+				close(firstAsked)
+				select {
+				case <-releaseFirst:
+				case <-t.Context().Done():
+				}
+			}
+		case r.imagePath(fleet.TalosInitramfs):
+			select {
+			case secondAtInitramfs <- struct{}{}:
+			default:
+			}
+			select {
+			case <-firstEnded:
+			case <-t.Context().Done():
+			}
+		}
+	})
+
+	firstDone := r.runOnceAsync(r.w)
+	r.await("the first job's kernel request", firstAsked)
+	if moved, err := r.repo.ResetTalosHash(t.Context(), r.key, fleet.ActorCLI, fetchT0()); err != nil || !moved {
+		t.Errorf("ResetTalosHash during the fetch = %v, %v; want true, nil", moved, err)
+	}
+	secondDone := r.runOnceAsync(&worker{f: r.f})
+	select {
+	case <-secondAtInitramfs:
+	case <-time.After(secondJobGrace):
+	}
+	close(releaseFirst)
+	r.await("the first job", firstDone)
+	close(firstEnded)
+	r.await("the second job", secondDone)
+
+	if errs := r.handlerErrors(); len(errs) != 0 {
+		t.Errorf("error handler got %v, want nothing", errs)
+	}
+	r.wantReadyWith(files)
+}
+
+func TestTalosSource_WaitForHeldKeyEndsWithContext(t *testing.T) {
+	r := newTalosRig(t, talosSetup{})
+	release, err := r.f.holdTalos(t.Context(), r.key)
+	if err != nil {
+		t.Fatalf("holdTalos = %v", err)
+	}
+	defer release()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		_, err := r.w.runOnce(ctx)
+		done <- err
+	}()
+	r.waitFor("the row to be claimed", func() bool { return r.talosRow().State == fleet.CacheFetching })
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("runOnce = %v, want context.Canceled", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("runOnce did not return once its context was cancelled")
+	}
+	if seen := r.seen(); len(seen) != 0 {
+		t.Errorf("requests = %v, want none while another job holds the key", seen)
+	}
+	r.wantTalosRow(fleet.CacheFetching, 0)
 }

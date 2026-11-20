@@ -186,6 +186,11 @@ type Fetcher struct {
 	// downloads in flight have claimed.
 	spaceMu  sync.Mutex
 	reserved uint64
+
+	// talosMu guards talosHeld: the Talos keys a job works on, each with the
+	// channel that job closes when it lets the key go.
+	talosMu   sync.Mutex
+	talosHeld map[fleet.TalosKey]chan struct{}
 }
 
 // NewFetcher returns a Fetcher over cfg and creates cfg.SpoolDir if it is
@@ -220,6 +225,8 @@ func NewFetcher(cfg FetcherConfig, opts ...FetcherOption) (*Fetcher, error) {
 		poll:    PollInterval,
 		idle:    IdleTimeout,
 		statfs:  diskFree,
+
+		talosHeld: make(map[fleet.TalosKey]chan struct{}),
 	}
 	f.sources = []source{utilitySource{f: f}}
 	if cfg.Talos != nil {

@@ -82,6 +82,8 @@ type talosJob struct {
 	f    *Fetcher
 	row  fleet.TalosRow
 	root *os.Root
+	// release lets the row's key go; nil until the job holds it.
+	release func()
 
 	// assets are the sizes and hashes the run found, which ready records.
 	assets fleet.TalosAssets
@@ -124,6 +126,14 @@ func (j *talosJob) run(ctx context.Context) error {
 	if !fleet.IsSHA256Hex(key.Schematic) {
 		return integrityf("the schematic %q is not 64 lower-case hex digits", key.Schematic)
 	}
+	// A hash reset lets another worker claim the row while an earlier job on it
+	// runs on. The claim fences only the database writes; the spool files and the
+	// tag are the key's, so the job waits until no other job holds the key.
+	release, err := j.f.holdTalos(ctx, key)
+	if err != nil {
+		return fmt.Errorf("wait for the other job on %s: %w", key.Tag(), err)
+	}
+	j.release = release
 	root, err := os.OpenRoot(j.f.cfg.SpoolDir)
 	if err != nil {
 		return fmt.Errorf("open the spool dir: %w", err)
@@ -353,9 +363,43 @@ func (j *talosJob) discard(ctx context.Context) {
 	}
 }
 
-// close releases the job's free space reservation and its handle on the spool
-// directory.
-func (j *talosJob) close(ctx context.Context) { j.dl().close(ctx) }
+// close releases the job's free space reservation, its handle on the spool
+// directory and then its key. The worker calls it after any discard, so the
+// next job on the key finds none of this job's spool files.
+func (j *talosJob) close(ctx context.Context) {
+	j.dl().close(ctx)
+	if j.release != nil {
+		j.release()
+	}
+}
+
+// holdTalos waits until no other job of f holds key, then holds it until the
+// returned release is called. It returns ctx's error when ctx ends the wait.
+func (f *Fetcher) holdTalos(ctx context.Context, key fleet.TalosKey) (release func(), err error) {
+	f.talosMu.Lock()
+	for {
+		ended, held := f.talosHeld[key]
+		if !held {
+			break
+		}
+		f.talosMu.Unlock()
+		select {
+		case <-ended:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		f.talosMu.Lock()
+	}
+	ended := make(chan struct{})
+	f.talosHeld[key] = ended
+	f.talosMu.Unlock()
+	return func() {
+		f.talosMu.Lock()
+		delete(f.talosHeld, key)
+		f.talosMu.Unlock()
+		close(ended)
+	}, nil
+}
 
 // progress records that done of total bytes of the current part are in place.
 // It is advisory: a failure goes to the error handler and the fetch goes on.
