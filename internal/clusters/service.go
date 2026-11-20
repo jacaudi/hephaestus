@@ -986,6 +986,22 @@ func (s *Service) fillCache(ctx context.Context, pairs []cachePair, at time.Time
 	return false
 }
 
+// Approved returns the cluster's approved pair, ErrNotFound when it has none.
+func (s *Service) Approved(ctx context.Context, clusterID string) (Pair, error) {
+	return s.cfg.Repo.ApprovedPair(ctx, clusterID)
+}
+
+// Drift reports whether the approved render of the machine's host records drift, as Repository.Drift does.
+func (s *Service) Drift(ctx context.Context, m fleet.Machine) (bool, error) {
+	return s.cfg.Repo.Drift(ctx, m)
+}
+
+// EnsureAssets creates the talos_cache row the machine installs from when it is absent, as Repository.EnsureAssets
+// does.
+func (s *Service) EnsureAssets(ctx context.Context, m fleet.Machine, at time.Time) error {
+	return s.cfg.Repo.EnsureAssets(ctx, m, at)
+}
+
 // Render returns the machine config of the ticket's host, rendered from the ticket's pair and secret version only,
 // never the cluster's current ones. It reads the tree cache and the database, never the git store, so a fetch does
 // not hold it up. A pair the cache lacks, or one no longer stored, is ErrNoRender. A render that hashes differently

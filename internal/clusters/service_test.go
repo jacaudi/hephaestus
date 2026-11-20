@@ -171,7 +171,13 @@ type svcHarness struct {
 // newSvcHarness imports cluster lab from srv's default repository, path lab, naming credentialRef when it is not empty.
 func newSvcHarness(t *testing.T, srv *gittest.Server, credentialRef string) *svcHarness {
 	t.Helper()
-	repo, d := testRepo(t, dbtest.SQLite)
+	return newSvcHarnessOn(t, srv, credentialRef, dbtest.SQLite)
+}
+
+// newSvcHarnessOn is newSvcHarness over the database open returns.
+func newSvcHarnessOn(t *testing.T, srv *gittest.Server, credentialRef string, open func(testing.TB) *db.DB) *svcHarness {
+	t.Helper()
+	repo, d := testRepo(t, open)
 	reader := sdkmetric.NewManualReader()
 	h := &svcHarness{
 		t: t, srv: srv, repo: repo, d: d, fake: newFakeResolver(svcValues(t)),
@@ -1843,5 +1849,49 @@ func TestService_RenderErrorFailsRenderApproved(t *testing.T) {
 	}
 	if res := runCheck(t, s, "render:approved"); res.Status != admin.StatusFail || !strings.Contains(res.Output, labName+"/"+svcCP) {
 		t.Errorf("render:approved = %s (%q), want fail naming %s/%s", res.Status, res.Output, labName, svcCP)
+	}
+}
+
+func TestService_RenderRightAfterCLIApproval(t *testing.T) {
+	srv := gittest.NewServer(t, gittest.Options{})
+	serve, cliDB := dbtest.SQLitePair(t)
+	h := newSvcHarnessOn(t, srv, "", func(testing.TB) *db.DB { return serve })
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	defer srv.Close()
+	cli := NewRepository(cliDB, h.repo.key)
+	approve := func(p Pair) {
+		t.Helper()
+		req := ApproveClusterRequest{Cluster: labName, PairID: p.ID, Actor: fleet.ActorCLI, At: h.now}
+		if _, err := cli.ApproveCluster(t.Context(), req); err != nil {
+			t.Fatalf("ApproveCluster(%s) on the CLI handle: %v", p.ID, err)
+		}
+	}
+	srv.Commit(t, svcFiles(t), nil)
+	s := h.service(h.fake)
+	approve(h.pendingAfterPoll(s))
+	srv.Commit(t, map[string]string{"lab/control-plane/cp.yaml.tpl": "machine:\n  network:\n    hostname: {{ .Node.Host }}-next\n"}, nil)
+	h.now = h.now.Add(FetchInterval)
+	next := h.pendingAfterPoll(s)
+	if !cached(s, next.ID) {
+		t.Fatal("the pending pair is not cached")
+	}
+
+	approve(next)
+	if err := os.RemoveAll(h.gitDir); err != nil {
+		t.Fatalf("remove the git store: %v", err)
+	}
+	config, err := s.Render(t.Context(), h.ticket(next, svcCP))
+
+	if err != nil {
+		t.Fatalf("Render right after the approval: %v", err)
+	}
+	if got, want := hashOf(config), h.hostRow(next.ID, svcCP).ConfigHash; got != want {
+		t.Errorf("config hash = %s, want the approved pair's %s", got, want)
+	}
+	if got, err := s.Approved(t.Context(), h.id); err != nil || got.ID != next.ID {
+		t.Errorf("Approved = %s, %v; want %s", got.ID, err, next.ID)
+	}
+	if drift, err := s.Drift(t.Context(), fleet.Machine{ClusterID: new(h.id), HostName: new(svcCP)}); err != nil || drift {
+		t.Errorf("Drift = %v, %v; want false, nil", drift, err)
 	}
 }

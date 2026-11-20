@@ -27,7 +27,8 @@ var (
 	ErrExists = errors.New("clusters: a cluster with this name exists")
 	// ErrClusterInUse is returned by Remove while a machine is bound to the cluster.
 	ErrClusterInUse = errors.New("clusters: machines are bound to this cluster")
-	// ErrStale is returned by an approval of a pair that is no longer the pending pair.
+	// ErrStale is returned by an approval of a pair that is no longer the pending pair, and by a drift approval of a
+	// config hash the host's drift no longer has.
 	ErrStale = errors.New("clusters: the pair is no longer pending")
 )
 
