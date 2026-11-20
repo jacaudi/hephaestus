@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/oras-project/oras-go/v3"
 	"github.com/oras-project/oras-go/v3/content"
+	"github.com/oras-project/oras-go/v3/content/memory"
 	"github.com/oras-project/oras-go/v3/content/oci"
 	"github.com/oras-project/oras-go/v3/errdef"
 
@@ -44,6 +46,18 @@ var ErrNotFound = fmt.Errorf("store: %w", errdef.ErrNotFound)
 type Store struct {
 	root string
 	oci  *oci.Store
+
+	// onError is told of failures the store survives (ErrDirSyncUnsupported).
+	onError func(context.Context, error)
+	// dirSyncWarned makes the unsupported-directory-fsync report happen once.
+	dirSyncWarned sync.Once
+
+	// syncFile, syncDirFn and statFn are the file sync, directory fsync and
+	// stat the store performs; tests replace them to record calls or inject
+	// failures, so they stay the real ones everywhere else.
+	syncFile  func(*os.File) error
+	syncDirFn func(*os.Root, string) error
+	statFn    func(*os.Root, string) (fs.FileInfo, error)
 
 	// pushMu guards pushing: one mutex per digest ever pushed, held by PushBlob
 	// from its size check to the end of its push.
@@ -88,10 +102,18 @@ func Layer(file string, size int64, sha256Hex string) (ocispec.Descriptor, error
 //
 // The load ignores cancellation of ctx, so a stop signal never leaves a half
 // loaded index; a corrupt layout is never moved aside once ctx is done.
-func Open(ctx context.Context, root string, now func() time.Time) (*Store, string, error) {
+//
+// Open creates ingest/ and blobs/sha256/ when they are missing, then fsyncs
+// blobs/sha256/, blobs/ and root, so the layout is durable before anything is
+// written to it.
+func Open(ctx context.Context, root string, now func() time.Time, opts ...Option) (*Store, string, error) {
 	o, err := newOCI(ctx, root)
 	if err == nil {
-		return &Store{root: root, oci: o}, "", nil
+		s := makeStore(root, o, opts)
+		if err := s.prepare(ctx); err != nil {
+			return nil, "", fmt.Errorf("open store %s: %w", root, err)
+		}
+		return s, "", nil
 	}
 	if ctx.Err() != nil || !isCorrupt(err) {
 		return nil, "", fmt.Errorf("open store %s: %w", root, err)
@@ -104,7 +126,37 @@ func Open(ctx context.Context, root string, now func() time.Time) (*Store, strin
 	if err != nil {
 		return nil, moved, fmt.Errorf("open store %s after moving the corrupt one to %s: %w", root, moved, err)
 	}
-	return &Store{root: root, oci: o}, moved, nil
+	s := makeStore(root, o, opts)
+	if err := s.prepare(ctx); err != nil {
+		return nil, moved, fmt.Errorf("open store %s after moving the corrupt one to %s: %w", root, moved, err)
+	}
+	return s, moved, nil
+}
+
+// Option configures a Store at Open.
+type Option func(*Store)
+
+// WithErrorHandler sets the function that is told of failures the store
+// survives, as ErrDirSyncUnsupported; the default does nothing. The package
+// never logs, so the caller decides what these are worth.
+func WithErrorHandler(fn func(context.Context, error)) Option {
+	return func(s *Store) { s.onError = fn }
+}
+
+// makeStore returns the store over o at root with opts applied.
+func makeStore(root string, o *oci.Store, opts []Option) *Store {
+	s := &Store{
+		root:      root,
+		oci:       o,
+		onError:   func(context.Context, error) {},
+		syncFile:  (*os.File).Sync,
+		syncDirFn: fsyncDir,
+		statFn:    (*os.Root).Stat,
+	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 // newOCI opens the layout at root with index writes synced to disk.
@@ -180,7 +232,7 @@ func (s *Store) blobSize(d digest.Digest) (int64, error) {
 	}
 	var size int64
 	err = s.inRoot(func(r *os.Root) error {
-		fi, err := r.Stat(rel)
+		fi, err := s.statFn(r, rel)
 		if err != nil {
 			return err
 		}
@@ -190,17 +242,18 @@ func (s *Store) blobSize(d digest.Digest) (int64, error) {
 	return size, err
 }
 
-// PushBlob stores the blob described by desc, read from r and verified by oras
-// against desc. A blob already on disk at desc.Size is left alone and r is not
-// read. A blob on disk at another size is a truncated leftover: oras keeps any
-// existing file, so it is unlinked first (that needs only write permission on
-// the directory, not on the 0444 file) and pushed again. A concurrent push of
-// the same blob is not an error: pushes of one digest take turns, because the
-// size check, the unlink and the push are one repair, and a second repair that
-// unlinked the first one's blob would leave it missing while the second still
-// writes. Pushes of different digests run together.
+// PushBlob stores the blob described by desc, read from r and verified against
+// desc, durably: the blob file and blobs/sha256 are synced before it returns.
+// A blob already on disk at desc.Size is hashed; when it is desc's, it is
+// synced and r is not read. A blob of another hash or size is a leftover (a
+// truncated file, or a zero-filled one a power cut left): the new blob is
+// written to ingest/ and renamed over it, so the path is never absent. A
+// concurrent push of the same blob is not an error: pushes of one digest take
+// turns, because the size check, the hash check and the write are one repair.
+// Pushes of different digests run together.
 func (s *Store) PushBlob(ctx context.Context, desc ocispec.Descriptor, r io.Reader) error {
-	if _, err := blobRel(desc.Digest); err != nil {
+	rel, err := blobRel(desc.Digest)
+	if err != nil {
 		return err
 	}
 	unlock := s.lockPush(desc.Digest)
@@ -210,16 +263,15 @@ func (s *Store) PushBlob(ctx context.Context, desc ocispec.Descriptor, r io.Read
 	case err != nil && !errors.Is(err, fs.ErrNotExist):
 		return err
 	case err == nil && size == desc.Size:
-		return nil
-	case err == nil:
-		if err := s.removeBlob(desc.Digest); err != nil {
-			return err
+		ok, err := s.syncPresent(desc, rel)
+		if err != nil {
+			return fmt.Errorf("sync blob %s: %w", desc.Digest, err)
+		}
+		if ok {
+			return s.syncDir(ctx, path.Dir(rel))
 		}
 	}
-	if err := s.oci.Push(ctx, desc, r); err != nil && !errors.Is(err, errdef.ErrAlreadyExists) {
-		return fmt.Errorf("push blob %s: %w", desc.Digest, err)
-	}
-	return nil
+	return s.writeBlob(ctx, desc, r)
 }
 
 // lockPush takes the push lock of d, which the returned function releases.
@@ -240,26 +292,35 @@ func (s *Store) lockPush(d digest.Digest) (unlock func()) {
 	return m.Unlock
 }
 
-// removeBlob unlinks a blob file; one that is already gone is not an error.
-func (s *Store) removeBlob(d digest.Digest) error {
-	rel, err := blobRel(d)
-	if err != nil {
-		return err
-	}
-	err = s.inRoot(func(r *os.Root) error { return r.Remove(rel) })
-	if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("remove wrong-sized blob %s: %w", d, err)
-	}
-	return nil
-}
-
 // TagArtifact packs an OCI 1.1 artifact manifest of artifactType over layers,
-// which must already be pushed, stores it and tags it ref. It returns the
-// manifest descriptor.
+// which must already be pushed, stores it and tags it ref. The manifest and
+// its config blob are written durably before the tag names them. It returns
+// the manifest descriptor.
 func (s *Store) TagArtifact(ctx context.Context, ref, artifactType string, layers []ocispec.Descriptor) (ocispec.Descriptor, error) {
-	m, err := oras.PackManifest(ctx, s.oci, oras.PackManifestVersion1_1, artifactType, oras.PackManifestOptions{Layers: layers})
+	mem := memory.New()
+	m, err := oras.PackManifest(ctx, mem, oras.PackManifestVersion1_1, artifactType, oras.PackManifestOptions{Layers: layers})
 	if err != nil {
 		return ocispec.Descriptor{}, fmt.Errorf("pack manifest for %q: %w", ref, err)
+	}
+	raw, err := content.FetchAll(ctx, mem, m)
+	if err != nil {
+		return ocispec.Descriptor{}, fmt.Errorf("read packed manifest for %q: %w", ref, err)
+	}
+	var packed ocispec.Manifest
+	if err := json.Unmarshal(raw, &packed); err != nil {
+		return ocispec.Descriptor{}, fmt.Errorf("decode packed manifest for %q: %w", ref, err)
+	}
+	cfg, err := content.FetchAll(ctx, mem, packed.Config)
+	if err != nil {
+		return ocispec.Descriptor{}, fmt.Errorf("read packed config for %q: %w", ref, err)
+	}
+	// the config goes first, so a manifest on disk never names a missing config
+	err = s.writeBlob(ctx, packed.Config, bytes.NewReader(cfg))
+	if err == nil {
+		err = s.writeBlob(ctx, m, bytes.NewReader(raw))
+	}
+	if err != nil {
+		return ocispec.Descriptor{}, fmt.Errorf("store manifest of %q: %w", ref, err)
 	}
 	if err := s.oci.Tag(ctx, m, ref); err != nil {
 		return ocispec.Descriptor{}, fmt.Errorf("tag %q: %w", ref, err)
