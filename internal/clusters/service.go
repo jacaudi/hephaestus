@@ -16,6 +16,7 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
 
+	"go.jacaudi.dev/hephaestus/internal/datakey"
 	"go.jacaudi.dev/hephaestus/internal/fleet"
 	"go.jacaudi.dev/hephaestus/internal/render"
 	"go.jacaudi.dev/hephaestus/internal/secret"
@@ -29,6 +30,8 @@ var (
 	// ErrDrift is returned by Render when the host's render hashes differently from its stored one; the host's render
 	// row then records the drift.
 	ErrDrift = errors.New("clusters: render differs from the approved hash")
+	// errRender marks an error of the render itself: the definition does not render, or renders no config for a host.
+	errRender = errors.New("clusters: the pair does not render")
 )
 
 // Resolver resolves references in one call, with a result per reference; any error is a failure of the call as a
@@ -986,9 +989,10 @@ func (s *Service) fillCache(ctx context.Context, pairs []cachePair, at time.Time
 // Render returns the machine config of the ticket's host, rendered from the ticket's pair and secret version only,
 // never the cluster's current ones. It reads the tree cache and the database, never the git store, so a fetch does
 // not hold it up. A pair the cache lacks, or one no longer stored, is ErrNoRender. A render that hashes differently
-// from the host's stored one records the drift on the host's row and is ErrDrift. Any other error is a render error,
-// which keeps render:approved failing for the pair until a render of it is produced; its text can quote a secret
-// value, so it is never logged.
+// from the host's stored one records the drift on the host's row and is ErrDrift. A stored row that does not open
+// (datakey.ErrDecrypt) or a render that fails keeps render:approved failing for the pair until a render of it is
+// produced; any other repository error, such as a dropped connection, leaves render:approved as it is. The error's
+// text can quote a secret value, so it is never logged.
 func (s *Service) Render(ctx context.Context, t fleet.Ticket) ([]byte, error) {
 	config, err := s.renderTicket(ctx, t)
 	s.noteRender(ctx, t.PairID, err, t.HostName)
@@ -1036,8 +1040,12 @@ func (s *Service) detectDrift(ctx context.Context, c *Cluster, at time.Time) {
 	fresh, rows, err := s.renderPair(ctx, def, p.ID, p.SecretVersionID)
 	s.noteRender(ctx, p.ID, err, hosts...)
 	if err != nil {
-		if !errors.Is(err, ErrNoRender) && ctx.Err() == nil {
+		switch {
+		case errors.Is(err, ErrNoRender), ctx.Err() != nil:
+		case pairFailed(err):
 			s.report(ctx, stageDrift, c.Name, "the approved pair does not render") // the error can quote a value
+		default:
+			s.fail(ctx, stageDrift, c.Name, err)
 		}
 		return
 	}
@@ -1062,7 +1070,7 @@ func (s *Service) renderPair(ctx context.Context, def *render.Cluster, pairID, v
 	}
 	renders, err := def.Render(ctx, values)
 	if err != nil {
-		return nil, nil, fmt.Errorf("clusters: render pair %s: %w", pairID, err)
+		return nil, nil, fmt.Errorf("%w: pair %s: %w", errRender, pairID, err)
 	}
 	fresh := make(map[string]render.HostRender, len(renders))
 	for i := range renders {
@@ -1076,7 +1084,7 @@ func (s *Service) renderPair(ctx context.Context, def *render.Cluster, pairID, v
 func (s *Service) checkHost(ctx context.Context, clusterID string, row HostRow, fresh map[string]render.HostRender, at time.Time) ([]byte, error) {
 	got, ok := fresh[row.Host]
 	if !ok {
-		return nil, fmt.Errorf("clusters: the render of pair %s has no host %s", row.PairID, row.Host)
+		return nil, fmt.Errorf("%w: pair %s renders no config for host %s", errRender, row.PairID, row.Host)
 	}
 	if got.ConfigHash == row.ConfigHash {
 		return got.Config, nil
@@ -1112,16 +1120,22 @@ func (s *Service) setDrift(ctx context.Context, clusterID string, row HostRow, g
 }
 
 // noteRender keeps render:approved's view of the pair after a render of it for hosts ended with err: a render that was
-// produced, served or drifted, clears the pair; a render error marks the hosts failing; no render, or a render ctx cut
-// short, changes nothing.
+// produced, served or drifted, clears the pair; a pair that failed marks the hosts failing. No render, a render ctx cut
+// short and any other repository error, such as a dropped database connection, say nothing of the pair and change
+// nothing.
 func (s *Service) noteRender(ctx context.Context, pairID string, err error, hosts ...string) {
 	switch {
 	case err == nil, errors.Is(err, ErrDrift):
 		s.clearRender(pairID)
-	case errors.Is(err, ErrNoRender), ctx.Err() != nil:
-	default:
+	case ctx.Err() == nil && pairFailed(err):
 		s.failRender(pairID, hosts...)
 	}
+}
+
+// pairFailed reports whether err says the pair itself cannot render: a stored row of it that does not open, or a
+// render error.
+func pairFailed(err error) bool {
+	return errors.Is(err, datakey.ErrDecrypt) || errors.Is(err, errRender)
 }
 
 // failRender marks the hosts of the pair failing for render:approved.

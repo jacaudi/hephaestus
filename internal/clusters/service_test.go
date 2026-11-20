@@ -27,6 +27,7 @@ import (
 
 	"go.jacaudi.dev/hephaestus/internal/admin"
 	"go.jacaudi.dev/hephaestus/internal/clusters/gittest"
+	"go.jacaudi.dev/hephaestus/internal/datakey"
 	"go.jacaudi.dev/hephaestus/internal/db"
 	"go.jacaudi.dev/hephaestus/internal/db/dbtest"
 	"go.jacaudi.dev/hephaestus/internal/fleet"
@@ -1744,5 +1745,103 @@ func TestService_RenderConcurrentWithPoll(t *testing.T) {
 	}
 	if n := len(h.fake.seen()); n != 4 {
 		t.Errorf("resolver called %d times, want 4: a pair per head tree", n)
+	}
+}
+
+// breakVersions makes every read of a secret version fail as a dropped database would: neither ErrNotFound nor a row
+// that does not open.
+func breakVersions(t *testing.T, d *db.DB) {
+	t.Helper()
+	execRaw(t, d, "ALTER TABLE secret_versions RENAME TO secret_versions_gone")
+}
+
+func TestService_RepositoryErrorLeavesRenderApproved(t *testing.T) {
+	srv := gittest.NewServer(t, gittest.Options{})
+	h := newSvcHarness(t, srv, "")
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	defer srv.Close()
+	srv.Commit(t, svcFiles(t), nil)
+	s := h.service(h.fake)
+	approved := h.approvedAfterPoll(s)
+	breakVersions(t, h.d)
+
+	_, err := s.Render(t.Context(), h.ticket(approved, svcCP))
+
+	if err == nil || errors.Is(err, ErrNoRender) || errors.Is(err, ErrDrift) {
+		t.Fatalf("Render = %v, want a repository error, neither ErrNoRender nor ErrDrift", err)
+	}
+	if res := runCheck(t, s, "render:approved"); res.Status != admin.StatusPass {
+		t.Errorf("render:approved = %s (%q) after a repository error, want pass", res.Status, res.Output)
+	}
+}
+
+func TestService_StartupRepositoryErrorLeavesRenderApproved(t *testing.T) {
+	srv := gittest.NewServer(t, gittest.Options{})
+	h := newSvcHarness(t, srv, "")
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	defer srv.Close()
+	srv.Commit(t, svcFiles(t), nil)
+	h.approvedAfterPoll(h.service(h.fake))
+	breakVersions(t, h.d)
+
+	s := h.service(h.fake)
+
+	if res := runCheck(t, s, "render:approved"); res.Status != admin.StatusPass {
+		t.Errorf("render:approved = %s (%q) after a repository error at startup, want pass", res.Status, res.Output)
+	}
+	for _, got := range h.reported() {
+		if strings.Contains(got, "does not render") {
+			t.Errorf("report %q calls a repository error a render failure", got)
+		}
+	}
+}
+
+func TestService_StartupDamagedVersionFailsRenderApproved(t *testing.T) {
+	srv := gittest.NewServer(t, gittest.Options{})
+	h := newSvcHarness(t, srv, "")
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	defer srv.Close()
+	srv.Commit(t, svcFiles(t), nil)
+	approved := h.approvedAfterPoll(h.service(h.fake))
+	damageVersion(t, h.d, approved.SecretVersionID)
+
+	s := h.service(h.fake)
+
+	res := runCheck(t, s, "render:approved")
+	for _, host := range []string{svcCP, "wrk-01"} {
+		if res.Status != admin.StatusFail || !strings.Contains(res.Output, labName+"/"+host) {
+			t.Errorf("render:approved = %s (%q), want fail naming %s/%s", res.Status, res.Output, labName, host)
+		}
+	}
+	if row := h.hostRow(approved.ID, svcCP); row.Drift {
+		t.Error("a version that does not open set drift")
+	}
+}
+
+func TestService_RenderErrorFailsRenderApproved(t *testing.T) {
+	srv := gittest.NewServer(t, gittest.Options{})
+	h := newSvcHarness(t, srv, "")
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	defer srv.Close()
+	srv.Commit(t, svcFiles(t), nil)
+	s := h.service(h.fake)
+	approved := h.approvedAfterPoll(s)
+	// A stored value set that opens but that the bundle cannot hold: the pair resolves, but does not render.
+	values := h.values(approved.SecretVersionID)
+	values["ref+op://lab/bundle/certs.os.crt"] = "not a certificate"
+	plain, err := json.Marshal(values)
+	if err != nil {
+		t.Fatalf("encode values: %v", err)
+	}
+	sealed := h.repo.key.SealField(datakey.Field{Table: tableVersions, Row: approved.SecretVersionID, Column: columnValues}, plain)
+	execRaw(t, h.d, "UPDATE secret_versions SET values_sealed = ? WHERE id = ?", sealed, approved.SecretVersionID)
+
+	_, err = s.Render(t.Context(), h.ticket(approved, svcCP))
+
+	if err == nil || errors.Is(err, ErrDrift) || errors.Is(err, ErrNoRender) || errors.Is(err, datakey.ErrDecrypt) {
+		t.Fatalf("Render = %v, want a render error", err)
+	}
+	if res := runCheck(t, s, "render:approved"); res.Status != admin.StatusFail || !strings.Contains(res.Output, labName+"/"+svcCP) {
+		t.Errorf("render:approved = %s (%q), want fail naming %s/%s", res.Status, res.Output, labName, svcCP)
 	}
 }
