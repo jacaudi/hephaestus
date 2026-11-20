@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -17,6 +18,7 @@ import (
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
 
+	"go.jacaudi.dev/hephaestus/internal/datakey"
 	"go.jacaudi.dev/hephaestus/internal/db"
 	"go.jacaudi.dev/hephaestus/internal/secret"
 	"go.jacaudi.dev/hephaestus/internal/toolcache"
@@ -52,6 +54,13 @@ type rawConfig struct {
 	Database struct {
 		URL secret.Secret `mapstructure:"url"`
 	} `mapstructure:"database"`
+	// DataKey and DataKeyFile are the data key itself or the file that holds it.
+	DataKey     secret.Secret `mapstructure:"data_key"`
+	DataKeyFile string        `mapstructure:"data_key_file"`
+	OP          struct {
+		Token     secret.Secret `mapstructure:"token"`
+		TokenFile string        `mapstructure:"token_file"`
+	} `mapstructure:"op"`
 	TLS struct {
 		Mode     string `mapstructure:"mode"`
 		CertFile string `mapstructure:"cert_file"`
@@ -81,6 +90,10 @@ type serveConfig struct {
 	AdminAddr       netip.AddrPort
 	DataDir         string
 	DatabaseURL     secret.Secret
+	// DataKey seals every secret hephaestus stores. OPToken is the 1Password
+	// service-account token, empty when none is configured.
+	DataKey *datakey.Key
+	OPToken secret.Secret
 	// TLSMode is tlsModeFile or tlsModeProxy. In file mode TLSCertFile and
 	// TLSKeyFile are set; in proxy mode ProxyAddr and TrustedProxies are.
 	TLSMode                 string
@@ -163,6 +176,12 @@ func (r rawConfig) validate(addrsOf interfaceAddrs) (serveConfig, error) {
 			errs = append(errs, fmt.Errorf("HEPHAESTUS_DATABASE_URL: %w", err))
 		}
 	}
+
+	cfg.DataKey, err = validateDataKey(r.DataKey, r.DataKeyFile)
+	errs = append(errs, err)
+
+	cfg.OPToken, _, err = envOrFile("HEPHAESTUS_OP_TOKEN", r.OP.Token, r.OP.TokenFile, false)
+	errs = append(errs, err)
 
 	cfg.FetchWorkers, err = validateFetchWorkers(r.Fetch.Workers)
 	errs = append(errs, err)
@@ -384,4 +403,50 @@ func tlsSetting(mode, usedBy, name string, set bool) error {
 		return fmt.Errorf("%s is only valid when HEPHAESTUS_TLS_MODE is %s", name, usedBy)
 	}
 	return nil
+}
+
+// validateDataKey reads the data key from HEPHAESTUS_DATA_KEY or the file in
+// HEPHAESTUS_DATA_KEY_FILE, exactly one of which must be set, and parses it. A
+// parse error is reported under the variable that supplied the key.
+func validateDataKey(value secret.Secret, file string) (*datakey.Key, error) {
+	raw, source, err := envOrFile("HEPHAESTUS_DATA_KEY", value, file, true)
+	if err != nil {
+		return nil, err
+	}
+	key, err := datakey.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", source, err)
+	}
+	return key, nil
+}
+
+// envOrFile returns the secret that the variable name holds as value, or that
+// the file named by name+"_FILE" holds, and the variable it came from. When
+// required, exactly one of the two must be set; otherwise at most one, and
+// none gives an empty secret. The file is read once and its trailing newline
+// is dropped. An error names the variable and never includes the secret.
+func envOrFile(name string, value secret.Secret, file string, required bool) (secret.Secret, string, error) {
+	fileName := name + "_FILE"
+	switch {
+	case value != "" && file != "":
+		if required {
+			return "", name, fmt.Errorf("set exactly one of %s or %s, not both", name, fileName)
+		}
+		return "", name, fmt.Errorf("set at most one of %s or %s, not both", name, fileName)
+	case value != "":
+		return value, name, nil
+	case file == "" && required:
+		return "", name, fmt.Errorf("set exactly one of %s or %s", name, fileName)
+	case file == "":
+		return "", name, nil
+	}
+	content, err := os.ReadFile(file) //nolint:gosec // G304: the path is the operator's own configuration, and a secret mount may be a symlink out of its directory
+	if err != nil {
+		return "", fileName, fmt.Errorf("%s: read secret file: %w", fileName, err)
+	}
+	trimmed := strings.TrimRight(string(content), "\r\n")
+	if trimmed == "" {
+		return "", fileName, fmt.Errorf("%s: file is empty", fileName)
+	}
+	return secret.Secret(trimmed), fileName, nil
 }

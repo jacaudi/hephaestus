@@ -68,3 +68,32 @@ func (k *Key) String() string { return "****" }
 
 // LogValue redacts the key in slog output.
 func (k *Key) LogValue() slog.Value { return slog.StringValue("****") }
+
+// FormatV1 is the first byte of every sealed field: the format of what follows.
+// A later format takes a new value, and OpenField refuses any it does not know.
+const FormatV1 byte = 0x01
+
+// Field names the stored value a sealed field belongs to. Binding it into the
+// additional data makes a sealed value open only at its own table, row and
+// column, so a value copied to another row fails to open.
+type Field struct{ Table, Row, Column string }
+
+// aad is the additional data of f: the format byte and "<table>/<row>/<column>".
+func (f Field) aad() []byte {
+	return fmt.Appendf([]byte{FormatV1}, "%s/%s/%s", f.Table, f.Row, f.Column)
+}
+
+// SealField seals plaintext for f as FormatV1 followed by Seal's output, with
+// the format byte and the field's name as additional data.
+func (k *Key) SealField(f Field, plaintext []byte) []byte {
+	return append([]byte{FormatV1}, k.Seal(plaintext, f.aad())...)
+}
+
+// OpenField reverses SealField. It returns ErrDecrypt for a wrong key, a
+// different field, an unknown or missing format byte and truncated data.
+func (k *Key) OpenField(f Field, sealed []byte) ([]byte, error) {
+	if len(sealed) == 0 || sealed[0] != FormatV1 {
+		return nil, ErrDecrypt
+	}
+	return k.Open(sealed[1:], f.aad())
+}

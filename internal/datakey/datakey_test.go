@@ -136,3 +136,85 @@ func TestKey_Redacts(t *testing.T) {
 		t.Errorf("LogValue() = %q, want %q", got, "****")
 	}
 }
+
+func TestSealField_RoundTrip(t *testing.T) {
+	k := mustParse(t, fixtureKey)
+	f := Field{Table: "clusters", Row: "lab", Column: "secrets"}
+	plaintext := []byte("cluster secret")
+
+	sealed := k.SealField(f, plaintext)
+	if len(sealed) == 0 || sealed[0] != FormatV1 {
+		t.Fatalf("sealed = %x, want it to start with the format byte %#x", sealed, FormatV1)
+	}
+
+	got, err := k.OpenField(f, sealed)
+	if err != nil {
+		t.Fatalf("OpenField: %v", err)
+	}
+	if !bytes.Equal(got, plaintext) {
+		t.Errorf("OpenField = %q, want %q", got, plaintext)
+	}
+}
+
+func TestSealField_WrongFieldFails(t *testing.T) {
+	k := mustParse(t, fixtureKey)
+	f := Field{Table: "clusters", Row: "lab", Column: "secrets"}
+	sealed := k.SealField(f, []byte("cluster secret"))
+
+	tests := []struct {
+		name  string
+		field Field
+	}{
+		{"other table", Field{Table: "pairs", Row: "lab", Column: "secrets"}},
+		{"other row", Field{Table: "clusters", Row: "prod", Column: "secrets"}},
+		{"other column", Field{Table: "clusters", Row: "lab", Column: "error"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := k.OpenField(tt.field, sealed)
+			if !errors.Is(err, ErrDecrypt) {
+				t.Errorf("OpenField error = %v, want ErrDecrypt", err)
+			}
+			if got != nil {
+				t.Errorf("OpenField = %q, want nil", got)
+			}
+		})
+	}
+}
+
+func TestSealField_FormatByteBound(t *testing.T) {
+	k := mustParse(t, fixtureKey)
+	f := Field{Table: "clusters", Row: "lab", Column: "secrets"}
+	sealed := k.SealField(f, []byte("cluster secret"))
+
+	otherFormat := bytes.Clone(sealed)
+	otherFormat[0] = 0x02
+	noFormat := sealed[1:]
+
+	tests := []struct {
+		name   string
+		sealed []byte
+	}{
+		{"other format byte", otherFormat},
+		{"no format byte", noFormat},
+		{"format byte only", sealed[:1]},
+		{"empty", nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := k.OpenField(f, tt.sealed); !errors.Is(err, ErrDecrypt) {
+				t.Errorf("OpenField error = %v, want ErrDecrypt", err)
+			}
+		})
+	}
+}
+
+func TestSealField_WrongKeyFails(t *testing.T) {
+	f := Field{Table: "clusters", Row: "lab", Column: "secrets"}
+	sealed := mustParse(t, fixtureKey).SealField(f, []byte("cluster secret"))
+	other := mustParse(t, secret.Secret(base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0xff}, Size))))
+
+	if _, err := other.OpenField(f, sealed); !errors.Is(err, ErrDecrypt) {
+		t.Errorf("OpenField error = %v, want ErrDecrypt", err)
+	}
+}

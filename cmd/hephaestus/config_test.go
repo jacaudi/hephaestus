@@ -15,11 +15,16 @@ import (
 	"time"
 
 	"github.com/spf13/pflag"
+
+	"go.jacaudi.dev/hephaestus/internal/datakey"
+	"go.jacaudi.dev/hephaestus/internal/secret"
 )
 
 const (
 	testCertFile = "/certs/tls.crt"
 	testKeyFile  = "/certs/tls.key"
+	// testDataKey is base64 of 32 bytes of 0x01.
+	testDataKey = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
 )
 
 // clearEnv blanks every inherited HEPHAESTUS_ variable: viper ignores an empty
@@ -31,6 +36,11 @@ func clearEnv(t *testing.T) {
 		if name, _, _ := strings.Cut(kv, "="); strings.HasPrefix(name, "HEPHAESTUS_") {
 			t.Setenv(name, "")
 		}
+	}
+	for _, name := range []string{
+		"HEPHAESTUS_DATA_KEY", "HEPHAESTUS_DATA_KEY_FILE", "HEPHAESTUS_OP_TOKEN", "HEPHAESTUS_OP_TOKEN_FILE",
+	} {
+		t.Setenv(name, "")
 	}
 }
 
@@ -47,6 +57,7 @@ func setMinimalEnv(t *testing.T) string {
 	t.Setenv("HEPHAESTUS_DATA_DIR", dir)
 	t.Setenv("HEPHAESTUS_TLS_CERT_FILE", testCertFile)
 	t.Setenv("HEPHAESTUS_TLS_KEY_FILE", testKeyFile)
+	t.Setenv("HEPHAESTUS_DATA_KEY", testDataKey)
 	return dir
 }
 
@@ -457,6 +468,154 @@ func TestLoadConfig_LogFormatFlag(t *testing.T) {
 			}
 			if got.LogFormat != tt.want {
 				t.Errorf("LogFormat = %q, want %q", got.LogFormat, tt.want)
+			}
+		})
+	}
+}
+
+// writeSecretFile writes content to a file under t.TempDir and returns its path.
+func writeSecretFile(t *testing.T, content string) string {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), "secret")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+	return path
+}
+
+func TestLoadConfig_DataKey(t *testing.T) {
+	const badKey = "not-base64!"
+	both := "set exactly one of HEPHAESTUS_DATA_KEY or HEPHAESTUS_DATA_KEY_FILE"
+	keyFile := writeSecretFile(t, testDataKey+"\n")
+	badFile := writeSecretFile(t, badKey+"\n")
+	missing := filepath.Join(t.TempDir(), "absent")
+
+	tests := []struct {
+		name    string
+		env     map[string]string
+		wantErr []string
+		secrets []string // text the error must not contain
+	}{
+		{name: "env value", env: map[string]string{"DATA_KEY": testDataKey}},
+		{name: "file", env: map[string]string{"DATA_KEY": "", "DATA_KEY_FILE": keyFile}},
+		{name: "neither", env: map[string]string{"DATA_KEY": ""}, wantErr: []string{both}},
+		{name: "both", env: map[string]string{"DATA_KEY_FILE": keyFile}, wantErr: []string{both}},
+		{
+			name:    "file missing",
+			env:     map[string]string{"DATA_KEY": "", "DATA_KEY_FILE": missing},
+			wantErr: []string{"HEPHAESTUS_DATA_KEY_FILE"},
+		},
+		{
+			name:    "bad base64 in the env value",
+			env:     map[string]string{"DATA_KEY": badKey},
+			wantErr: []string{"HEPHAESTUS_DATA_KEY", "not valid base64"},
+			secrets: []string{badKey},
+		},
+		{
+			name:    "bad base64 in the file",
+			env:     map[string]string{"DATA_KEY": "", "DATA_KEY_FILE": badFile},
+			wantErr: []string{"HEPHAESTUS_DATA_KEY_FILE", "not valid base64"},
+			secrets: []string{badKey},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setMinimalEnv(t)
+			for k, v := range tt.env {
+				t.Setenv("HEPHAESTUS_"+k, v)
+			}
+
+			got, err := load(t)
+			if len(tt.wantErr) == 0 {
+				if err != nil {
+					t.Fatalf("loadConfig: %v", err)
+				}
+				assertDataKey(t, got.DataKey)
+				return
+			}
+			if err == nil {
+				t.Fatal("loadConfig succeeded, want an error")
+			}
+			for _, want := range tt.wantErr {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error = %q, want it to contain %q", err, want)
+				}
+			}
+			for _, leaked := range tt.secrets {
+				if strings.Contains(err.Error(), leaked) {
+					t.Errorf("error = %q, want it not to contain the key text %q", err, leaked)
+				}
+			}
+		})
+	}
+}
+
+// assertDataKey checks that k is the key testDataKey names: it opens what that key seals.
+func assertDataKey(t *testing.T, k *datakey.Key) {
+	t.Helper()
+
+	if k == nil {
+		t.Fatal("DataKey = nil, want the parsed key")
+	}
+	want, err := datakey.Parse(secret.Secret(testDataKey))
+	if err != nil {
+		t.Fatalf("Parse fixture: %v", err)
+	}
+	f := datakey.Field{Table: "t", Row: "r", Column: "c"}
+	if got, err := k.OpenField(f, want.SealField(f, []byte("probe"))); err != nil || string(got) != "probe" {
+		t.Errorf("DataKey opens the fixture key's seal as %q, %v; want %q", got, err, "probe")
+	}
+}
+
+func TestLoadConfig_OPToken(t *testing.T) {
+	const token = "ops_example-token"
+	atMost := "set at most one of HEPHAESTUS_OP_TOKEN or HEPHAESTUS_OP_TOKEN_FILE"
+
+	tests := []struct {
+		name    string
+		env     map[string]string
+		want    secret.Secret
+		wantErr string
+	}{
+		{name: "neither", want: ""},
+		{name: "env value", env: map[string]string{"OP_TOKEN": token}, want: token},
+		{name: "file", env: map[string]string{"OP_TOKEN_FILE": writeSecretFile(t, token+"\n")}, want: token},
+		{
+			name:    "both",
+			env:     map[string]string{"OP_TOKEN": token, "OP_TOKEN_FILE": writeSecretFile(t, token)},
+			wantErr: atMost,
+		},
+		{
+			name:    "file missing",
+			env:     map[string]string{"OP_TOKEN_FILE": filepath.Join(t.TempDir(), "absent")},
+			wantErr: "HEPHAESTUS_OP_TOKEN_FILE",
+		},
+		{
+			name:    "file empty",
+			env:     map[string]string{"OP_TOKEN_FILE": writeSecretFile(t, "\n")},
+			wantErr: "HEPHAESTUS_OP_TOKEN_FILE: file is empty",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setMinimalEnv(t)
+			for k, v := range tt.env {
+				t.Setenv("HEPHAESTUS_"+k, v)
+			}
+
+			got, err := load(t)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("loadConfig error = %v, want it to contain %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("loadConfig: %v", err)
+			}
+			if got.OPToken != tt.want {
+				t.Errorf("OPToken = %q, want %q", got.OPToken.Expose(), tt.want.Expose())
 			}
 		})
 	}
