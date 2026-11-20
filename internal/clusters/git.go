@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/filemode"
+	"github.com/go-git/go-git/v5/plumbing/format/idxfile"
 	"github.com/go-git/go-git/v5/plumbing/format/packfile"
 	"github.com/go-git/go-git/v5/plumbing/object"
 	githttp "github.com/go-git/go-git/v5/plumbing/transport/http"
@@ -286,15 +288,21 @@ func classifyRead(err error) readClass {
 	if pe, ok := errors.AsType[*packfile.Error](err); ok && pe != nil {
 		return readCorrupt
 	}
-	switch {
-	case errors.Is(err, plumbing.ErrObjectNotFound):
+	if errors.Is(err, plumbing.ErrObjectNotFound) {
 		return readMissing
-	case errors.Is(err, packfile.ErrMalformedPackFile), errors.Is(err, zlib.ErrChecksum):
-		return readCorrupt
-	case errors.Is(err, io.ErrUnexpectedEOF):
-		// A truncated object; safe to call corrupt because readTree reads only the local store, never the network.
-		return readCorrupt
-	default:
-		return readOther
 	}
+
+	corrupt := []error{
+		packfile.ErrMalformedPackFile, packfile.ErrReferenceDeltaNotFound, packfile.ErrInvalidDelta, packfile.ErrDeltaCmd,
+		packfile.ErrLengthOverflow, packfile.ErrInflatedSizeMismatch,
+		idxfile.ErrMalformedIdxFile, idxfile.ErrUnsupportedVersion,
+		object.ErrMalformedTree, object.ErrEntriesNotSorted, plumbing.ErrInvalidType,
+		zlib.ErrChecksum, zlib.ErrHeader,
+		// A truncated object; safe to call corrupt because readTree reads only the local store, never the network.
+		io.ErrUnexpectedEOF,
+	}
+	if slices.ContainsFunc(corrupt, func(target error) bool { return errors.Is(err, target) }) {
+		return readCorrupt
+	}
+	return readOther
 }

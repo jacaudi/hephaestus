@@ -17,7 +17,9 @@ import (
 	"time"
 
 	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/format/idxfile"
 	"github.com/go-git/go-git/v5/plumbing/format/packfile"
+	"github.com/go-git/go-git/v5/plumbing/object"
 	"go.uber.org/goleak"
 
 	"go.jacaudi.dev/hephaestus/internal/clusters/gittest"
@@ -394,8 +396,20 @@ func TestClassifyRead(t *testing.T) {
 		want readClass
 	}{
 		{"invalid object", packfile.ErrInvalidObject.AddDetails("x"), readCorrupt},
+		{"packfile error without details", packfile.ErrBadSignature, readCorrupt},
 		{"wrapped malformed pack", fmt.Errorf("w: %w", packfile.ErrMalformedPackFile), readCorrupt},
+		{"reference delta not found", fmt.Errorf("w: %w", packfile.ErrReferenceDeltaNotFound), readCorrupt},
+		{"invalid delta", fmt.Errorf("w: %w", packfile.ErrInvalidDelta), readCorrupt},
+		{"wrong delta command", fmt.Errorf("w: %w", packfile.ErrDeltaCmd), readCorrupt},
+		{"length overflow", fmt.Errorf("w: %w", packfile.ErrLengthOverflow), readCorrupt},
+		{"inflated size mismatch", fmt.Errorf("w: %w", packfile.ErrInflatedSizeMismatch), readCorrupt},
+		{"malformed idx file", fmt.Errorf("w: %w", idxfile.ErrMalformedIdxFile), readCorrupt},
+		{"unsupported idx version", fmt.Errorf("w: %w", idxfile.ErrUnsupportedVersion), readCorrupt},
+		{"malformed tree", fmt.Errorf("w: %w", object.ErrMalformedTree), readCorrupt},
+		{"entries not sorted", fmt.Errorf("w: %w", object.ErrEntriesNotSorted), readCorrupt},
+		{"invalid type", fmt.Errorf("w: %w", plumbing.ErrInvalidType), readCorrupt},
 		{"zlib checksum", zlib.ErrChecksum, readCorrupt},
+		{"zlib header", fmt.Errorf("w: %w", zlib.ErrHeader), readCorrupt},
 		{"truncated stream", fmt.Errorf("w: %w", io.ErrUnexpectedEOF), readCorrupt},
 		{"object not found", plumbing.ErrObjectNotFound, readMissing},
 		{"wrapped object not found", fmt.Errorf("w: %w", plumbing.ErrObjectNotFound), readMissing},
