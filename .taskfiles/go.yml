@@ -13,6 +13,8 @@ tasks:
     cmds:
       - task: fmt:check
       - task: tidy:check
+      - task: machinery
+      - task: noexec
       - task: lint
       - task: vuln
       - task: test
@@ -35,6 +37,15 @@ tasks:
     desc: Fail if go.mod/go.sum are not tidy
     cmds:
       - go mod tidy -diff
+  machinery:
+    desc: machinery stays at v1.14.4 and the talos module is never required (the vendored Topf code takes the pkg/machinery module only)
+    cmds:
+      - test "$(go list -m -f '{{"{{.Version}}"}}' github.com/siderolabs/talos/pkg/machinery)" = v1.14.4
+      - test -z "$(go list -m all | grep -E '^github.com/siderolabs/talos ')"
+  noexec:
+    desc: The vendored Topf code imports no os/exec (it renders offline and runs no process)
+    cmds:
+      - test -z "$(go list -f '{{"{{join .Imports \"\\n\"}}"}}' ./internal/third_party/topf/... | grep -x os/exec)"
   vuln:
     desc: Scan dependencies for known vulnerabilities
     cmds:

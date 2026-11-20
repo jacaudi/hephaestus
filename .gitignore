@@ -3,3 +3,5 @@
 /build/ipxe/out/
 /build/e2e/
 /build/catalogpin/
+/build/parity/out/
+/build/parity-build.log
