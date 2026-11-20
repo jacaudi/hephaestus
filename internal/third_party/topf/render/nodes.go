@@ -62,7 +62,8 @@ func installerImagePatch(image string, versionContract *talosconfig.VersionContr
 // hephaestus: changed — generateNodeConfig is a function of the cluster config, the node, the Input and the secrets
 // bundle (Render reads the bundle once), and returns the rendered nodeState. The patch context comes from
 // newPatchContext, which Schematic shares. The mask calls (AddSecretsToMask) are removed, and so are collectNodeInfo,
-// filterNodes and FilteredNodes: nothing is queried live and every node is rendered.
+// filterNodes and FilteredNodes: nothing is queried live and every node is rendered. A canceled context is
+// returned before a node is rendered.
 
 // newPatchContext returns the context node's schematic and patches are resolved against, with the schematic id as
 // configured (it may still be an @file reference).

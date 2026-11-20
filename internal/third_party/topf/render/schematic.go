@@ -20,8 +20,8 @@ import (
 // body, so the caller can send it to the image factory itself.
 
 // resolve resolves the schematic ID of patchCtx. If the ID starts with @, it is treated as a path to a schematic
-// file (relative to the root of the tree). Files ending in .tpl are rendered through Go templates using the
-// patch context as data. The schematic ID is computed locally from the canonical YAML hash, and the canonical body
+// file (relative to the root of the tree). Files ending in .tpl are rendered through Go templates against the
+// patch context's TemplateData(). The schematic ID is computed locally from the canonical YAML hash, and the canonical body
 // is returned with it. Non-@-prefixed IDs are returned unchanged, with a nil body.
 func resolve(in Input, patchCtx *config.PatchContext) (id string, body []byte, err error) {
 	ref, ok := strings.CutPrefix(patchCtx.SchematicID, "@")

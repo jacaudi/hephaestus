@@ -37,7 +37,7 @@ nodes:
 `
 
 // fixture reads the shared secrets bundle: secrets.yaml holds references only, values.json maps each to its value.
-func fixture(t *testing.T) (secretsYAML []byte, values map[string]string) {
+func fixture(t testing.TB) (secretsYAML []byte, values map[string]string) {
 	t.Helper()
 
 	secretsYAML, err := os.ReadFile("testdata/bundle/secrets.yaml")
@@ -266,16 +266,22 @@ func TestRender_EmptyBundle(t *testing.T) {
 	}
 }
 
-func TestRender_UnparsableBundle(t *testing.T) {
-	tests := []struct {
-		name string
-		body string
-	}{
+// unparsableBundles are secrets files that are not empty and are not a valid bundle.
+func unparsableBundles() []struct{ name, body string } {
+	return []struct{ name, body string }{
 		{"not yaml", "certs: ["},
 		{"fails validation", "cluster:\n  id: x\n"},
+		{"null", "null"},
+		{"tilde", "~"},
+		{"document marker", "---\n"},
+		{"comment only", "# nothing\n"},
+		{"empty list", "[]"},
+		{"reference in malformed yaml", " 00000000A: ref+op://lab/bundle/certs.k8s.crt\n0"},
 	}
+}
 
-	for _, tt := range tests {
+func TestRender_UnparsableBundle(t *testing.T) {
+	for _, tt := range unparsableBundles() {
 		t.Run(tt.name, func(t *testing.T) {
 			fsys, values := tree(t, "", map[string]string{"secrets.yaml": tt.body})
 
@@ -290,8 +296,9 @@ func TestRender_UnparsableBundle(t *testing.T) {
 func TestRender_SecretsProviderRefused(t *testing.T) {
 	fsys, values := tree(t, "secretsProvider: ./provider\n", nil)
 
-	if _, err := Render(t.Context(), input(fsys, values)); err == nil {
-		t.Error("Render accepted a secretsProvider, want an error")
+	_, err := Render(t.Context(), input(fsys, values))
+	if err == nil || !strings.Contains(err.Error(), "secretsProvider") {
+		t.Errorf("Render error = %v, want one naming secretsProvider", err)
 	}
 }
 
@@ -347,11 +354,12 @@ func TestRender_CanceledContext(t *testing.T) {
 
 func TestSchematic_ReadsNoPatch(t *testing.T) {
 	fsys, values := tree(t, "", map[string]string{"all/bad.yaml": "machine: ["})
-	delete(fsys, "secrets.yaml")
 
-	in := input(fsys, values)
+	// Schematic reads neither the patch nor the bundle: it resolves with the bundle gone.
+	withoutBundle, _ := tree(t, "", map[string]string{"all/bad.yaml": "machine: ["})
+	delete(withoutBundle, "secrets.yaml")
 
-	id, body, err := Schematic(t.Context(), in, "cp-01")
+	id, body, err := Schematic(t.Context(), input(withoutBundle, values), "cp-01")
 	if err != nil {
 		t.Fatalf("Schematic: %v", err)
 	}
@@ -360,8 +368,10 @@ func TestSchematic_ReadsNoPatch(t *testing.T) {
 		t.Errorf("Schematic = %q, %q, want %q and nil", id, body, DefaultSchematic)
 	}
 
-	if _, err := Render(t.Context(), in); err == nil {
-		t.Error("Render succeeded over an unparsable patch, want an error")
+	// Render, with the bundle present, reads the patch and fails on it.
+	_, err = Render(t.Context(), input(fsys, values))
+	if err == nil || errors.Is(err, ErrSecretsBundleMissing) {
+		t.Errorf("Render error = %v, want the patch error", err)
 	}
 }
 
@@ -396,4 +406,30 @@ func TestSchematic_UnknownHost(t *testing.T) {
 	if _, _, err := Schematic(t.Context(), input(fsys, values), "nope"); err == nil {
 		t.Error("Schematic of an unknown host succeeded, want an error")
 	}
+}
+
+func FuzzLoadSecretsBundle(f *testing.F) {
+	secretsYAML, values := fixture(f)
+
+	f.Add(secretsYAML)
+	f.Add([]byte(""))
+
+	for _, tt := range unparsableBundles() {
+		f.Add([]byte(tt.body))
+	}
+
+	cfg := &config.TopfConfig{SecretsPath: "secrets.yaml"}
+
+	f.Fuzz(func(t *testing.T, content []byte) {
+		fsys := fstest.MapFS{"secrets.yaml": {Data: content}}
+
+		_, err := loadSecretsBundle(input(fsys, values), cfg)
+		if err == nil || errors.Is(err, ErrSecretsBundleMissing) || errors.Is(err, ErrSecretsBundleUnparsable) {
+			return
+		}
+
+		if _, ok := errors.AsType[*config.MissingReferenceError](err); !ok {
+			t.Errorf("loadSecretsBundle error = %v, want nil, Missing, Unparsable or a missing reference", err)
+		}
+	})
 }

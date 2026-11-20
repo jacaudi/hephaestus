@@ -32,7 +32,7 @@ const (
 var DefaultFactory = gendata.ImageFactory //nolint:gochecknoglobals // exported read-only default sourced from talos, treated as constant
 
 // hephaestus: changed — Node is renamed nodeState (the exported Node of this package is the render result) and keeps
-// the cluster config, the node, the resolved schematic and the config bundle. MachineStatus, the running version and
+// the cluster config, the node, the resolved schematic and its body, and the config bundle. MachineStatus, the running version and
 // schematic, Error, MarshalYAML, Attrs, InstallerImageRef and the client are removed: hephaestus renders offline.
 
 // nodeState is a configured node of the cluster with what rendering its configuration produced.
