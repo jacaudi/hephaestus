@@ -14,6 +14,7 @@ run:
     - integration
     - e2e
     - parity
+    - sdksmoke
 
 linters:
   default: none

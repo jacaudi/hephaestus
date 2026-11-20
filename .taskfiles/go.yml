@@ -19,6 +19,7 @@ tasks:
       - task: vuln
       - task: :render:parity
       - task: test
+      - task: sdk-smoke
       - task: cross
       - task: test-integration
       - task: cover:db
@@ -55,6 +56,12 @@ tasks:
     desc: Unit tests with the race detector
     cmds:
       - go test ./... -race
+  sdk-smoke:
+    desc: The real 1Password SDK builds without cgo and refuses a dummy token with an error, not a panic
+    env:
+      CGO_ENABLED: '0'
+    cmds:
+      - go test -tags sdksmoke ./internal/secrets/ -run TestOnePassword_SmokeDummyToken -count=1 -v
   build:
     desc: Build bin/hephaestus
     env:
