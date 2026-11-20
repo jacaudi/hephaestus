@@ -1,4 +1,4 @@
-# Vendored: Topf cluster config loader (pkg/config)
+# Vendored: Topf cluster config loader (pkg/config) and per-node render (internal/topf)
 
 | | |
 |---|---|
@@ -19,12 +19,16 @@ Topf is taken from a git checkout of the full SHA above, never through the Go mo
 | `config/node.go` | `pkg/config/node.go` | unchanged |
 | `config/node_role.go` | `pkg/config/node_role.go` | unchanged |
 | `config/endpoint.go` | `pkg/config/endpoint.go` | unchanged |
+| `render/node.go` | `internal/topf/node.go` | changed |
+| `render/nodes.go` | `internal/topf/nodes.go` | changed |
+| `render/secrets.go` | `internal/topf/secrets.go` and `pkg/providers/secrets.go` (`LoadSecretsBundle`) | changed |
+| `render/schematic.go` | `internal/schematic/resolver.go` | changed |
 
 The changed files keep Topf's MIT header; the line directly under it is a `hephaestus:` provenance comment, and each change is marked `// hephaestus: changed — <what>` at the code. The unchanged files are byte-for-byte Topf's.
 
-Written for hephaestus (header `// hephaestus: new`), not Topf's: `config/doc.go`, `config/fsys.go`, `config/refs.go`, `config/template.go`, and the tests `config/config_test.go`, `config/refs_test.go`, `config/fsys_test.go`.
+Written for hephaestus (header `// hephaestus: new`), not Topf's: `config/doc.go`, `config/fsys.go`, `config/refs.go`, `config/template.go`, and the tests `config/config_test.go`, `config/refs_test.go`, `config/fsys_test.go`; `render/doc.go`, `render/render.go` (`Input`, `Node`, `Render`, `Schematic`) and the test `render/render_test.go`; and the fixture `render/testdata/genbundle/main.go` with its committed outputs `render/testdata/bundle/secrets.yaml` and `values.json`.
 
-Not copied: `pkg/config/*_test.go` (they use host paths), and everything else of Topf.
+Not copied: `pkg/config/*_test.go` (they use host paths), `internal/topf/` other than `node.go` and `nodes.go` (`apply.go`, `client.go`, `current_config_secrets.go`, `render.go`, `topf.go`, `wait.go`), `pkg/providers/` other than `LoadSecretsBundle`, and everything else of Topf.
 
 ## Changes from upstream
 
@@ -41,6 +45,14 @@ Not copied: `pkg/config/*_test.go` (they use host paths), and everything else of
 11. New `fsys.go`: `ErrEscapes`, `ErrSymlinkLoop`, `CleanRel` and `EvalSymlinks` (resolves symlinks of an `fs.FS` that implements `fs.ReadLinkFS`, at most 40 per path).
 12. New `refs.go`: `SubstituteReferences` replaces Topf's `vals eval` pipe (`internal/decryption` and `internal/vals`). It decides whether a file holds a reference as Topf's `hasValsRefs` does (`gopkg.in/yaml.v3` decode into `any`, stop at the first decode error); a file holding none is returned byte for byte. Otherwise each reference scalar (never a mapping key) is replaced by its value from the map as a string, and the documents are encoded again with indent 2. A reference with no value is a `*MissingReferenceError`. `HasReferencePrefix` is Topf's pattern `^ref\+[a-zA-Z0-9]+://` (`internal/vals/vals.go`), written without a package-level regexp.
 13. New `template.go`: `TemplateData` and `TemplateNode`, what a template executes against. `TemplateData` has no methods and `TemplateNode` has `Endpoint` only (a template also reaches the methods of the `netip.Addr` behind `Node.IP`); field names equal to `PatchContext`'s and `Node`'s so a Topf template renders the same text; `PatchesDir`, `DecryptCache`, `FS`, `Values`, `Funcs` and `Load` are not reachable from a template. `Node.IP` is a fresh copy per render, and `RuntimeData` is always zero.
+
+### The per-node render (`render/`)
+
+14. `render/node.go`: Topf's `Node` is renamed `nodeState` (the exported `Node` of this package is the render result) and keeps the cluster config, the node, the resolved schematic and the config bundle, with `TalosVersion()`, `KubernetesVersion()`, `InstallerImage()` and `ConfigProvider()`. `MachineStatus`, the running version and schematic, `Error`, `MarshalYAML`, `Attrs`, `InstallerImageRef` and the client are removed. `TalosVersion()` is `strings.TrimPrefix(cmp.Or(cfg.TalosVersion, version.Tag), "v")`: no running version, hephaestus renders offline. (As in Topf, `TalosVersion()` ignores a node's own `talosVersion` while `InstallerImage()` honours it.)
+15. `render/node.go`: `DefaultSchematic` is the constant `376567988ad370138ad8b2698212367b8edcb69b5fd68c80be1f2ec7d603b4ba`, the Talos main module's `pkg/images.DefaultInstallerImageSchematic` at v1.14.4 (`pkg/images/images.go:24`), so the Talos main module is never imported. `DefaultPlatform` is a constant too; `DefaultFactory` stays a variable read from machinery's embedded `gendata.ImageFactory`.
+16. `render/nodes.go`: `installerImagePatch` is unchanged. `generateNodeConfig` is a function of `(ctx, cfg, node, in, secretsBundle)` returning the rendered `nodeState`; it keeps the patch context, the schematic resolution, `PatchContext.Load`, the version contract, the installer patch first and the bundle options. `collectNodeInfo`, `filterNodes`, `FilteredNodes` and the mask calls are removed. `newPatchContext` (shared with `Schematic`) builds the patch context from the `Input`, and `generateNodeConfig` returns the context error before it renders.
+17. `render/secrets.go`: `Secrets()` and `providers.LoadSecretsBundle` become `loadSecretsBundle`, which reads `cfg.SecretsPath` from the tree through `ReadResolved`, decodes it into `secrets.Bundle` with `go.yaml.in/yaml/v4`, validates it (`Validate(nil)`) and sets the clock skewed one second to the past, as Topf does. A missing or empty file is `ErrSecretsBundleMissing` (Topf generated and stored a bundle), a decode or validation failure is `ErrSecretsBundleUnparsable` wrapping the cause. The provider, the prompt, `generateAndStoreSecrets`, `Put`, the cache and `collectSecrets` are removed. A symlink on the path of the bundle must stay inside the tree (`EvalSymlinks`). `Render` refuses a set `secretsProvider` (`topf: secretsProvider is not supported`), as `Load` refuses `nodesProvider`.
+18. `render/schematic.go`: `Resolver` and its options become the function `resolve`, and `readFile` a function. The factory client, `submitSchematic`, the HTTP client and the user agent are removed (the id is only computed locally). An `@` path is relative to the root of the tree (Topf joined it to the directory of the config file) and goes through `CleanRel` and `EvalSymlinks`, so it cannot leave the tree. A `.tpl` file is rendered with `RenderTemplate` against `TemplateData()` and the `Input`'s function map; any other file is read with `fs.ReadFile`, with no reference substitution, as in Topf. `resolve` also returns the canonical body (`schematic.Canonical`) of an `@` schematic, and its id is `schematic.ID`.
 
 ## Linting
 
