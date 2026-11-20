@@ -648,7 +648,7 @@ func runRepositorySuite(t *testing.T, open func(testing.TB) *db.DB) {
 		r, d := testRepo(t, open)
 		c := mustImport(t, r, labImport(t0))
 		mustMark(t, r, c, "T1", TriggerHead, t0)
-		// The mark survives a change that is not to the source, so only the revision is stale.
+		// A set that is not to the source still bumps the revision and so clears the mark: no work owns it any more.
 		mustSet(t, r, SetRequest{Name: labName, Username: new("other"), At: t0.Add(time.Minute)})
 		id, stored, err := r.StorePending(t.Context(), pendingReq(c, "T1", t0.Add(2*time.Minute)))
 		if err != nil || stored || id != "" {
@@ -657,8 +657,45 @@ func runRepositorySuite(t *testing.T, open func(testing.TB) *db.DB) {
 		if n := count(t, d, "cluster_pairs", "1 = 1") + count(t, d, "secret_versions", "1 = 1") + count(t, d, "host_renders", "1 = 1"); n != 0 {
 			t.Fatalf("%d rows were written, want none", n)
 		}
+		got := mustGet(t, r, labName)
+		wantNoMark(t, got)
+		if got.PendingPairID != "" {
+			t.Fatalf("PendingPairID = %q, want nothing recorded", got.PendingPairID)
+		}
+	})
+
+	t.Run("StorePendingRevisionBumpedUnderMark", func(t *testing.T) {
+		r, d := testRepo(t, open)
+		c := mustImport(t, r, labImport(t0))
+		mustMark(t, r, c, "T1", TriggerHead, t0)
+		// Another process bumps the revision without clearing the mark; the store alone must refuse.
+		execRaw(t, d, "UPDATE clusters SET revision = revision + 1 WHERE id = ?", c.ID)
+		id, stored, err := r.StorePending(t.Context(), pendingReq(c, "T1", t0.Add(time.Minute)))
+		if err != nil || stored || id != "" {
+			t.Fatalf("StorePending = %q, %v, %v; want no pair, false, nil", id, stored, err)
+		}
+		if n := count(t, d, "cluster_pairs", "1 = 1") + count(t, d, "secret_versions", "1 = 1") + count(t, d, "host_renders", "1 = 1"); n != 0 {
+			t.Fatalf("%d rows were written, want none", n)
+		}
 		if got := mustGet(t, r, labName); got.PendingPairID != "" || got.ProcessingTree != "T1" {
 			t.Fatalf("cluster = %+v, want nothing recorded and the mark as it was", got)
+		}
+	})
+
+	t.Run("SetWithoutSourceChangeClearsMark", func(t *testing.T) {
+		r, _ := testRepo(t, open)
+		c := mustImport(t, r, labImport(t0))
+		pairID := mustStore(t, r, c, "T0", t0)
+		mustMark(t, r, c, "T1", TriggerHead, t0.Add(time.Minute))
+		got := mustSet(t, r, SetRequest{Name: labName, Username: new("other"), At: t0.Add(2 * time.Minute)})
+		wantNoMark(t, got)
+		if got.Revision != 1 || got.LastHeadTree != "T0" || got.PendingPairID != pairID {
+			t.Fatalf("Set = %+v, want revision 1 with the last head T0 and pending pair %s kept", got, pairID)
+		}
+		// The work of the new revision can start at once.
+		mustMark(t, r, got, "T1", TriggerHead, t0.Add(3*time.Minute))
+		if again := mustGet(t, r, labName); again.ProcessingTree != "T1" || again.ProcessingRevision == nil || *again.ProcessingRevision != 1 {
+			t.Fatalf("cluster = %+v, want T1 processing at revision 1", again)
 		}
 	})
 

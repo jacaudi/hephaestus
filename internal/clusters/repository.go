@@ -276,10 +276,11 @@ func applySet(c *Cluster, req SetRequest) (changed []string, source, credential 
 	return changed, source, credential
 }
 
-// Set changes the fields of req and adds one to the revision. A changed repo URL, ref or path also clears the
-// pending pair (deleting it with its renders and version), the failed tree, the processing mark and the last head
-// tree, so the new source's head is processed even if it is the same tree; the approved pair is kept. A changed
-// credential reference clears the sealed credential. It audits cluster.set. An unknown name is ErrNotFound.
+// Set changes the fields of req and adds one to the revision, which clears the processing mark: work marked at the
+// old revision can no longer be stored, so the mark has no owner. A changed repo URL, ref or path also clears the
+// pending pair (deleting it with its renders and version), the failed tree and the last head tree, so the new
+// source's head is processed even if it is the same tree; the approved pair is kept. A changed credential
+// reference clears the sealed credential. It audits cluster.set. An unknown name is ErrNotFound.
 func (r *Repository) Set(ctx context.Context, req SetRequest) (Cluster, error) {
 	if err := validateSet(req); err != nil {
 		return Cluster{}, err
@@ -302,8 +303,9 @@ func (r *Repository) Set(ctx context.Context, req SetRequest) (Cluster, error) {
 		if credential {
 			q = q.Set("credential_sealed = NULL")
 		}
+		q = clearMark(q)
 		if source {
-			q = clearMark(q.Set("pending_pair_id = NULL").Set("failed_tree = NULL").Set("failed_error_sealed = NULL").Set("last_head_tree = NULL"))
+			q = q.Set("pending_pair_id = NULL").Set("failed_tree = NULL").Set("failed_error_sealed = NULL").Set("last_head_tree = NULL")
 		}
 		if err := updateOne(ctx, q, db.ErrConflict); err != nil {
 			return err
