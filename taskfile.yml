@@ -59,6 +59,20 @@ tasks:
       DATE: {sh: date -u +%Y-%m-%dT%H:%M:%SZ}
     cmds:
       - docker buildx build --platform {{.PLATFORM}} --load --progress=plain --build-arg VERSION={{.VERSION}} --build-arg COMMIT={{.COMMIT}} --build-arg DATE={{.DATE}} -t hephaestus:dev .
+  render:parity:
+    desc: Golden parity with topf render at the pinned commit (needs DOCKER_HOST)
+    cmds:
+      - |
+        docker build -f build/parity/Dockerfile -t hephaestus-parity:local . > build/parity-build.log 2>&1 || { tail -20 build/parity-build.log; exit 1; }
+      - rm -rf build/parity/out && mkdir -p build/parity/out
+      - |
+        set -eu
+        for d in internal/render/testdata/parity/*/; do
+          c=$(basename "${d}")
+          mkdir -p "build/parity/out/${c}"
+          docker run --rm --user "$(id -u):$(id -g)" -e VALSSTUB_VALUES=/fixture/values.json -e TOPF_SUBMIT_TO_FACTORY=false -v "{{.ROOT_DIR}}/internal/render/testdata/parity/${c}:/fixture:ro" -v "{{.ROOT_DIR}}/build/parity/out/${c}:/out" hephaestus-parity:local topf --topfconfig /fixture/topf.yaml render --output /out
+        done
+      - go test -tags parity ./internal/render/ -run TestParity_Golden -count=1 -v
   catalog:image:
     desc: Build the pinned catalog pin image, which holds catalogpin and gpg (needs DOCKER_HOST)
     vars:

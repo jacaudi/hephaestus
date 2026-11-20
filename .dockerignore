@@ -6,3 +6,5 @@ docs
 .superpowers
 .worktrees
 build/e2e
+build/parity/out
+build/parity-build.log

@@ -13,6 +13,7 @@ run:
   build-tags:
     - integration
     - e2e
+    - parity
 
 linters:
   default: none

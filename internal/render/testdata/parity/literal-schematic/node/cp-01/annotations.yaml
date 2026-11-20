@@ -1,0 +1,3 @@
+machine:
+  nodeAnnotations:
+    hephaestus.example.test/rack: r1

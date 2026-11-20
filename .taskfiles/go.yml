@@ -17,6 +17,7 @@ tasks:
       - task: noexec
       - task: lint
       - task: vuln
+      - task: :render:parity
       - task: test
       - task: cross
       - task: test-integration

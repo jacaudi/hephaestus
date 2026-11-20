@@ -1,0 +1,5 @@
+machine:
+  sysctls:
+    vm.max_map_count: "262144"
+  env:
+    CLUSTER_ID: ref+op://lab/bundle/cluster.id
