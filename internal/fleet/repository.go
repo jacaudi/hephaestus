@@ -822,7 +822,8 @@ func insertBootEvent(ctx context.Context, q bun.IDB, row bootEventRow) error {
 // *TransitionError "host_bound". A trigger that ends in StateNone (forget)
 // deletes the machine, with its MACs and boot events, and returns it with State
 // StateNone. Every transition but config_served revokes the machine's live
-// tickets.
+// tickets. A transition into assigned re-arms the failed or broken talos_cache
+// row of the machine's Talos tuple and arch, creating none.
 func TransitionTx(ctx context.Context, q bun.IDB, req TransitionRequest) (Machine, error) {
 	m, err := loadMachine(ctx, q, req.MachineID)
 	if err != nil {
@@ -864,6 +865,13 @@ func TransitionTx(ctx context.Context, q bun.IDB, req TransitionRequest) (Machin
 	// a served config consumes the ticket itself and revokes the rest.
 	if req.Trigger != TriggerConfigServed {
 		if _, err := RevokeMachineTicketsTx(ctx, q, m.ID, req.At); err != nil {
+			return Machine{}, err
+		}
+	}
+	// Talos rows come after machines and tickets. Entering assigned re-arms the
+	// row the machine installs from, so a broken one does not hold it.
+	if lc.State == StateAssigned {
+		if err := rearmTalosOf(ctx, q, m, req.At); err != nil {
 			return Machine{}, err
 		}
 	}
