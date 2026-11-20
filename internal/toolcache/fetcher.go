@@ -21,6 +21,7 @@ import (
 	"go.opentelemetry.io/otel/metric/noop"
 
 	"go.jacaudi.dev/hephaestus/internal/catalog"
+	"go.jacaudi.dev/hephaestus/internal/factory"
 	"go.jacaudi.dev/hephaestus/internal/fleet"
 	"go.jacaudi.dev/hephaestus/internal/store"
 )
@@ -84,9 +85,9 @@ var errIdle = errors.New("idle timeout: no data from the upstream")
 // failure; a retry may meet a faster server.
 var errTooSlow = fmt.Errorf("the upstream sent fewer than %d KiB/s over %s", MinThroughput>>10, ThroughputWindow)
 
-// FetcherConfig is what a Fetcher works on. Every field but Workers is required.
+// FetcherConfig is what a Fetcher works on. Every field but Workers and Talos is required.
 type FetcherConfig struct {
-	// Repo holds the utility_cache rows the fetcher claims and settles.
+	// Repo holds the utility_cache and talos_cache rows the fetcher claims and settles.
 	Repo *fleet.Repository
 	// Store receives the extracted files.
 	Store *store.Store
@@ -99,12 +100,28 @@ type FetcherConfig struct {
 	// Workers is how many downloads run at once, from 1 to MaxFetchWorkers. 0
 	// means DefaultFetchWorkers.
 	Workers int
+	// Talos is the image factory the talos_cache rows are fetched from; nil
+	// leaves those rows alone. Build it over Client, so a registration has the
+	// downloads' TLS and https-only redirect policy.
+	Talos *factory.Client
 }
+
+// The FetchEvent sources: the table of the row that changed.
+const (
+	// SourceUtility is a utility_cache row, named by Key and Pin.
+	SourceUtility = "utility"
+	// SourceTalos is a talos_cache row, named by Talos.
+	SourceTalos = "talos"
+)
 
 // FetchEvent is one state change of a cache row the fetcher made.
 type FetchEvent struct {
-	Key      fleet.CacheKey
-	Pin      string
+	// Source is SourceUtility or SourceTalos.
+	Source string
+	Key    fleet.CacheKey
+	Pin    string
+	// Talos is the row of a SourceTalos event.
+	Talos    fleet.TalosKey
 	From, To fleet.CacheState
 	// Attempts is the row's failed attempts after the change.
 	Attempts int
@@ -154,6 +171,9 @@ type Fetcher struct {
 	onError  func(context.Context, error)
 	bytes    metric.Int64Counter
 	failures metric.Int64Counter
+	// talosBytes and talosFailures count the Talos downloads.
+	talosBytes    metric.Int64Counter
+	talosFailures metric.Int64Counter
 	// sources are the kinds of row the workers claim.
 	sources []source
 
@@ -202,6 +222,9 @@ func NewFetcher(cfg FetcherConfig, opts ...FetcherOption) (*Fetcher, error) {
 		statfs:  diskFree,
 	}
 	f.sources = []source{utilitySource{f: f}}
+	if cfg.Talos != nil {
+		f.sources = append(f.sources, talosSource{f: f})
+	}
 	for _, opt := range opts {
 		opt(f)
 	}
@@ -216,6 +239,16 @@ func NewFetcher(cfg FetcherConfig, opts ...FetcherOption) (*Fetcher, error) {
 		metric.WithDescription("Failed fetches, by class: integrity or other."))
 	if err != nil {
 		return nil, fmt.Errorf("toolcache: create the fetch failures counter: %w", err)
+	}
+	f.talosBytes, err = f.meter.Int64Counter("hephaestus.talos.fetch.bytes", metric.WithUnit("By"),
+		metric.WithDescription("Bytes of Talos boot assets downloaded from the image factory."))
+	if err != nil {
+		return nil, fmt.Errorf("toolcache: create the Talos fetch bytes counter: %w", err)
+	}
+	f.talosFailures, err = f.meter.Int64Counter("hephaestus.talos.fetch.failures",
+		metric.WithDescription("Failed Talos asset fetches, by class: integrity or other."))
+	if err != nil {
+		return nil, fmt.Errorf("toolcache: create the Talos fetch failures counter: %w", err)
 	}
 	if err := os.MkdirAll(cfg.SpoolDir, spoolDirMode); err != nil {
 		return nil, fmt.Errorf("toolcache: create the spool dir: %w", err)
@@ -289,7 +322,7 @@ func (w *worker) runOnce(ctx context.Context) (bool, error) {
 	start := time.Now()
 	defer c.run.close(ctx)
 	err = c.run.run(ctx)
-	o := outcome{ev: FetchEvent{Key: c.event.Key, Pin: c.event.Pin, From: fleet.CacheFetching, Bytes: c.run.received()}}
+	o := outcome{ev: FetchEvent{Source: c.event.Source, Key: c.event.Key, Pin: c.event.Pin, Talos: c.event.Talos, From: fleet.CacheFetching, Bytes: c.run.received()}}
 	switch {
 	case err == nil:
 		o.ready = true
@@ -374,7 +407,10 @@ func (w *worker) retryHeld(ctx context.Context) (bool, error) {
 	w.held = nil
 	if moved {
 		// The cause is a database error, which may hold control runes: like every event's Err, it is printable text.
-		f.events(ctx, FetchEvent{Key: h.ev.Key, Pin: h.ev.Pin, From: fleet.CacheFetching, To: fleet.CacheWanted, Err: errors.New(fleet.PrintableText(h.cause.Error()))})
+		f.events(ctx, FetchEvent{
+			Source: h.ev.Source, Key: h.ev.Key, Pin: h.ev.Pin, Talos: h.ev.Talos, From: fleet.CacheFetching, To: fleet.CacheWanted,
+			Err: errors.New(fleet.PrintableText(h.cause.Error())),
+		})
 	}
 	if !firstRetry {
 		return true, nil // the error was returned when the retry failed

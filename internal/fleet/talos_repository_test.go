@@ -3,6 +3,7 @@ package fleet
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -337,9 +338,28 @@ func runTalosSuite(t *testing.T, open func(testing.TB) *db.DB, pair func(testing
 		want.BytesDone, want.BytesTotal, want.Assets = seed.BytesDone, seed.BytesTotal, talosAssets()
 		wantTalos(t, r, k, want)
 
-		moved, err = r.MarkTalosReady(t.Context(), k, TalosAssets{}, at.Add(time.Minute))
+		moved, err = r.MarkTalosReady(t.Context(), k, talosAssets(), at.Add(time.Minute))
 		wantBool(t, "MarkTalosReady(ready)", moved, err, false)
 		wantTalos(t, r, k, want)
+	})
+
+	// A row is never ready without the size and hash of every part: the next
+	// fetch would record fresh upstream hashes without an audited reset.
+	t.Run("MarkTalosReadyNeedsEveryAsset", func(t *testing.T) {
+		d := open(t)
+		r := NewRepository(d)
+		seed := talosRowIn(k, CacheFetching, t0)
+		seedTalos(t, d, seed)
+
+		noCmdline := talosAssets()
+		delete(noCmdline, TalosCmdline)
+		for _, assets := range []TalosAssets{nil, {}, noCmdline} {
+			moved, err := r.MarkTalosReady(t.Context(), k, assets, t0.Add(time.Minute))
+			if err == nil || moved {
+				t.Fatalf("MarkTalosReady(%v) = %v, %v; want an error", assets, moved, err)
+			}
+			wantTalos(t, r, k, seed)
+		}
 	})
 
 	t.Run("FirstFailureBacksOff", func(t *testing.T) {
@@ -512,6 +532,25 @@ func runTalosSuite(t *testing.T, open func(testing.TB) *db.DB, pair func(testing
 		wantBool(t, "ResetTalosHash(absent)", moved, err, false)
 		if got := auditsOf(t, d, "talos.hash_reset"); len(got) != 2 {
 			t.Fatalf("talos.hash_reset audits = %+v, want the two resets and none for the absent row", got)
+		}
+	})
+
+	// A reset under a fetch in flight would let a second worker claim the row
+	// while the first still settles it, so it is refused until the fetch ends.
+	t.Run("ResetHashRefusedWhileFetching", func(t *testing.T) {
+		d := open(t)
+		r := NewRepository(d)
+		seed := talosRowIn(k, CacheFetching, t0)
+		seed.Assets = talosAssets()
+		seedTalos(t, d, seed)
+
+		moved, err := r.ResetTalosHash(t.Context(), k, ActorCLI, t0.Add(time.Minute))
+		if !errors.Is(err, ErrTalosFetching) || moved {
+			t.Fatalf("ResetTalosHash(fetching) = %v, %v; want false, ErrTalosFetching", moved, err)
+		}
+		wantTalos(t, r, k, seed)
+		if got := auditsOf(t, d, "talos.hash_reset"); len(got) != 0 {
+			t.Fatalf("talos.hash_reset audits = %+v, want none for a refused reset", got)
 		}
 	})
 

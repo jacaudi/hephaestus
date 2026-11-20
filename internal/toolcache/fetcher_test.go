@@ -186,6 +186,13 @@ type harness struct {
 
 func newHarness(t *testing.T, cat *catalog.Catalog, client *http.Client) *harness {
 	t.Helper()
+	return newHarnessFor(t, FetcherConfig{Catalog: cat, Client: client})
+}
+
+// newHarnessFor is newHarness over cfg, whose Repo, Store, SpoolDir and Workers
+// it sets.
+func newHarnessFor(t *testing.T, cfg FetcherConfig) *harness {
+	t.Helper()
 	h := &harness{t: t, d: dbtest.SQLite(t), storeDir: filepath.Join(t.TempDir(), "store"), spool: t.TempDir(), reader: sdkmetric.NewManualReader()}
 	h.repo = fleet.NewRepository(h.d)
 	st, _, err := store.Open(t.Context(), h.storeDir, fetchT0)
@@ -193,8 +200,9 @@ func newHarness(t *testing.T, cat *catalog.Catalog, client *http.Client) *harnes
 		t.Fatalf("store.Open: %v", err)
 	}
 	h.store = st
+	cfg.Repo, cfg.Store, cfg.SpoolDir, cfg.Workers = h.repo, st, h.spool, 1
 	f, err := NewFetcher(
-		FetcherConfig{Repo: h.repo, Store: st, Catalog: cat, Client: client, SpoolDir: h.spool, Workers: 1},
+		cfg,
 		WithClock(fetchT0),
 		WithMeter(sdkmetric.NewMeterProvider(sdkmetric.WithReader(h.reader)).Meter("test")),
 		WithEvents(func(_ context.Context, ev FetchEvent) {

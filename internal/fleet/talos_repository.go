@@ -17,6 +17,9 @@ const (
 	actionTalosHashReset = "talos.hash_reset"
 )
 
+// ErrTalosFetching means ResetTalosHash found the row being fetched.
+var ErrTalosFetching = errors.New("the Talos row is being fetched; reset its hash once the fetch has ended")
+
 // talosDetail is the detail of a talos.hash_reset audit event.
 type talosDetail struct {
 	Schematic string `json:"schematic"`
@@ -151,8 +154,13 @@ func (r *Repository) RecordTalosProgress(ctx context.Context, key TalosKey, done
 }
 
 // MarkTalosReady moves a fetching row to ready with the assets its fetch
-// recorded, and clears its failure history. It reports whether it did.
+// recorded, and clears its failure history. It reports whether it did. Assets
+// that are not Complete are an error and move nothing: a ready row without its
+// hashes would have the next fetch record fresh ones unaudited.
 func (r *Repository) MarkTalosReady(ctx context.Context, key TalosKey, assets TalosAssets, at time.Time) (bool, error) {
+	if !assets.Complete() {
+		return false, fmt.Errorf("fleet: mark Talos %s ready: the assets %v do not record every part with a sha256", key.Tag(), assets)
+	}
 	moved, err := applied(ctx, updateTalos(r.bdb, key).Where("state = ?", CacheFetching).
 		Set("state = ?", CacheReady).Set("assets = ?", assets).
 		Set("attempts = 0").Set("last_error = ''").Set("next_attempt_at = NULL").Set("updated_at = ?", stamp(at)))
@@ -253,19 +261,33 @@ func (r *Repository) RequeueTalos(ctx context.Context, key TalosKey, at time.Tim
 }
 
 // ResetTalosHash is an admin's trust decision to accept a changed upstream
-// build: it moves the row at key, in any state, to wanted with its recorded
-// assets, attempts, progress and last error cleared, and audits talos.hash_reset
-// as actor, in a single transaction. It reports whether a row was there.
+// build: it moves the row at key, in any state but fetching, to wanted with its
+// recorded assets, attempts, progress and last error cleared, and audits
+// talos.hash_reset as actor, in a single transaction. It reports whether a row
+// was there. A fetching row is refused with ErrTalosFetching: moved to wanted
+// under its fetch, it could be claimed by a second worker while the first still
+// settles it, so the admin resets it once that fetch has ended.
 func (r *Repository) ResetTalosHash(ctx context.Context, key TalosKey, actor string, at time.Time) (bool, error) {
 	at = stamp(at)
 	var moved bool
 	err := db.RunInTxRetry(ctx, r.bdb, func(ctx context.Context, tx bun.Tx) error {
-		var err error
-		moved, err = applied(ctx, updateTalos(tx, key).
+		row, ok, err := loadTalos(ctx, tx, key)
+		switch {
+		case err != nil || !ok:
+			moved = false
+			return err
+		case row.State == CacheFetching:
+			return ErrTalosFetching
+		}
+		moved, err = applied(ctx, updateTalos(tx, key).Where("state = ?", row.State).
 			Set("state = ?", CacheWanted).Set("assets = ?", TalosAssets{}).Set("attempts = 0").Set("next_attempt_at = NULL").
 			Set("bytes_done = 0").Set("bytes_total = 0").Set("last_error = ''").Set("updated_at = ?", at))
-		if err != nil || !moved {
+		switch {
+		case err != nil:
 			return err
+		case !moved:
+			// The row left the state it was read in: read it again.
+			return db.ErrConflict
 		}
 		return InsertAudit(ctx, tx, AuditEvent{At: at, Actor: actor, Action: actionTalosHashReset, Detail: talosDetail(key)})
 	})

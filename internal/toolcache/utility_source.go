@@ -15,32 +15,39 @@ import (
 // which is both the row's run and its settler.
 type utilitySource struct{ f *Fetcher }
 
-// claim returns ClaimFetch's row for claimUrgent and nothing for any other
-// class. ClaimFetch already takes the highest priority first, so priority 0
-// rows come out in that class too and the claim order is ClaimFetch's own.
+// claim returns a priority 1 row for claimUrgent and a priority 0 row for
+// claimRest, so the Talos rows of an assigned machine come between the two,
+// and nothing for any other class.
 func (s utilitySource) claim(ctx context.Context, class claimClass, at time.Time) (claimed, bool, error) {
-	if class != claimUrgent {
+	var priority int
+	switch class {
+	case claimUrgent:
+		priority = 1
+	case claimRest:
+		priority = 0
+	case claimAssigned, claimOther:
 		return claimed{}, false, nil
 	}
-	row, ok, err := s.f.cfg.Repo.ClaimFetch(ctx, at)
+	row, ok, err := s.f.cfg.Repo.ClaimFetchAtPriority(ctx, priority, at)
 	if err != nil || !ok {
 		return claimed{}, false, err
 	}
 	job := &fetchJob{f: s.f, row: row}
 	return claimed{
 		name:  fmt.Sprintf("%s/%s", row.Entry, row.Arch),
-		event: FetchEvent{Key: row.Key(), Pin: row.Pin, From: claimedFrom(row), To: fleet.CacheFetching, Attempts: row.Attempts},
+		event: FetchEvent{Source: SourceUtility, Key: row.Key(), Pin: row.Pin, From: claimedFrom(row.NextAttemptAt), To: fleet.CacheFetching, Attempts: row.Attempts},
 		run:   job,
 		row:   job,
 	}, true, nil
 }
 
-// claimedFrom is the state a claimed row was in. ClaimFetch returns it already
-// fetching. A failure sets next_attempt_at and every way back to wanted clears
-// it except ResetFetching and ResetFetchingRow, so a set value means failed; a
-// row either gave back after a failed claim is reported as failed too.
-func claimedFrom(row fleet.CacheRow) fleet.CacheState {
-	if row.NextAttemptAt.IsZero() {
+// claimedFrom is the state a claimed row was in, from its next_attempt_at; the
+// claim returns the row already fetching. In both tables a failure sets
+// next_attempt_at and every way back to wanted clears it except the resets of
+// fetching rows, so a set value means failed; a row either gave back after a
+// failed claim is reported as failed too.
+func claimedFrom(nextAttemptAt time.Time) fleet.CacheState {
+	if nextAttemptAt.IsZero() {
 		return fleet.CacheWanted
 	}
 	return fleet.CacheFailed

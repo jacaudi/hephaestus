@@ -33,6 +33,24 @@ const (
 	TalosCmdline TalosPart = "cmdline"
 )
 
+// TalosParts returns the three parts in the order they are fetched and layered:
+// kernel, initramfs, cmdline.
+func TalosParts() [3]TalosPart { return [3]TalosPart{TalosKernel, TalosInitramfs, TalosCmdline} }
+
+// IsSHA256Hex reports whether s is 64 lower-case hex digits: the form of a
+// recorded sha256 and of a schematic ID.
+func IsSHA256Hex(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for i := range len(s) {
+		if c := s[i]; (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 // TalosAsset is the size and sha256 recorded at an asset's first complete
 // fetch; later fetches are checked against it.
 type TalosAsset struct {
@@ -43,6 +61,17 @@ type TalosAsset struct {
 // TalosAssets are the recorded assets of a row, by part, stored as the JSON
 // column assets. A row that has never been fetched has none.
 type TalosAssets map[TalosPart]TalosAsset
+
+// Complete reports whether a records every part with a sha256, as a ready row
+// must.
+func (a TalosAssets) Complete() bool {
+	for _, p := range TalosParts() {
+		if !IsSHA256Hex(a[p].SHA256) {
+			return false
+		}
+	}
+	return true
+}
 
 // TalosRow is a stored talos_cache row: the bun model of the table. Body is the
 // schematic's canonical body, nil for a literal schematic ID.

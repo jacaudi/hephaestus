@@ -141,27 +141,48 @@ func wantFetch(ctx context.Context, q bun.IDB, w FetchWant, at time.Time) error 
 // first, then the oldest updated_at. A row another worker takes first is skipped
 // for the next. It reports false when none is eligible.
 func (r *Repository) ClaimFetch(ctx context.Context, at time.Time) (CacheRow, bool, error) {
+	row, ok, err := r.claimFetchInTx(ctx, nil, at)
+	if err != nil {
+		return CacheRow{}, false, fmt.Errorf("fleet: claim fetch: %w", err)
+	}
+	return row, ok, nil
+}
+
+// ClaimFetchAtPriority is ClaimFetch restricted to the rows at priority, so a
+// fetcher can put other work between the priorities.
+func (r *Repository) ClaimFetchAtPriority(ctx context.Context, priority int, at time.Time) (CacheRow, bool, error) {
+	row, ok, err := r.claimFetchInTx(ctx, &priority, at)
+	if err != nil {
+		return CacheRow{}, false, fmt.Errorf("fleet: claim fetch at priority %d: %w", priority, err)
+	}
+	return row, ok, nil
+}
+
+// claimFetchInTx runs claimFetch in a transaction of its own.
+func (r *Repository) claimFetchInTx(ctx context.Context, priority *int, at time.Time) (CacheRow, bool, error) {
 	var (
 		claimed CacheRow
 		ok      bool
 	)
 	err := r.bdb.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
 		var err error
-		claimed, ok, err = claimFetch(ctx, tx, stamp(at), nil)
+		claimed, ok, err = claimFetch(ctx, tx, stamp(at), priority, nil)
 		return err
 	})
-	if err != nil {
-		return CacheRow{}, false, fmt.Errorf("fleet: claim fetch: %w", err)
-	}
-	return claimed, ok, nil
+	return claimed, ok, err
 }
 
-// claimFetch is ClaimFetch's transaction body. afterSelect, when set, runs between
-// the select of the candidates and the update of the first: tests land another
-// worker's claim there, a race only Postgres lets happen on its own.
-func claimFetch(ctx context.Context, tx bun.IDB, at time.Time, afterSelect func()) (CacheRow, bool, error) {
+// claimFetch is ClaimFetch's transaction body, over the rows at priority when it
+// is set and every row otherwise. afterSelect, when set, runs between the select
+// of the candidates and the update of the first: tests land another worker's
+// claim there, a race only Postgres lets happen on its own.
+func claimFetch(ctx context.Context, tx bun.IDB, at time.Time, priority *int, afterSelect func()) (CacheRow, bool, error) {
 	var rows []CacheRow
-	err := tx.NewSelect().Model(&rows).Where("state = ? OR (state = ? AND next_attempt_at <= ?)", CacheWanted, CacheFailed, at).Scan(ctx)
+	q := tx.NewSelect().Model(&rows).Where("state = ? OR (state = ? AND next_attempt_at <= ?)", CacheWanted, CacheFailed, at)
+	if priority != nil {
+		q = q.Where("priority = ?", *priority)
+	}
+	err := q.Scan(ctx)
 	if err != nil {
 		return CacheRow{}, false, fmt.Errorf("load claimable rows: %w", err)
 	}

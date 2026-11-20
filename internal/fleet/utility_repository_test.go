@@ -103,7 +103,7 @@ func claimBetween(t *testing.T, d *db.DB, at time.Time, between func(ctx context
 	)
 	err := d.Bun().RunInTx(t.Context(), nil, func(ctx context.Context, tx bun.Tx) error {
 		var err error
-		got, ok, err = claimFetch(ctx, tx, at, func() { between(ctx, tx) })
+		got, ok, err = claimFetch(ctx, tx, at, nil, func() { between(ctx, tx) })
 		return err
 	})
 	if err != nil {
@@ -337,6 +337,35 @@ func runUtilitySuite(t *testing.T, open func(testing.TB) *db.DB) {
 		}
 		if got, ok := mustClaim(t, r, at); ok {
 			t.Fatalf("ClaimFetch with nothing eligible = %+v, true; want false", got)
+		}
+	})
+
+	t.Run("ClaimFetchAtPriority", func(t *testing.T) {
+		d := open(t)
+		r := NewRepository(d)
+		low := cacheRowIn(CacheKey{Entry: "ta", Arch: ArchAMD64}, CacheWanted, t0)
+		high := cacheRowIn(CacheKey{Entry: "tb", Arch: ArchAMD64}, CacheWanted, t0.Add(-time.Minute))
+		high.Priority = 1
+		seedCache(t, d, low)
+		seedCache(t, d, high)
+
+		at := t0.Add(time.Hour)
+		got, ok, err := r.ClaimFetchAtPriority(t.Context(), 0, at)
+		want := low
+		want.State, want.UpdatedAt = CacheFetching, at
+		if err != nil || !ok || !sameCacheRow(got, want) {
+			t.Fatalf("ClaimFetchAtPriority(0) = %+v, %v, %v; want %+v (the older priority 1 row is not priority 0)", got, ok, err, want)
+		}
+		wantCache(t, r, high.Key(), high)
+		if got, ok, err := r.ClaimFetchAtPriority(t.Context(), 0, at); err != nil || ok {
+			t.Fatalf("second ClaimFetchAtPriority(0) = %+v, %v, %v; want none left", got, ok, err)
+		}
+
+		got, ok, err = r.ClaimFetchAtPriority(t.Context(), 1, at)
+		want = high
+		want.State, want.UpdatedAt = CacheFetching, at
+		if err != nil || !ok || !sameCacheRow(got, want) {
+			t.Fatalf("ClaimFetchAtPriority(1) = %+v, %v, %v; want %+v", got, ok, err, want)
 		}
 	})
 
