@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"path"
 	"strings"
 
 	topfrender "go.jacaudi.dev/hephaestus/internal/third_party/topf/render"
@@ -92,6 +93,9 @@ func (c *Cluster) checkSchematic(ctx context.Context, node *topfrender.Node, dum
 	if !ok || !strings.HasSuffix(file, templateSuffix) {
 		return nil
 	}
+
+	// Load cleaned the path with config.CleanRel and refused one that escapes the tree, so path.Clean gives the same name.
+	file = path.Clean(file)
 
 	_, body, err := topfrender.Schematic(ctx, topfrender.Input{FS: c.FS, Values: dummies, Funcs: FuncMap()}, node.Host)
 	if err != nil || !bytes.Equal(body, node.SchematicBody) {

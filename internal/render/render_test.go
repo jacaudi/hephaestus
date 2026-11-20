@@ -211,3 +211,17 @@ func TestSchematicBody_DummyRenderErrorRefused(t *testing.T) {
 		t.Errorf("refusal = %q in %q, want rule \"secret reaches schematic\" in %s", refusal.Rule, refusal.File, schematicTpl)
 	}
 }
+
+func TestSchematicBody_RefusalNamesCleanedPath(t *testing.T) {
+	fsys := renderTree(t)
+	apply(t, fsys,
+		appendTopf("schematicId: \"@./"+schematicTpl+"\"\ndata:\n  x: "+refClusterID+"\n"),
+		writeFile(schematicTpl, hashedArgBody),
+	)
+
+	_, err := loadAndRender(t, fsys, bundleValues(t))
+
+	if refusal, ok := errors.AsType[*RefusalError](err); !ok || refusal.File != schematicTpl {
+		t.Fatalf("Render error = %v, want a *RefusalError naming %s", err, schematicTpl)
+	}
+}

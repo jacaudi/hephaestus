@@ -180,6 +180,52 @@ func TestRedact_ErrorNamesReference(t *testing.T) {
 	}
 }
 
+func TestRedact_ValueHoldingMarkerRefused(t *testing.T) {
+	const secret = "s3cr3t-part-one"
+
+	tests := []struct {
+		name, value, render string
+	}{
+		{"whole value", secret + Marker + "s3cr3t-part-two", "k: " + secret + Marker + "s3cr3t-part-two\n"},
+		{"line of a multi-line value", "first-line-is-long\n" + secret + Marker + "tail-of-line\n", "k: x\n"},
+		{"value is the marker", Marker, "k: x\n"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := Redact([]byte(tt.render), map[string]string{refPassword: tt.value})
+
+			redaction, ok := errors.AsType[*RedactionError](err)
+			if !ok {
+				t.Fatalf("Redact = %q, %v, want a *RedactionError", got, err)
+			}
+
+			if !errors.Is(err, ErrRedaction) || redaction.Ref != refPassword {
+				t.Errorf("error = %v, want ErrRedaction naming %s", err, refPassword)
+			}
+
+			if strings.Contains(err.Error(), secret) {
+				t.Errorf("error text %q holds the value", err.Error())
+			}
+		})
+	}
+}
+
+func TestRedact_SurvivorNamesFirstPatternReference(t *testing.T) {
+	const render = "a: 'p@ss''one'\nb: 'p@ss''two-longer'\n"
+
+	values := map[string]string{"ref+op://a/b/short": "p@ss'one", "ref+op://a/b/long": "p@ss'two-longer"}
+
+	// Both values survive; the longest pattern comes first, whichever key the decoder yields first.
+	for range 100 {
+		_, err := Redact([]byte(render), values)
+
+		if redaction, ok := errors.AsType[*RedactionError](err); !ok || redaction.Ref != "ref+op://a/b/long" {
+			t.Fatalf("Redact error = %v, want a *RedactionError for ref+op://a/b/long", err)
+		}
+	}
+}
+
 func FuzzRedact(f *testing.F) {
 	f.Add([]byte("k: abc\n"), "abc")
 	f.Add([]byte("a: RED\nb: E\nc: 0c9f\n"), "E")
@@ -188,9 +234,16 @@ func FuzzRedact(f *testing.F) {
 	f.Add([]byte("k: Pj4+Pz8/eA==\nu: Pj4-Pz8_eA\nh: 3e3e3e3f3f3f78\n"), ">>>???x")
 	f.Add([]byte("a: [unclosed\n"), "secret-value")
 	f.Add([]byte(Marker+": "+Marker+"\n"), "RED")
+	f.Add([]byte("k: s3cr3t-one"+Marker+"s3cr3t-two\n"), "s3cr3t-one"+Marker+"s3cr3t-two")
 
 	f.Fuzz(func(t *testing.T, render []byte, value string) {
 		got, err := Redact(render, map[string]string{refPassword: value})
+
+		// A value that holds the marker cannot be told from a marker once replaced, so it is always refused.
+		if strings.Contains(value, Marker) && err == nil {
+			t.Fatalf("Redact(%q, %q) = %q, want an error: the value holds the marker", render, value, got)
+		}
+
 		if err != nil || value == "" {
 			return
 		}

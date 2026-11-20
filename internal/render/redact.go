@@ -58,6 +58,15 @@ type pattern struct {
 // mapping key that still holds a pattern outside a Marker is a *RedactionError.
 func Redact(render []byte, values map[string]string) ([]byte, error) {
 	patterns := patternsOf(values)
+
+	// A pattern that holds Marker spans the edge of a piece the search is cut into, so it would never match and the value
+	// would pass in clear: such a value is refused whole.
+	for _, p := range patterns {
+		if strings.Contains(p.text, Marker) {
+			return nil, &RedactionError{Ref: p.ref}
+		}
+	}
+
 	text := string(render)
 
 	for _, p := range patterns {
@@ -80,7 +89,7 @@ func Redact(render []byte, values map[string]string) ([]byte, error) {
 			return nil, fmt.Errorf("%w: the output does not decode as YAML", ErrRedaction)
 		}
 
-		if ref, found := survivor(doc, patterns); found {
+		if ref, found := survivor(appendDecoded(nil, doc), patterns); found {
 			return nil, &RedactionError{Ref: ref}
 		}
 	}
@@ -163,43 +172,42 @@ func holdsOutsideMarker(s, pat string) bool {
 	return false
 }
 
-// survivor returns the reference of the first pattern that a string scalar or mapping key below v still holds outside
-// a Marker, through both kinds of mapping YAML decodes to.
-func survivor(v any, patterns []pattern) (ref string, found bool) {
-	switch v := v.(type) {
-	case string:
-		for _, p := range patterns {
-			if holdsOutsideMarker(v, p.text) {
+// survivor returns the reference of the first pattern, in the order of patterns, that one of the decoded strings still
+// holds outside a Marker. Going pattern by pattern, not string by string, makes the answer the same on every run.
+func survivor(decoded []string, patterns []pattern) (ref string, found bool) {
+	for _, p := range patterns {
+		for _, s := range decoded {
+			if holdsOutsideMarker(s, p.text) {
 				return p.ref, true
-			}
-		}
-	case []any:
-		for _, item := range v {
-			if ref, found := survivor(item, patterns); found {
-				return ref, true
-			}
-		}
-	case map[string]any:
-		for key, item := range v {
-			if ref, found := survivor(key, patterns); found {
-				return ref, true
-			}
-
-			if ref, found := survivor(item, patterns); found {
-				return ref, true
-			}
-		}
-	case map[any]any:
-		for key, item := range v {
-			if ref, found := survivor(key, patterns); found {
-				return ref, true
-			}
-
-			if ref, found := survivor(item, patterns); found {
-				return ref, true
 			}
 		}
 	}
 
 	return "", false
+}
+
+// appendDecoded appends every string scalar and mapping key below v, through both kinds of mapping YAML decodes to.
+func appendDecoded(out []string, v any) []string {
+	switch v := v.(type) {
+	case string:
+		out = append(out, v)
+	case []any:
+		for _, item := range v {
+			out = appendDecoded(out, item)
+		}
+	case map[string]any:
+		out = appendMap(out, v)
+	case map[any]any:
+		out = appendMap(out, v)
+	}
+
+	return out
+}
+
+func appendMap[K comparable](out []string, m map[K]any) []string {
+	for key, item := range m {
+		out = appendDecoded(appendDecoded(out, key), item)
+	}
+
+	return out
 }
