@@ -3,13 +3,10 @@ package toolcache
 import (
 	"cmp"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
-	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -20,7 +17,6 @@ import (
 	"time"
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
 
@@ -158,6 +154,8 @@ type Fetcher struct {
 	onError  func(context.Context, error)
 	bytes    metric.Int64Counter
 	failures metric.Int64Counter
+	// sources are the kinds of row the workers claim.
+	sources []source
 
 	// Test hooks.
 	poll   time.Duration
@@ -203,6 +201,7 @@ func NewFetcher(cfg FetcherConfig, opts ...FetcherOption) (*Fetcher, error) {
 		idle:    IdleTimeout,
 		statfs:  diskFree,
 	}
+	f.sources = []source{utilitySource{f: f}}
 	for _, opt := range opts {
 		opt(f)
 	}
@@ -266,27 +265,6 @@ func (w *worker) run(ctx context.Context) {
 	}
 }
 
-// outcome is how one claimed row ended: ready, given back, or a failure to record.
-type outcome struct {
-	ready bool
-	// deferred is a row to give back to wanted, with no attempt and no failure,
-	// because the spool volume has no room for it beside the downloads in flight.
-	deferred bool
-	fail     fleet.FetchFailure
-	// ev is the event to emit once the outcome is stored, less To and Attempts.
-	ev FetchEvent
-}
-
-// heldOutcome is an outcome the database refused. retried is set once the
-// next poll has tried it again.
-type heldOutcome struct {
-	outcome
-
-	retried bool
-	// cause is the latest error that kept the outcome from being stored.
-	cause error
-}
-
 // runOnce settles one row. It reports false when nothing was claimed, and true
 // when a row was: with a nil error when its outcome (ready or a recorded
 // failure) was stored, with errSpaceBusy when the row was given back to wanted
@@ -299,20 +277,19 @@ func (w *worker) runOnce(ctx context.Context) (bool, error) {
 		return w.retryHeld(ctx)
 	}
 	f := w.f
-	row, ok, err := f.cfg.Repo.ClaimFetch(ctx, f.now())
+	c, ok, err := w.claim(ctx)
 	if err != nil {
 		return false, err
 	}
 	if !ok {
 		return false, nil
 	}
-	f.events(ctx, FetchEvent{Key: row.Key(), Pin: row.Pin, From: claimedFrom(row), To: fleet.CacheFetching, Attempts: row.Attempts})
+	f.events(ctx, c.event)
 
 	start := time.Now()
-	job := &fetchJob{f: f, row: row}
-	defer job.close(ctx)
-	err = job.run(ctx)
-	o := outcome{ev: FetchEvent{Key: row.Key(), Pin: row.Pin, From: fleet.CacheFetching, Bytes: job.downloaded}}
+	defer c.run.close(ctx)
+	err = c.run.run(ctx)
+	o := outcome{ev: FetchEvent{Key: c.event.Key, Pin: c.event.Pin, From: fleet.CacheFetching, Bytes: c.run.received()}}
 	switch {
 	case err == nil:
 		o.ready = true
@@ -322,23 +299,23 @@ func (w *worker) runOnce(ctx context.Context) (bool, error) {
 		// Not a failure: no attempt, no backoff, no class and no failures count. The
 		// event says why the row went back, as the held-reset event does.
 		o.deferred = true
-		o.ev.Attempts = row.Attempts
+		o.ev.Attempts = c.event.Attempts
 		o.ev.Err = errors.New(fleet.PrintableText(err.Error()))
 	default:
 		o.ev.Class = classOf(err)
-		cause := fleet.PrintableText(err.Error())
-		o.ev.Err = errors.New(cause)
-		o.fail = fleet.FetchFailure{Key: row.Key(), Pin: row.Pin, Cause: cause, Integrity: o.ev.Class == classIntegrity, At: f.now()}
-		f.failures.Add(ctx, 1, metric.WithAttributes(attribute.String("class", o.ev.Class)))
-		if o.fail.Integrity {
-			job.discard(ctx)
+		o.cause = fleet.PrintableText(err.Error())
+		o.ev.Err = errors.New(o.cause)
+		o.integrity, o.at = o.ev.Class == classIntegrity, f.now()
+		c.row.countFailure(ctx, o.ev.Class)
+		if o.integrity {
+			c.run.discard(ctx)
 		}
 	}
 	o.ev.Duration = time.Since(start)
 
-	recordErr := f.record(ctx, o)
+	recordErr := c.row.record(ctx, o)
 	if o.ready {
-		job.discard(ctx)
+		c.run.discard(ctx)
 	}
 	if recordErr == nil {
 		if o.deferred {
@@ -349,55 +326,22 @@ func (w *worker) runOnce(ctx context.Context) (bool, error) {
 	if ctx.Err() != nil {
 		return true, ctx.Err()
 	}
-	w.held = &heldOutcome{outcome: o, cause: recordErr}
+	w.held = &heldOutcome{outcome: o, name: c.name, row: c.row, cause: recordErr}
 	return true, recordErr
 }
 
-// claimedFrom is the state a claimed row was in. ClaimFetch returns it already
-// fetching. A failure sets next_attempt_at and every way back to wanted clears
-// it except ResetFetching and ResetFetchingRow, so a set value means failed; a
-// row either gave back after a failed claim is reported as failed too.
-func claimedFrom(row fleet.CacheRow) fleet.CacheState {
-	if row.NextAttemptAt.IsZero() {
-		return fleet.CacheWanted
-	}
-	return fleet.CacheFailed
-}
-
-// record stores o and emits its event. A failure that could not be stored
-// carries its cause along, for the error handler.
-func (f *Fetcher) record(ctx context.Context, o outcome) error {
-	if o.deferred {
-		moved, err := f.cfg.Repo.ResetFetchingRow(ctx, o.ev.Key, o.ev.Pin, f.now())
-		if err != nil {
-			return err
+// claim asks every source for a row of each class in the claim order and
+// returns the first row claimed.
+func (w *worker) claim(ctx context.Context) (claimed, bool, error) {
+	at := w.f.now()
+	for _, class := range []claimClass{claimUrgent, claimAssigned, claimRest, claimOther} {
+		for _, s := range w.f.sources {
+			if c, ok, err := s.claim(ctx, class, at); err != nil || ok {
+				return c, ok, err
+			}
 		}
-		if moved {
-			o.ev.To = fleet.CacheWanted
-			f.events(ctx, o.ev)
-		}
-		return nil
 	}
-	if o.ready {
-		moved, err := f.cfg.Repo.MarkReady(ctx, o.ev.Key, o.ev.Pin, f.now())
-		if err != nil {
-			return err
-		}
-		if moved {
-			o.ev.To = fleet.CacheReady
-			f.events(ctx, o.ev)
-		}
-		return nil
-	}
-	row, err := f.cfg.Repo.RecordFetchFailure(ctx, o.fail)
-	if err != nil {
-		return fmt.Errorf("%w (the fetch failed: %s)", err, o.fail.Cause)
-	}
-	if row.Pin == o.ev.Pin && (row.State == fleet.CacheFailed || row.State == fleet.CacheBroken) {
-		o.ev.To, o.ev.Attempts = row.State, row.Attempts
-		f.events(ctx, o.ev)
-	}
-	return nil
+	return claimed{}, false, nil
 }
 
 // retryHeld tries the held outcome once more. When that fails too, or when an
@@ -408,7 +352,7 @@ func (w *worker) retryHeld(ctx context.Context) (bool, error) {
 	f, h := w.f, w.held
 	firstRetry := !h.retried
 	if firstRetry {
-		err := f.record(ctx, h.outcome)
+		err := h.row.record(ctx, h.outcome)
 		switch {
 		case err == nil:
 			w.held = nil
@@ -420,7 +364,7 @@ func (w *worker) retryHeld(ctx context.Context) (bool, error) {
 	}
 	// The row may have been repinned or settled since it was claimed; the reset
 	// then moves nothing, and no event says it did.
-	moved, err := f.cfg.Repo.ResetFetchingRow(ctx, h.ev.Key, h.ev.Pin, f.now())
+	moved, err := h.row.giveBack(ctx, f.now())
 	if err != nil {
 		if ctx.Err() != nil {
 			return true, ctx.Err()
@@ -435,10 +379,11 @@ func (w *worker) retryHeld(ctx context.Context) (bool, error) {
 	if !firstRetry {
 		return true, nil // the error was returned when the retry failed
 	}
-	return true, fmt.Errorf("the outcome of %s/%s could not be stored twice and the row went back to wanted: %w", h.ev.Key.Entry, h.ev.Key.Arch, h.cause)
+	return true, fmt.Errorf("the outcome of %s could not be stored twice and the row went back to wanted: %w", h.name, h.cause)
 }
 
-// fetchJob is the work on one claimed row.
+// fetchJob is the work on one claimed utility row: its run (fetchRun) here,
+// its settler in utility_source.go, and its downloads through dl.
 type fetchJob struct {
 	f     *Fetcher
 	row   fleet.CacheRow
@@ -452,18 +397,23 @@ type fetchJob struct {
 	reserved uint64
 }
 
+// dl is the job's downloader, over the job's own root, byte count and reservation.
+func (j *fetchJob) dl() *downloader {
+	return &downloader{f: j.f, root: j.root, downloaded: &j.downloaded, reserved: &j.reserved, bytes: j.f.bytes, progress: j.progress}
+}
+
+// object is object n of the pin, spooled under SpoolName(pin, n).
+func (j *fetchJob) object(n int) object {
+	o := j.entry.Pin.Objects[n]
+	return object{URL: o.URL, SpoolName: SpoolName(j.row.Pin, n), Size: o.Size, SHA256: o.SHA256, Index: n}
+}
+
 // close releases what the job holds: its free space reservation, whichever way
 // the job ended, and its handle on the spool directory.
-func (j *fetchJob) close(ctx context.Context) {
-	j.f.spaceMu.Lock()
-	j.f.reserved -= j.reserved
-	j.f.spaceMu.Unlock()
-	if j.root != nil {
-		if err := j.root.Close(); err != nil {
-			j.f.onError(ctx, fmt.Errorf("close the spool dir: %w", err))
-		}
-	}
-}
+func (j *fetchJob) close(ctx context.Context) { j.dl().close(ctx) }
+
+// received is how many bytes this run received.
+func (j *fetchJob) received() int64 { return j.downloaded }
 
 // run takes the row to the point where its files are in the store, tagged and
 // whole. It returns ctx's error, wrapped, when ctx ends it.
@@ -493,7 +443,7 @@ func (j *fetchJob) run(ctx context.Context) error {
 		if err := j.download(ctx, n); err != nil {
 			return err
 		}
-		if err := j.verify(ctx, n); err != nil {
+		if err := j.dl().verify(ctx, j.object(n)); err != nil {
 			return err
 		}
 		l, err := j.extract(ctx, n)
@@ -517,15 +467,11 @@ func (j *fetchJob) discard(ctx context.Context) {
 	if j.root == nil {
 		return
 	}
-	var errs []error
+	objects := make([]object, 0, len(j.entry.Pin.Objects))
 	for n := range j.entry.Pin.Objects {
-		for _, name := range []string{SpoolName(j.row.Pin, n), ETagName(j.row.Pin, n), ETagName(j.row.Pin, n) + ".tmp"} {
-			if err := j.root.Remove(name); err != nil && !errors.Is(err, fs.ErrNotExist) {
-				errs = append(errs, err)
-			}
-		}
+		objects = append(objects, j.object(n))
 	}
-	if err := errors.Join(errs...); err != nil {
+	if err := j.dl().discard(ctx, objects); err != nil {
 		j.f.onError(ctx, fmt.Errorf("remove the spool of %s/%s: %w", j.row.Entry, j.row.Arch, err))
 	}
 }
@@ -541,238 +487,18 @@ func (j *fetchJob) progress(ctx context.Context, done, total int64) {
 
 // download brings object n of the pin into its spool file in full.
 func (j *fetchJob) download(ctx context.Context, n int) error {
-	obj := j.entry.Pin.Objects[n]
-	have, etag, err := j.resumePoint(n, obj.Size)
-	if err != nil {
-		return err
-	}
-	if have == obj.Size {
-		// Whole already, so nothing is downloaded, but its extraction still writes
-		// about its size into the store.
-		if err := j.reserveSpace(obj.Size, 1); err != nil {
-			return err
-		}
-		j.progress(ctx, obj.Size, obj.Size)
-		return nil
-	}
-	if err := j.reserveSpace(obj.Size, 2); err != nil {
-		return err
-	}
-	return j.transfer(ctx, n, have, etag)
+	return j.dl().fetch(ctx, j.object(n))
 }
 
-// resumePoint says how much of object n is already in its spool and under
-// which strong ETag. A spool longer than the pin, or one with no strong ETag
-// to resume under, is emptied.
-func (j *fetchJob) resumePoint(n int, size int64) (have int64, etag string, err error) {
-	spool := SpoolName(j.row.Pin, n)
-	fi, err := j.root.Stat(spool)
-	if errors.Is(err, fs.ErrNotExist) {
-		return 0, "", nil
-	}
-	if err != nil {
-		return 0, "", fmt.Errorf("stat the spool: %w", err)
-	}
-	have = fi.Size()
-	if have == size || have == 0 {
-		return have, "", nil
-	}
-	if have < size {
-		raw, err := j.root.ReadFile(ETagName(j.row.Pin, n))
-		if err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return 0, "", fmt.Errorf("read the ETag sidecar: %w", err)
-		}
-		if err == nil && strongETag(string(raw)) {
-			return have, string(raw), nil
-		}
-	}
-	return 0, "", j.reset(n)
-}
-
-// reset empties object n's spool and removes its sidecar.
-func (j *fetchJob) reset(n int) error {
-	f, err := j.root.OpenFile(SpoolName(j.row.Pin, n), os.O_WRONLY|os.O_TRUNC, spoolFileMode)
-	switch {
-	case errors.Is(err, fs.ErrNotExist):
-	case err != nil:
-		return fmt.Errorf("empty the spool: %w", err)
-	default:
-		if err := f.Close(); err != nil {
-			return fmt.Errorf("empty the spool: %w", err)
-		}
-	}
-	return j.dropETag(n)
-}
-
-func (j *fetchJob) dropETag(n int) error {
-	if err := j.root.Remove(ETagName(j.row.Pin, n)); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("remove the ETag sidecar: %w", err)
-	}
-	return nil
-}
-
-// keepETag stores etag as object n's sidecar when it is strong, atomically,
-// and removes the sidecar otherwise.
-func (j *fetchJob) keepETag(n int, etag string) error {
-	if !strongETag(etag) {
-		return j.dropETag(n)
-	}
-	name := ETagName(j.row.Pin, n)
-	tmp := name + ".tmp"
-	if err := j.root.WriteFile(tmp, []byte(etag), spoolFileMode); err != nil {
-		return errors.Join(fmt.Errorf("write the ETag sidecar: %w", err), j.root.Remove(tmp))
-	}
-	if err := j.root.Rename(tmp, name); err != nil {
-		return errors.Join(fmt.Errorf("replace the ETag sidecar: %w", err), j.root.Remove(tmp))
-	}
-	return nil
-}
-
-// reserveSpace refuses a download the spool volume has no room for, and
-// otherwise holds the room for the job until close. The job's need is copies
-// times the object (2: the spool and its extracted copy; 1 when the spool is
-// already whole and only the extraction is left), and that is all it holds.
-// spaceReserve is the margin the volume keeps whatever runs on it, so it is
-// counted once, not once per download. The need must fit in what is free less
-// the margin and less what the other downloads in flight hold, because their
-// bytes are not all on the disk yet.
-//
-// A need that does not fit even alone, that is, without the others' holds, is
-// an ordinary error: no wait would change it. One that fits alone but not beside
-// the others is errSpaceBusy, which the worker does not count as a failure.
-// A job that reserved for an earlier object swaps that reservation for this
-// one: those bytes are on the disk by now.
+// reserveSpace holds copies times size of the spool volume for the job, as
+// downloader.reserveSpace does.
 func (j *fetchJob) reserveSpace(size int64, copies uint64) error {
-	f := j.f
-	// Past this, the need below does not fit in a uint64; no volume holds it.
-	if uint64(max(size, 0)) > (math.MaxUint64-spaceReserve)/copies {
-		return fmt.Errorf("free space on the spool volume cannot hold a %d byte object", size)
-	}
-	need := copies * uint64(max(size, 0))
-
-	// ponytail: statfs runs under the lock so check and reserve are one step;
-	// a slow volume delays only other reservations, and a measured delay can move it out.
-	f.spaceMu.Lock()
-	defer f.spaceMu.Unlock()
-	free, err := f.statfs(f.cfg.SpoolDir)
-	if err != nil {
-		return fmt.Errorf("free space on the spool volume: %w", err)
-	}
-	if free < need+spaceReserve {
-		return fmt.Errorf("free space on the spool volume is %d bytes, a %d byte object needs %d and the %d byte margin", free, size, need, spaceReserve)
-	}
-	others := f.reserved - j.reserved
-	if free-min(free, others) < need+spaceReserve {
-		return fmt.Errorf("%w: free space is %d bytes with %d reserved by other downloads, a %d byte object needs %d and the %d byte margin",
-			errSpaceBusy, free, others, size, need, spaceReserve)
-	}
-	f.reserved, j.reserved = others+need, need
-	return nil
+	return j.dl().reserveSpace(size, copies)
 }
 
-// transfer requests object n, from byte have under etag when etag is set, and
-// writes the body into the spool.
-func (j *fetchJob) transfer(ctx context.Context, n int, have int64, etag string) (err error) {
-	obj := j.entry.Pin.Objects[n]
-	reqCtx, cancel := context.WithCancelCause(ctx)
-	defer cancel(nil)
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, obj.URL, http.NoBody)
-	if err != nil {
-		return fmt.Errorf("build the request for object %d: %w", n, RedactURLError(err))
-	}
-	if etag != "" {
-		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", have))
-		req.Header.Set("If-Range", etag)
-	}
-	resp, err := j.f.cfg.Client.Do(req)
-	if err != nil {
-		return fmt.Errorf("get object %d: %w", n, RedactURLError(err))
-	}
-	defer func() { err = errors.Join(err, resp.Body.Close()) }()
-
-	offset, err := j.accept(resp, n, have)
-	if err != nil {
-		return err
-	}
-	body := newIdleReader(resp.Body, j.f.idle, cancel)
-	defer body.Stop()
-	// The floor counts only what this response sends, never the offset's bytes
-	// that an earlier attempt left in the spool.
-	return j.write(ctx, newFloorReader(body, j.f.now), n, offset)
-}
-
-// accept checks the response to object n's request against the pin and returns
-// the spool offset its body continues at. A 206 is checked in this order: the
-// Content-Range start, then its total, then its end, then the Content-Length.
-func (j *fetchJob) accept(resp *http.Response, n int, have int64) (int64, error) {
-	size := j.entry.Pin.Objects[n].Size
-	switch resp.StatusCode {
-	case http.StatusOK:
-		if resp.ContentLength >= 0 && resp.ContentLength != size {
-			return 0, integrityf("the upstream sent %d bytes for an object pinned at %d", resp.ContentLength, size)
-		}
-		return 0, j.keepETag(n, resp.Header.Get("ETag"))
-	case http.StatusPartialContent:
-		header := resp.Header.Get("Content-Range")
-		start, end, total, err := parseContentRange(header)
-		if err != nil || start != have {
-			return 0, errors.Join(fmt.Errorf("a 206 with Content-Range %q does not continue at byte %d", header, have), err, j.reset(n))
-		}
-		if total != size {
-			return 0, integrityf("Content-Range %q says the object is %d bytes, pinned at %d", header, total, size)
-		}
-		// Only the total is a fact about the object (minor-16): a range that
-		// stops short is a misbehaving server, which a retry may not meet. It is
-		// checked before the Content-Length, which a short range also disagrees with.
-		if end != size-1 {
-			return 0, fmt.Errorf("a 206 with Content-Range %q ends at byte %d, not at the last byte %d", header, end, size-1)
-		}
-		if resp.ContentLength >= 0 && resp.ContentLength != size-have {
-			return 0, integrityf("the upstream sent %d bytes for the %d the range asked for", resp.ContentLength, size-have)
-		}
-		return have, nil
-	default:
-		return 0, fmt.Errorf("the upstream answered %q", resp.Status)
-	}
-}
-
-// write copies body into object n's spool from offset, and records the
-// progress. Bytes past the pinned size are an integrity failure; a body that
-// ends short is not, and its spool is kept.
-func (j *fetchJob) write(ctx context.Context, body io.Reader, n int, offset int64) (err error) {
-	obj := j.entry.Pin.Objects[n]
-	flags := os.O_WRONLY | os.O_CREATE | os.O_APPEND
-	if offset == 0 {
-		flags = os.O_WRONLY | os.O_CREATE | os.O_TRUNC
-	}
-	file, err := j.root.OpenFile(SpoolName(j.row.Pin, n), flags, spoolFileMode)
-	if err != nil {
-		return fmt.Errorf("open the spool: %w", err)
-	}
-	defer func() { err = errors.Join(err, file.Close()) }()
-
-	want := obj.Size - offset
-	w := &spoolWriter{file: file, last: time.Now()}
-	w.tick = func() { j.progress(ctx, offset+w.n, obj.Size) }
-	// One byte past the end is enough to see an oversize body.
-	copied, err := io.Copy(w, io.LimitReader(body, want+1))
-	j.downloaded += w.n
-	j.f.bytes.Add(ctx, w.n)
-	// The floor judges a Read after its bytes were returned, so it can cut the Read
-	// that delivered the object's last byte. The spool is then whole: no failure.
-	if copied == want && errors.Is(err, errTooSlow) {
-		err = nil
-	}
-	switch {
-	case err != nil:
-		return fmt.Errorf("copy object %d: %w", n, err)
-	case copied > want:
-		return integrityf("the upstream sent more than the pinned %d bytes", obj.Size)
-	case copied < want:
-		return fmt.Errorf("the body of object %d ended at byte %d of %d", n, offset+copied, obj.Size)
-	}
-	j.progress(ctx, obj.Size, obj.Size)
-	return nil
+// write copies body into object n's spool from offset, as downloader.write does.
+func (j *fetchJob) write(ctx context.Context, body io.Reader, n int, offset int64) error {
+	return j.dl().write(ctx, body, j.object(n), offset)
 }
 
 // spoolWriter writes to a spool file and calls tick at most every
@@ -794,36 +520,13 @@ func (s *spoolWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// verify checks that object n's whole spool is the pinned size and sha256.
-func (j *fetchJob) verify(ctx context.Context, n int) (err error) {
-	obj := j.entry.Pin.Objects[n]
-	f, err := j.root.Open(SpoolName(j.row.Pin, n))
-	if err != nil {
-		return fmt.Errorf("open the spool: %w", err)
-	}
-	defer func() { err = errors.Join(err, f.Close()) }()
-
-	h := sha256.New()
-	size, err := io.Copy(h, ctxReader{r: f, err: ctx.Err})
-	if err != nil {
-		return fmt.Errorf("hash the spool: %w", err)
-	}
-	if size != obj.Size {
-		return integrityf("the spool holds %d bytes, the pin says %d", size, obj.Size)
-	}
-	if got := hex.EncodeToString(h.Sum(nil)); got != obj.SHA256 {
-		return integrityf("the object's sha256 is %s, the pin says %s", got, obj.SHA256)
-	}
-	return nil
-}
-
 // extract pushes each pinned file of object n from its spool into the store
 // and returns their layers. A file that is not what the pin says, or a member
 // the extractor refuses, is an integrity failure; a failing disk is not.
 func (j *fetchJob) extract(ctx context.Context, n int) (layers []ocispec.Descriptor, err error) {
 	pin := j.entry.Pin.Objects[n]
 	container := j.entry.Objects[n].Container
-	f, err := j.root.Open(SpoolName(j.row.Pin, n))
+	f, err := j.dl().open(j.object(n))
 	if err != nil {
 		return nil, fmt.Errorf("open the spool: %w", err)
 	}
