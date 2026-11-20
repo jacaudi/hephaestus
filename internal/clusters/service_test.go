@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -796,5 +797,107 @@ func TestService_CacheDropsReplacedPairs(t *testing.T) {
 	}
 	if !cached(s, second) {
 		t.Error("the pending pair is not cached")
+	}
+}
+
+// literalFiles is svcFiles with every reference replaced by its value, so the tree holds no reference at all.
+func literalFiles(t *testing.T) map[string]string {
+	t.Helper()
+	files := svcFiles(t)
+	values := svcValues(t)
+	refs := slices.SortedFunc(maps.Keys(values), func(a, b string) int { return len(b) - len(a) })
+	pairs := make([]string, 0, 2*len(refs))
+	for _, ref := range refs {
+		pairs = append(pairs, ref, strconv.Quote(values[ref]))
+	}
+	files["lab/secrets.yaml"] = strings.NewReplacer(pairs...).Replace(files["lab/secrets.yaml"])
+	delete(files, "lab/all/base.yaml")
+	if strings.Contains(files["lab/secrets.yaml"], "ref+") {
+		t.Fatal("the literal bundle still holds a reference")
+	}
+	return files
+}
+
+func TestService_NoReferencesSkipsResolver(t *testing.T) {
+	srv := gittest.NewServer(t, gittest.Options{})
+	h := newSvcHarness(t, srv, "")
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	defer srv.Close()
+	commit := srv.Commit(t, literalFiles(t), nil)
+	s := h.service(h.fake)
+
+	h.poll(s)
+
+	c := h.cluster()
+	if c.PendingPairID == "" {
+		t.Fatalf("no pending pair for a tree without references; reported %q", h.reported())
+	}
+	if got := h.pair(c.PendingPairID).TreeHash; got != srv.Tree(t, commit, gitLab) {
+		t.Errorf("pending pair tree = %s, want %s", got, srv.Tree(t, commit, gitLab))
+	}
+	if calls := h.fake.seen(); len(calls) != 0 {
+		t.Errorf("resolver calls = %q for a tree without references, want none", calls)
+	}
+}
+
+func TestService_SetWithFailingCredentialStoresNothing(t *testing.T) {
+	srv := gittest.NewServer(t, gittest.Options{})
+	h := newSvcHarness(t, srv, "")
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	defer srv.Close()
+	srv.Commit(t, svcFiles(t), nil)
+	files := svcFiles(t)
+	files["lab/notes.txt"] = "the new source's tree"
+	srv.CommitTo(t, "mirror", files, nil)
+	h.fake.set(func(f *fakeResolver) { f.fail[svcCredRef] = svcKind })
+	s := h.service(h.fake)
+	h.poll(s)
+	if h.cluster().PendingPairID == "" {
+		t.Fatalf("no pending pair from the first source; reported %q", h.reported())
+	}
+
+	mirror, user, ref := srv.URL("mirror"), svcUser, svcCredRef
+	set := mustSet(t, h.repo, SetRequest{Name: labName, RepoURL: &mirror, Username: &user, CredentialRef: &ref, At: gitT0})
+	h.poll(s)
+
+	c := h.cluster()
+	if c.PendingPairID != "" || c.LastHeadTree != "" || c.FailedTree != "" {
+		t.Errorf("at revision %d: pending = %q, last head = %q, failed = %q; want nothing stored before the new source is fetched",
+			set.Revision, c.PendingPairID, c.LastHeadTree, c.FailedTree)
+	}
+	wantNoMark(t, c)
+	if calls := h.fake.seen(); len(calls) != 2 || !slices.Equal(calls[1], []string{svcCredRef}) {
+		t.Errorf("resolver calls = %q; want the first head tree, then the credential only", calls)
+	}
+}
+
+func TestService_UnreleasedMarkRetried(t *testing.T) {
+	srv := gittest.NewServer(t, gittest.Options{})
+	h := newSvcHarness(t, srv, "")
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	defer srv.Close()
+	srv.Commit(t, svcFiles(t), nil)
+	other := mustImport(t, h.repo, ImportRequest{Name: labName + "2", RepoURL: srv.URL(gittest.DefaultRepo), Ref: gitBranch, Subpath: gitLab, At: gitT0})
+	// Cluster lab's mark cannot be cleared: its store fails, and so does the release after it.
+	execRaw(t, h.d, "CREATE TRIGGER keep_mark BEFORE UPDATE ON clusters WHEN OLD.id = '"+h.id+
+		"' AND OLD.processing_tree IS NOT NULL AND NEW.processing_tree IS NULL BEGIN SELECT RAISE(ABORT, 'injected'); END")
+	s := h.service(h.fake)
+
+	h.poll(s)
+
+	if c := h.cluster(); c.ProcessingTree == "" || c.PendingPairID != "" {
+		t.Fatalf("lab: mark = %q, pending = %q; want the mark kept and no pair", c.ProcessingTree, c.PendingPairID)
+	}
+	if c := mustGet(t, h.repo, other.Name); c.PendingPairID == "" {
+		t.Fatalf("%s: no pending pair; reported %q", other.Name, h.reported())
+	}
+
+	execRaw(t, h.d, "DROP TRIGGER keep_mark")
+	h.poll(s)
+
+	c := h.cluster()
+	wantNoMark(t, c)
+	if c.PendingPairID == "" {
+		t.Errorf("lab: no pending pair once its mark could be cleared; reported %q", h.reported())
 	}
 }
