@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io/fs"
 	"slices"
+	"strings"
 	"testing"
 	"testing/fstest"
 )
@@ -198,16 +199,19 @@ func TestCollectPatchFiles_SameTargetTwice(t *testing.T) {
 
 func TestCollectPatchFiles_SymlinkLoop(t *testing.T) {
 	tests := []struct {
-		name string
-		fsys fs.FS
+		name     string
+		fsys     fs.FS
+		wantName string
 	}{
 		{
-			name: "link to its own directory",
-			fsys: fstest.MapFS{"all/a.yaml": file("a: 1\n"), "all/loop": link(".")},
+			name:     "link to its own directory",
+			fsys:     fstest.MapFS{"all/a.yaml": file("a: 1\n"), "all/loop": link(".")},
+			wantName: `"all/loop"`,
 		},
 		{
-			name: "link to an ancestor",
-			fsys: fstest.MapFS{"all/sub/a.yaml": file("a: 1\n"), "all/sub/up": link("..")},
+			name:     "link to an ancestor",
+			fsys:     fstest.MapFS{"all/sub/a.yaml": file("a: 1\n"), "all/sub/up": link("..")},
+			wantName: `"all/sub/up"`,
 		},
 	}
 
@@ -216,6 +220,10 @@ func TestCollectPatchFiles_SymlinkLoop(t *testing.T) {
 			_, err := collectPatchFiles(tt.fsys, "all")
 			if !errors.Is(err, ErrSymlinkLoop) {
 				t.Errorf("collectPatchFiles error = %v, want %v", err, ErrSymlinkLoop)
+			}
+
+			if err != nil && !strings.Contains(err.Error(), tt.wantName) {
+				t.Errorf("collectPatchFiles error = %v, want it to name the link %s", err, tt.wantName)
 			}
 		})
 	}

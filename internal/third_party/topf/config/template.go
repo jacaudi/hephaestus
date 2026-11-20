@@ -4,8 +4,9 @@ package config
 
 import "net/netip"
 
-// TemplateData is what a patch template executes against. It is plain data with no methods, so a template reaches
-// nothing but its fields; PatchesDir, the file system and the reference values of a PatchContext are not among them.
+// TemplateData is what a patch template executes against. TemplateData has no methods and TemplateNode has Endpoint only
+// (a template also reaches the methods of the netip.Addr in Node.IP), so a template reaches nothing of a PatchContext:
+// not PatchesDir, the file system, the reference values or Load.
 // Field names equal PatchContext's, so a Topf template renders the same text.
 type TemplateData struct {
 	ClusterName       string

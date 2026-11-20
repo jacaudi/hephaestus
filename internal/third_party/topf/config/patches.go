@@ -107,19 +107,26 @@ type patchWalker struct {
 //     that leaves the tree is ErrEscapes;
 //   - a linked directory is walked under its link name, where Topf walks it under its real path, and a directory
 //     already on the walk chain is ErrSymlinkLoop, where Topf recurses until the path is too long;
-//   - only a missing folder is empty: Topf's os.IsNotExist on the whole walk also emptied a folder that held a
-//     dangling symlink, silently dropping every patch in it, and here that is an error.
+//   - only a folder missing as a plain path element is empty: Topf's os.IsNotExist on the whole walk also emptied a
+//     folder that held a dangling symlink, silently dropping every patch in it, and here a symlink on the way whose
+//     target does not exist is an error (EvalSymlinks marks it errLinkTarget).
 
 // collectPatchFiles returns the patch files below folder, in walk order, the name of a link being the link's own path.
 // A folder that does not exist has none.
 func collectPatchFiles(fsys fs.FS, folder string) ([]string, error) {
-	if _, err := fs.Lstat(fsys, folder); errors.Is(err, fs.ErrNotExist) {
+	realFolder, err := EvalSymlinks(fsys, folder)
+	if errors.Is(err, fs.ErrNotExist) && !errors.Is(err, errLinkTarget) {
+		// A plain path element is missing: the folder does not exist. (A link whose target is missing is an error.)
 		return nil, nil
 	}
 
-	realFolder, err := EvalSymlinks(fsys, folder)
 	if err != nil {
 		return nil, err
+	}
+
+	// A file system without links is not checked by EvalSymlinks.
+	if _, err := fs.Stat(fsys, realFolder); errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
 	}
 
 	w := &patchWalker{fsys: fsys, pattern: regexp.MustCompile(`.*\.ya?ml(\.tpl)?`)}

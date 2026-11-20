@@ -16,6 +16,10 @@ var ErrEscapes = errors.New("topf: path leaves the definition tree")
 // ErrSymlinkLoop reports symlinks that form a loop.
 var ErrSymlinkLoop = errors.New("topf: symlinks form a loop")
 
+// errLinkTarget marks an EvalSymlinks failure whose missing component came from the target of a symlink, not from the
+// name asked for: the link dangles. It always travels with an error matching fs.ErrNotExist.
+var errLinkTarget = errors.New("topf: symlink target does not exist")
+
 // maxSymlinks is how many links EvalSymlinks follows before it reports a loop (the limit of Linux's path walk).
 const maxSymlinks = 40
 
@@ -48,12 +52,18 @@ func EvalSymlinks(fsys fs.FS, name string) (string, error) {
 	var (
 		resolved []string // the real path so far: no link, no "." and no ".."
 		pending  = splitPath(cleaned)
+		fromLink int // how many leading elements of pending came from a symlink target
 		links    int
 	)
 
 	for len(pending) > 0 {
 		part := pending[0]
 		pending = pending[1:]
+		inTarget := fromLink > 0
+
+		if inTarget {
+			fromLink--
+		}
 
 		if part == ".." {
 			if len(resolved) == 0 {
@@ -69,6 +79,10 @@ func EvalSymlinks(fsys fs.FS, name string) (string, error) {
 
 		info, err := fs.Lstat(fsys, next)
 		if err != nil {
+			if inTarget && errors.Is(err, fs.ErrNotExist) {
+				return "", fmt.Errorf("%w: %q: %w", errLinkTarget, name, err)
+			}
+
 			return "", err
 		}
 
@@ -93,7 +107,9 @@ func EvalSymlinks(fsys fs.FS, name string) (string, error) {
 		}
 
 		// A relative target resolves against the directory of the link, which is resolved already.
-		pending = append(splitPath(path.Clean(target)), pending...)
+		targetParts := splitPath(path.Clean(target))
+		pending = append(targetParts, pending...)
+		fromLink += len(targetParts)
 	}
 
 	if len(resolved) == 0 {

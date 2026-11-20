@@ -290,6 +290,9 @@ func FuzzSubstituteReferences(f *testing.F) {
 		"",
 		"---\n---\n",
 		"a: \"ref+op://v/i/t\"\n",
+		`a: "ref\x2Bop://v/i/f"` + "\n",
+		`a: "ref\u002Bop://v/i/z"` + "\n",
+		`a: "ref\+op://v/i/z"` + "\n",
 	} {
 		f.Add([]byte(seed))
 	}
@@ -304,8 +307,8 @@ func FuzzSubstituteReferences(f *testing.F) {
 	f.Fuzz(func(t *testing.T, in []byte) {
 		out, err := SubstituteReferences(in, values)
 
-		// Without the literal prefix no scalar can be a reference.
-		if !bytes.Contains(in, []byte("ref+")) {
+		// A file that holds no reference, whatever its spelling (YAML escapes can spell the prefix), is returned as it came.
+		if !hasReferences(in) {
 			if err != nil {
 				t.Fatalf("SubstituteReferences(%q) error = %v, want nil", in, err)
 			}
@@ -313,11 +316,77 @@ func FuzzSubstituteReferences(f *testing.F) {
 			if !bytes.Equal(out, in) {
 				t.Fatalf("SubstituteReferences(%q) = %q, want the input unchanged", in, out)
 			}
+
+			return
+		}
+
+		// A file that holds one and resolves leaves no reference scalar behind.
+		if err != nil {
+			return
+		}
+
+		dec := yaml.NewDecoder(bytes.NewReader(out))
+		for {
+			var doc yaml.Node
+			if err := dec.Decode(&doc); err != nil {
+				if errors.Is(err, io.EOF) {
+					return
+				}
+
+				t.Fatalf("SubstituteReferences(%q) = %q, which does not decode: %v", in, out, err)
+			}
+
+			if left, ok := referenceLeft(&doc); ok {
+				t.Fatalf("SubstituteReferences(%q) = %q, which still holds %q", in, out, left)
+			}
 		}
 	})
+}
+
+// referenceLeft returns a reference scalar below n, never looking at mapping keys.
+func referenceLeft(n *yaml.Node) (string, bool) {
+	if n.Kind == yaml.ScalarNode && HasReferencePrefix(n.Value) {
+		return n.Value, true
+	}
+
+	for i, child := range n.Content {
+		if n.Kind == yaml.MappingNode && i%2 == 0 {
+			continue
+		}
+
+		if left, ok := referenceLeft(child); ok {
+			return left, true
+		}
+	}
+
+	return "", false
 }
 
 func isMissingRef(err error) bool {
 	_, ok := errors.AsType[*MissingReferenceError](err)
 	return ok
+}
+
+// A double-quoted scalar can spell the prefix with an escape; it is a reference all the same.
+func TestSubstituteReferences_EscapedPrefix(t *testing.T) {
+	in := `a: "ref\x2Bop://v/i/f"` + "\n"
+
+	out, err := SubstituteReferences([]byte(in), map[string]string{"ref+op://v/i/f": "value"})
+	if err != nil {
+		t.Fatalf("SubstituteReferences: %v", err)
+	}
+
+	var got map[string]any
+	if err := yaml.Unmarshal(out, &got); err != nil {
+		t.Fatalf("decode %q: %v", out, err)
+	}
+
+	if got["a"] != "value" {
+		t.Errorf("a decodes as %v, want %q", got["a"], "value")
+	}
+
+	_, err = SubstituteReferences([]byte(in), nil)
+	if !isMissingRef(err) {
+		t.Errorf("SubstituteReferences without a value: error = %v, want a *MissingReferenceError", err)
+	}
 }
