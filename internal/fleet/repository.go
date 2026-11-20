@@ -744,12 +744,16 @@ func recordKnownBoot(ctx context.Context, tx bun.IDB, rec BootRecord) (State, Ma
 	return from, m, nil
 }
 
-// markUUIDJunk marks every machine holding stored's UUID junk and audits the
-// conflict that proved the UUID is shared. It is the one write both /boot and
-// /discover make when they find a UUID reported with another serial or product.
+// markUUIDJunk marks every machine holding stored's UUID junk, revokes their live
+// tickets and audits the conflict that proved the UUID is shared. It is the one
+// write both /boot and /discover make when they find a UUID reported with another
+// serial or product.
 func markUUIDJunk(ctx context.Context, q bun.IDB, stored Machine, seen Identity, at time.Time) error {
 	if _, err := q.NewUpdate().Model((*Machine)(nil)).Set("junk = ?", true).Where("smbios_uuid = ?", stored.UUID).Exec(ctx); err != nil {
 		return fmt.Errorf("mark UUID junk: %w", err)
+	}
+	if err := revokeUUIDTicketsTx(ctx, q, stored.UUID, at); err != nil {
+		return err
 	}
 	audit := auditEventRow{At: at.UTC(), Actor: ActorSystem, Action: actionUUIDConflict, MachineID: stored.ID}
 	return insertAudit(ctx, q, audit, conflictDetail{
@@ -817,7 +821,8 @@ func insertBootEvent(ctx context.Context, q bun.IDB, row bootEventRow) error {
 // every other trigger leaves them. A bind the unique index refuses is the
 // *TransitionError "host_bound". A trigger that ends in StateNone (forget)
 // deletes the machine, with its MACs and boot events, and returns it with State
-// StateNone.
+// StateNone. Every transition but config_served revokes the machine's live
+// tickets.
 func TransitionTx(ctx context.Context, q bun.IDB, req TransitionRequest) (Machine, error) {
 	m, err := loadMachine(ctx, q, req.MachineID)
 	if err != nil {
@@ -854,6 +859,13 @@ func TransitionTx(ctx context.Context, q bun.IDB, req TransitionRequest) (Machin
 	}
 	if err != nil {
 		return Machine{}, fmt.Errorf("store state of %s: %w", m.ID, err)
+	}
+	// The machine row is written, so it is held: tickets come after it. Recording
+	// a served config consumes the ticket itself and revokes the rest.
+	if req.Trigger != TriggerConfigServed {
+		if _, err := RevokeMachineTicketsTx(ctx, q, m.ID, req.At); err != nil {
+			return Machine{}, err
+		}
 	}
 	ev := AuditEvent{
 		At: req.At, Actor: req.Actor, Action: "transition." + string(req.Trigger), MachineID: m.ID,
