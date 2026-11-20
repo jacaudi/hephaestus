@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"go.jacaudi.dev/hephaestus/internal/catalog/catalogtest"
 	"go.jacaudi.dev/hephaestus/internal/fleet"
@@ -281,13 +282,11 @@ func otherVersionAfterRange(t *testing.T, data []byte) http.Handler {
 func TestDownloader_RestartIsOnePerAttempt(t *testing.T) {
 	data := testBody(4096)
 	up := newUpstream(t)
-	up.handle(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// A 206 under another ETag even to a request that asks for no range.
+	up.handle(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// A 206 under another ETag, and one that starts at the half even for a
+		// request that asks for no range, so the restart cannot succeed.
 		w.Header().Set("ETag", `"B"`)
-		start := 0
-		if r.Header.Get("Range") != "" {
-			start = len(data) / 2
-		}
+		start := len(data) / 2
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, len(data)-1, len(data)))
 		w.WriteHeader(http.StatusPartialContent)
 		send(t, w, data[start:])
@@ -386,5 +385,144 @@ func TestDownloader_ErrorsNameTheObject(t *testing.T) {
 				t.Errorf("fetch = %v, want text containing %q", err, tt.want)
 			}
 		})
+	}
+}
+
+// TestDownloader_StatusBodyThatNeverComesIsCutByTheIdleTimeout pins that the
+// error body is read under the same idle bound as a success body: the client
+// has no total timeout, so a header followed by silence would hold the worker.
+func TestDownloader_StatusBodyThatNeverComesIsCutByTheIdleTimeout(t *testing.T) {
+	up := newUpstream(t)
+	up.handle(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "512")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		flush(t, w)
+		select {
+		case <-r.Context().Done():
+		case <-time.After(30 * time.Second):
+		}
+	}))
+	d, h := newDownloader(t, up)
+	h.f.idle = 100 * time.Millisecond
+	o := object{URL: up.srv.URL + "/obj", SpoolName: "obj-0", Size: 10, SHA256: strings.Repeat("0", 64)}
+	done := make(chan error, 1)
+
+	go func() { done <- d.fetch(t.Context(), o) }()
+
+	select {
+	case err := <-done:
+		if se, ok := errors.AsType[*StatusError](err); !ok || se.Code != http.StatusServiceUnavailable {
+			t.Errorf("fetch = %v, want a *StatusError with Code 503", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("fetch did not return: the error body is read with no idle bound")
+	}
+}
+
+// TestDownloader_FullRange206WithoutRangeIsAccepted pins that an upstream that
+// answers every request with a 206 of the whole object still serves a fetch
+// that asked for no range: at offset 0 the spool is overwritten, so nothing
+// can be spliced.
+func TestDownloader_FullRange206WithoutRangeIsAccepted(t *testing.T) {
+	data := testBody(4096)
+	up := newUpstream(t)
+	up.handle(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("ETag", testETag)
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", len(data)-1, len(data)))
+		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+		w.WriteHeader(http.StatusPartialContent)
+		send(t, w, data)
+	}))
+	d, h := newDownloader(t, up)
+	o := object{URL: up.srv.URL + "/obj", SpoolName: "obj-0", Size: int64(len(data)), SHA256: sha(data)}
+
+	if err := d.fetch(t.Context(), o); err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+
+	if got := spoolOf(t, h, o.SpoolName); !bytes.Equal(got, data) {
+		t.Errorf("the spool holds %d bytes that are not the body's %d", len(got), len(data))
+	}
+	if got := spoolOf(t, h, o.SpoolName+".etag"); string(got) != testETag {
+		t.Errorf("sidecar = %q, want %q: a later resume is checked against this response", got, testETag)
+	}
+	if seen := up.seen(); len(seen) != 1 {
+		t.Errorf("requests = %+v, want one", seen)
+	}
+}
+
+// TestDownloader_UnknownSize206WithoutTotalRestarts pins that a ranged
+// response whose Content-Range gives no usable total is a fault of that
+// response, not of the object: the spool restarts from zero and the 200 that
+// follows is fetched, with no integrity failure.
+func TestDownloader_UnknownSize206WithoutTotalRestarts(t *testing.T) {
+	tests := []struct {
+		name string
+		rng  func(half, n int) string
+	}{
+		{name: "an unknown total", rng: func(half, n int) string { return fmt.Sprintf("bytes %d-%d/*", half, n-1) }},
+		{name: "no Content-Range", rng: func(int, int) string { return "" }},
+		{name: "a malformed Content-Range", rng: func(int, int) string { return "bytes nonsense" }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data := testBody(4096)
+			half := len(data) / 2
+			up := newUpstream(t)
+			up.handle(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("ETag", testETag)
+				if r.Header.Get("Range") == "" {
+					w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+					send(t, w, data)
+					return
+				}
+				if rng := tt.rng(half, len(data)); rng != "" {
+					w.Header().Set("Content-Range", rng)
+				}
+				w.WriteHeader(http.StatusPartialContent)
+				send(t, w, data[half:])
+			}))
+			d, h := newDownloader(t, up)
+			o := object{URL: up.srv.URL + "/obj", SpoolName: "obj-0", Max: 1 << 20}
+			seedHalfOf(t, h, o.SpoolName, data, testETag)
+
+			if err := d.fetch(t.Context(), o); err != nil {
+				t.Fatalf("fetch = %v, want the restart to succeed", err)
+			}
+
+			if got := spoolOf(t, h, o.SpoolName); !bytes.Equal(got, data) {
+				t.Errorf("the spool holds %d bytes that are not the body's %d", len(got), len(data))
+			}
+			if seen := up.seen(); len(seen) != 2 || seen[0].Range == "" || seen[1].Range != "" {
+				t.Errorf("requests = %+v, want a ranged one and a restart with no Range", seen)
+			}
+		})
+	}
+}
+
+// TestDownloader_UnknownSize206WithoutTotalOnFirstRequestIsOrdinary pins that
+// the restart is only for a request that sent a Range: a first request
+// answered by a 206 with no total cannot be mended by asking the same again.
+func TestDownloader_UnknownSize206WithoutTotalOnFirstRequestIsOrdinary(t *testing.T) {
+	data := testBody(4096)
+	up := newUpstream(t)
+	up.handle(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/*", len(data)-1))
+		w.WriteHeader(http.StatusPartialContent)
+		send(t, w, data)
+	}))
+	d, _ := newDownloader(t, up)
+	o := object{URL: up.srv.URL + "/obj", SpoolName: "obj-0", Max: 1 << 20}
+
+	err := d.fetch(t.Context(), o)
+
+	if err == nil {
+		t.Fatal("fetch = nil, want an error")
+	}
+	if _, ok := errors.AsType[*IntegrityError](err); ok || errors.Is(err, errRestart) {
+		t.Errorf("fetch = %v, want an ordinary error: neither an *IntegrityError nor errRestart", err)
+	}
+	if seen := up.seen(); len(seen) != 1 {
+		t.Errorf("requests = %+v, want one", seen)
 	}
 }

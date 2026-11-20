@@ -243,7 +243,7 @@ func (d *downloader) transfer(ctx context.Context, o object, have int64, etag st
 	}
 	defer func() { err = errors.Join(err, resp.Body.Close()) }()
 
-	offset, size, err := d.accept(resp, o, have, etag)
+	offset, size, err := d.accept(resp, o, have, etag, cancel)
 	if err != nil {
 		return err
 	}
@@ -266,20 +266,17 @@ func (d *downloader) transfer(ctx context.Context, o object, have int64, etag st
 // headers give, which Max bounds. A 416 to a ranged request means the range
 // starts at or past the end of what the upstream has, so the spool is emptied
 // and errRestart returned.
-func (d *downloader) accept(resp *http.Response, o object, have int64, etag string) (offset, size int64, err error) {
+func (d *downloader) accept(resp *http.Response, o object, have int64, etag string, cancel context.CancelCauseFunc) (offset, size int64, err error) {
 	if resp.StatusCode == http.StatusRequestedRangeNotSatisfiable && etag != "" {
 		return 0, 0, errors.Join(errRestart, d.reset(o))
 	}
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
-		return 0, 0, statusError(resp)
+		return 0, 0, d.statusError(resp, cancel)
 	}
 	size = o.Size
 	if size == 0 {
-		if size, err = responseSize(resp); err != nil {
+		if size, err = d.unknownSize(resp, o, etag); err != nil {
 			return 0, 0, err
-		}
-		if size > o.Max {
-			return 0, 0, integrityf("the upstream says the object is %d bytes, over the %d it may be", size, o.Max)
 		}
 	}
 	if resp.StatusCode == http.StatusPartialContent {
@@ -289,6 +286,27 @@ func (d *downloader) accept(resp *http.Response, o object, have int64, etag stri
 		return 0, 0, integrityf("the upstream sent %d bytes for an object pinned at %d", resp.ContentLength, size)
 	}
 	return 0, size, d.keepETag(o, resp.Header.Get("ETag"))
+}
+
+// unknownSize is the size of o, which has none pinned, from resp's headers, at
+// most o.Max. A 200 that does not state its size, and a size over Max, are
+// integrity failures: asking again gets the same answer. A 206 that does not
+// state it is a fault of that ranged answer, not of the object, so after a
+// request that sent a range the spool is emptied and errRestart returned; one
+// that sent none cannot be mended that way and is an ordinary error.
+func (d *downloader) unknownSize(resp *http.Response, o object, etag string) (int64, error) {
+	size, err := responseSize(resp)
+	switch {
+	case err != nil && resp.StatusCode == http.StatusPartialContent && etag != "":
+		return 0, errors.Join(errRestart, d.reset(o))
+	case err != nil && resp.StatusCode == http.StatusPartialContent:
+		return 0, errors.Join(err, d.reset(o))
+	case err != nil:
+		return 0, err
+	case size > o.Max:
+		return 0, integrityf("the upstream says the object is %d bytes, over the %d it may be", size, o.Max)
+	}
+	return size, nil
 }
 
 // acceptRange checks a 206 to o's request for the bytes from have on, against
@@ -316,7 +334,9 @@ func (d *downloader) acceptRange(resp *http.Response, o object, size, have int64
 	}
 	switch got := resp.Header.Get("ETag"); {
 	case etag == "":
-		return errors.New("a 206 answered a request that asked for no range")
+		// No range was asked for, so the start is 0 and the body overwrites the
+		// spool: nothing can be spliced. Its ETag guards a later resume.
+		return d.keepETag(o, got)
 	case got != etag:
 		// Some upstreams answer 206 whatever If-Range says (RFC 9110 section 13.1.5
 		// says they must not); the bytes they send may belong to another version.
@@ -326,10 +346,14 @@ func (d *downloader) acceptRange(resp *http.Response, o object, size, have int64
 }
 
 // statusError is the *StatusError for resp, its body read up to
-// fleet.MaxCauseBytes. A body that breaks off is noted after the status, which
-// stays the error.
-func statusError(resp *http.Response) error {
-	text, err := io.ReadAll(io.LimitReader(resp.Body, fleet.MaxCauseBytes))
+// fleet.MaxCauseBytes under the same idle bound as a body that is kept: the
+// client has no total timeout, so a body that never comes would hold the
+// worker. A body that breaks off is noted after the status, which stays the
+// error.
+func (d *downloader) statusError(resp *http.Response, cancel context.CancelCauseFunc) error {
+	body := newIdleReader(resp.Body, d.f.idle, cancel)
+	defer body.Stop()
+	text, err := io.ReadAll(io.LimitReader(body, fleet.MaxCauseBytes))
 	se := &StatusError{Code: resp.StatusCode, Body: fleet.PrintableText(string(text))}
 	if err != nil {
 		return fmt.Errorf("%w (its body broke off: %w)", se, err)
@@ -350,7 +374,7 @@ func responseSize(resp *http.Response) (int64, error) {
 	case http.StatusPartialContent:
 		_, _, total, err := parseContentRange(resp.Header.Get("Content-Range"))
 		if err != nil {
-			return 0, integrityf("the upstream does not give a size for the object: %w", err)
+			return 0, fmt.Errorf("a 206 gives no size for the object: %w", err)
 		}
 		return total, nil
 	default:
