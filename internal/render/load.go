@@ -24,7 +24,7 @@ const (
 	ruleSecretsProvider    = "secretsProvider set"
 	ruleConfigDir          = "configDir set"
 	rulePathEscapes        = "path escapes tree"
-	ruleRefInIdentity      = "reference in host, ip, schematicId or talosVersion"
+	ruleRefInIdentity      = "reference in host, ip, schematicId, talosVersion or kubernetesVersion"
 	ruleHostNotDNS         = "host not a DNS name"
 	ruleHostDuplicate      = "duplicate host"
 	ruleKubernetesMissing  = "kubernetesVersion missing"
@@ -212,7 +212,8 @@ func readTopf(fsys fs.FS) (*definition, error) {
 		return nil, refuse(topfFile, ruleTopfUnparsable)
 	}
 
-	// Only a string can be checked above; any other scalar a path field decodes from names no place outside the tree.
+	// Rule 3 checked string values only. A path that decodes from another scalar (patchesDir: 5) cannot leave the tree by
+	// name, and a link it names that leaves the tree is refused by rule 11.
 	if def.patchesDir, err = config.CleanRel(cmp.Or(def.cfg.PatchesDir, ".")); err != nil {
 		return nil, refuse(topfFile, rulePathEscapes)
 	}
@@ -321,8 +322,9 @@ func checkTreePath(fsys fs.FS, p string) error {
 	return nil
 }
 
-// hasIdentityReference reports whether host, ip, schematicId or talosVersion, of the cluster or of a node, starts like
-// a reference. It reads the generic decode, so no typed field has failed first.
+// hasIdentityReference reports whether host, ip, schematicId, talosVersion or kubernetesVersion, of the cluster or of a
+// node (config.Node has no kubernetesVersion), starts like a reference. It reads the generic decode, so no typed field
+// has failed first.
 func hasIdentityReference(generic any) bool {
 	isReference := func(v any) bool {
 		s, ok := v.(string)
@@ -330,7 +332,7 @@ func hasIdentityReference(generic any) bool {
 		return ok && config.HasReferencePrefix(s)
 	}
 
-	for _, key := range []string{"schematicId", "talosVersion"} {
+	for _, key := range []string{"schematicId", "talosVersion", "kubernetesVersion"} {
 		if isReference(field(generic, key)) {
 			return true
 		}
@@ -751,11 +753,16 @@ func patchFiles(fsys fs.FS, def *definition) ([]string, error) {
 	return files, nil
 }
 
-// collectPatchFiles returns the patch files below folder as Topf's loadFolder walks them (the vendored collectPatchFiles
-// of package config): a file matches by its own name, a link to a file by its target's, and a link to a directory is
-// walked under the link's name. A folder that does not exist has none. The tree passed the link rules already, so no link
-// leaves it, dangles or loops.
+// collectPatchFiles returns the patch files below folder, selected as the vendored collectPatchFiles of package config
+// does: a file matches by its own name, a link to a file by its target's, and a link to a directory is walked under the
+// link's name. A folder that does not exist has none. It differs from the vendored walk in two ways: it has no loop check
+// (the tree passed rule 11 already, so no link leaves the tree, dangles or loops), and only a missing folder is empty,
+// where any other error, a missing entry below the folder included, is returned.
 func collectPatchFiles(fsys fs.FS, folder string) ([]string, error) {
+	if _, err := fs.Stat(fsys, folder); errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+
 	var files []string
 
 	err := fs.WalkDir(fsys, folder, func(name string, entry fs.DirEntry, err error) error {
@@ -794,9 +801,6 @@ func collectPatchFiles(fsys fs.FS, folder string) ([]string, error) {
 
 		return nil
 	})
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil, nil
-	}
 
 	return files, err
 }

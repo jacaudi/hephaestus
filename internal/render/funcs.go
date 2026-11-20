@@ -81,13 +81,7 @@ func FuncMap() template.FuncMap {
 func templateRule(name, text string, funcs template.FuncMap) string {
 	tmpl, err := template.New(path.Base(name)).Funcs(funcs).Option("missingkey=error").Parse(text)
 	if err != nil {
-		// The parser reports a call to an unknown function as: template: <name>:<line>: function "<func>" not defined.
-		_, rest, _ := strings.Cut(err.Error(), `function "`)
-		if fn, _, ok := strings.Cut(rest, `" not defined`); ok {
-			return ruleTemplateFunc + fn
-		}
-
-		return ""
+		return undefinedFuncRule(err, path.Base(name))
 	}
 
 	for _, t := range tmpl.Templates() {
@@ -135,4 +129,30 @@ func readsPatchesDir(n parse.Node) bool {
 
 func readsPatchesDirBranch(b *parse.BranchNode) bool {
 	return readsPatchesDir(b.Pipe) || readsPatchesDir(b.List) || readsPatchesDir(b.ElseList)
+}
+
+// undefinedFuncRule returns the rule for a parse error that reports a call to an unknown function, "" for any other
+// error. The parser words it "template: <name>:<line>: function "<func>" not defined"; the template name, which is the
+// file's name and can hold any text, is cut off first so it cannot be mistaken for the function.
+func undefinedFuncRule(err error, name string) string {
+	rest, ok := strings.CutPrefix(err.Error(), "template: "+name+":")
+	if !ok {
+		return ""
+	}
+
+	_, msg, ok := strings.Cut(rest, ": ") // the line number holds no ": "
+	if !ok {
+		return ""
+	}
+
+	msg, ok = strings.CutPrefix(msg, `function "`)
+	if !ok {
+		return ""
+	}
+
+	if fn, _, ok := strings.Cut(msg, `" not defined`); ok {
+		return ruleTemplateFunc + fn
+	}
+
+	return ""
 }

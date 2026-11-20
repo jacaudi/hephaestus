@@ -274,7 +274,7 @@ func TestLoad_Accepted(t *testing.T) {
 func TestLoad_Refusals(t *testing.T) {
 	const (
 		unparsable   = "topf.yaml unparsable"
-		refInIdent   = "reference in host, ip, schematicId or talosVersion"
+		refInIdent   = "reference in host, ip, schematicId, talosVersion or kubernetesVersion"
 		notDNS       = "host not a DNS name"
 		notID        = "schematicId not an id or @path"
 		nonPlain     = "non-plain data value"
@@ -333,6 +333,11 @@ func TestLoad_Refusals(t *testing.T) {
 
 		// 4. references in identity fields, then a typed field that does not decode
 		{name: "reference in host", edits: []edit{replaceTopf("host: wrk-01", "host: ref+op://v/i/f")}, file: topfName, rule: refInIdent},
+		{
+			name:  "reference in kubernetesVersion",
+			edits: []edit{replaceTopf("kubernetesVersion: v1.35.10", "kubernetesVersion: ref+op://v/i/f")},
+			file:  topfName, rule: refInIdent,
+		},
 		{name: "reference in ip", edits: []edit{replaceTopf("ip: 10.10.20.21", "ip: ref+op://v/i/f")}, file: topfName, rule: refInIdent},
 		{name: "reference in schematicId", edits: []edit{appendTopf("schematicId: ref+op://v/i/f\n")}, file: topfName, rule: refInIdent},
 		{
@@ -517,6 +522,11 @@ func TestLoad_Refusals(t *testing.T) {
 			file:  "all/keys.yaml.tpl", rule: "template function not allowed: keys",
 		},
 		{
+			name:  "template file named like a parser message",
+			edits: []edit{writeFile("all/function \"x\" not defined.yaml.tpl", "x: {{ keys .Data }}\n")},
+			file:  "all/function \"x\" not defined.yaml.tpl", rule: "template function not allowed: keys",
+		},
+		{
 			name:  "template function that does not exist",
 			edits: []edit{writeFile("all/nope.yaml.tpl", "x: {{ nope 1 }}\n")},
 			file:  "all/nope.yaml.tpl", rule: "template function not allowed: nope",
@@ -573,7 +583,7 @@ func TestLoad_RuleOrder(t *testing.T) {
 	}{
 		{"nodesProvider set", []edit{appendTopf("nodesProvider: /bin/x\n")}},
 		{ruleEscape, []edit{appendTopf("patchesDir: ../p\n")}},
-		{"reference in host, ip, schematicId or talosVersion", []edit{replaceTopf("host: wrk-01", "host: ref+op://v/i/f")}},
+		{"reference in host, ip, schematicId, talosVersion or kubernetesVersion", []edit{replaceTopf("host: wrk-01", "host: ref+op://v/i/f")}},
 		{"topf.yaml unparsable", []edit{replaceTopf("role: worker", "role: boss")}},
 		{"host not a DNS name", []edit{replaceTopf("host: cp-01", "host: Cp-01")}},
 		{"kubernetesVersion missing", []edit{replaceTopf("kubernetesVersion: v1.35.10\n", "")}},
