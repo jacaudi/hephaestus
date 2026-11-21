@@ -16,7 +16,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/filemode"
 	"github.com/go-git/go-git/v5/plumbing/format/idxfile"
 	"github.com/go-git/go-git/v5/plumbing/format/packfile"
 	"github.com/go-git/go-git/v5/plumbing/object"
@@ -452,6 +454,53 @@ func TestGit_MissingTreeAfterMoveAsideNotCorrupt(t *testing.T) {
 	}
 	if g.corrupt(tree, err) {
 		t.Error("a tree missing after a move-aside is called corrupt")
+	}
+}
+
+// danglingTree stores, in g's repository of the cluster, a tree that names an object the repository does not have, makes
+// the tree expected and returns its hash.
+func danglingTree(t *testing.T, g *gitStore, clusterID string) string {
+	t.Helper()
+	repo, err := git.PlainOpen(g.repoPath(clusterID))
+	if err != nil {
+		t.Fatalf("open the store: %v", err)
+	}
+	dangling := &object.Tree{Entries: []object.TreeEntry{
+		{Name: "vendor", Mode: filemode.Regular, Hash: plumbing.NewHash("1111111111111111111111111111111111111111")},
+	}}
+	enc := repo.Storer.NewEncodedObject()
+	if err := dangling.Encode(enc); err != nil {
+		t.Fatalf("encode the tree: %v", err)
+	}
+	hash, err := repo.Storer.SetEncodedObject(enc)
+	if err != nil {
+		t.Fatalf("store the tree: %v", err)
+	}
+	g.expect([]string{hash.String()})
+	return hash.String()
+}
+
+// TestGit_MissingEntryUnderIntactTreeNotCorrupt: a tree that is in the store but names an object the repository never
+// sent is not a damaged store, so reading it does not call for moving the store aside, which every cluster shares.
+func TestGit_MissingEntryUnderIntactTreeNotCorrupt(t *testing.T) {
+	srv := gittest.NewServer(t, gittest.Options{})
+	srv.Commit(t, labFiles("1"), nil)
+	g := newTestStore(t, srv)
+	if _, err := g.fetch(t.Context(), gitCluster, labSource(srv, gitLab)); err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	tree := danglingTree(t, g, gitCluster)
+
+	_, err := g.readTree(t.Context(), gitCluster, tree)
+
+	if err == nil {
+		t.Fatal("readTree of a tree with a missing entry succeeded")
+	}
+	if g.corrupt(tree, err) {
+		t.Errorf("a tree with a missing entry is called corrupt; chain: %s", chainOf(err))
+	}
+	if !errors.Is(err, errEntryMissing) {
+		t.Errorf("error = %v, want it to say an entry is missing", err)
 	}
 }
 

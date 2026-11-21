@@ -487,14 +487,27 @@ func (s *Service) readMarked(ctx context.Context, w work) (fsys fs.FS, moved, ok
 	if s.git.corrupt(w.tree, err) {
 		return nil, s.moveAside(ctx, w.c.Name, err, w.at), false
 	}
-	// A new head tree beyond the bounds fails as one a load rule refuses does, so it is not read again.
-	if tooLarge, isTooLarge := errors.AsType[*TreeTooLargeError](err); isTooLarge && w.trigger == TriggerHead {
-		s.storeFailed(ctx, w, tooLarge.Error())
-		s.report(ctx, stageRead, w.c.Name, "the tree is too large to read")
+	// A new head tree that cannot be read, whatever the store holds, fails as one a load rule refuses does, so it is not
+	// read again.
+	if text, unreadable := unreadableText(err); unreadable && w.trigger == TriggerHead {
+		s.storeFailed(ctx, w, text)
+		s.report(ctx, stageRead, w.c.Name, "the tree is unreadable: "+text)
 		return nil, false, false
 	}
 	s.report(ctx, stageRead, w.c.Name, "the tree cannot be read")
 	return nil, false, false
+}
+
+// unreadableText is the fixed text of a tree that cannot be read however the store is: one beyond the bounds, or one that
+// names an object the repository does not have. It holds no content of the tree.
+func unreadableText(err error) (string, bool) {
+	if tooLarge, ok := errors.AsType[*TreeTooLargeError](err); ok {
+		return tooLarge.Error(), true
+	}
+	if errors.Is(err, errEntryMissing) {
+		return errEntryMissing.Error(), true
+	}
+	return "", false
 }
 
 // buildPair loads, resolves and renders the tree w holds the mark on, and stores the result: the pending pair, or the

@@ -418,6 +418,39 @@ func TestService_UnparsableBundleRefusedBeforeResolving(t *testing.T) {
 	}
 }
 
+func TestService_HeadTreeWithMissingEntryFailsWithoutMovingTheStore(t *testing.T) {
+	srv := gittest.NewServer(t, gittest.Options{})
+	h := newSvcHarness(t, srv, "")
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	defer srv.Close()
+	srv.Commit(t, svcFiles(t), nil)
+	s := h.service(h.fake)
+	h.poll(s)
+	c := h.cluster()
+	tree := danglingTree(t, s.git, c.ID)
+	w := work{c: &c, tree: tree, trigger: TriggerHead, at: h.now}
+	if !s.mark(t.Context(), w) {
+		t.Fatal("the tree could not be marked")
+	}
+
+	_, moved, ok := s.readMarked(t.Context(), w)
+
+	if ok || moved {
+		t.Fatalf("readMarked = ok %t, moved %t; want neither", ok, moved)
+	}
+	c = h.cluster()
+	if c.FailedTree != tree || c.LastHeadTree != tree {
+		t.Errorf("failed tree = %q, last head = %q; want both %s", c.FailedTree, c.LastHeadTree, tree)
+	}
+	if got := h.errors().Failed; !strings.Contains(got, "does not have") {
+		t.Errorf("failed error = %q, want it to say the repository lacks an object", got)
+	}
+	wantNoMark(t, c)
+	if aside, err := filepath.Glob(s.git.dir + ".corrupt-*"); err != nil || len(aside) != 0 {
+		t.Errorf("moved-aside stores = %v, %v; want none", aside, err)
+	}
+}
+
 func TestService_OversizeTreeStoredFailedOnce(t *testing.T) {
 	srv := gittest.NewServer(t, gittest.Options{})
 	h := newSvcHarness(t, srv, "")

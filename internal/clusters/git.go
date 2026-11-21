@@ -44,6 +44,10 @@ const (
 	maxTreeBytes = 128 << 20
 )
 
+// errEntryMissing reports a tree that is in the store but names an object below it that is not: the repository never
+// sent it, which says nothing about the store's health, unlike a missing tree.
+var errEntryMissing = errors.New("the tree names an object the repository does not have")
+
 // TreeTooLargeError reports a tree with more paths or more bytes than the store reads. Its text holds no content of the
 // tree.
 type TreeTooLargeError struct {
@@ -196,6 +200,10 @@ func (g *gitStore) readTree(ctx context.Context, clusterID, tree string) (fs.FS,
 		files[f.Name] = memFile{data: []byte(content), mode: fileMode(f.Mode)}
 		return nil
 	})
+	if errors.Is(err, plumbing.ErrObjectNotFound) {
+		// The root tree was read above, so the missing object is one it names.
+		err = fmt.Errorf("%w: %w", errEntryMissing, err)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("clusters: read tree %s: %w", tree, err)
 	}
@@ -362,6 +370,9 @@ const (
 // classifyRead sorts an error from reading a tree by type: a missing object, an object that does not decode, or
 // anything else.
 func classifyRead(err error) readClass {
+	if errors.Is(err, errEntryMissing) {
+		return readOther
+	}
 	if pe, ok := errors.AsType[*packfile.Error](err); ok && pe != nil {
 		return readCorrupt
 	}
