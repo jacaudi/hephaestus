@@ -767,7 +767,6 @@ func TestEvents_Console(t *testing.T) {
 	fail := filepath.Join(dir, "fail")
 	want := []string{
 		"▸ Toolbox image",
-		"  ── 0 passed · 0 failed · 14s",
 		"▸ Boot ovmf  amd64 · UEFI · file mode",
 		"  PASS  held within 120s (after 18s)",
 		"  PASS  dnsmasq leased an address to 52:54:00:e2:e0:03 (10.99.0.131)",
@@ -786,7 +785,6 @@ func TestEvents_Console(t *testing.T) {
 		"  ── 1 passed · 1 failed · 1 note · 0s",
 		"  ── 1 passed · 0 failed · 1h02m",
 		row("phase", "pass", "fail", "time"),
-		row("toolbox", "0", "0", "14s"),
 		row("boot-ovmf", "3", "0", "21s"),
 		row("boot-seabios", "1", "0", "14s"),
 		row("install-boot", "2", "1", "5m12s"),
@@ -806,6 +804,24 @@ func TestEvents_Console(t *testing.T) {
 		if !slices.Contains(lines, w) {
 			t.Errorf("the console has no line %q", w)
 		}
+	}
+	// A phase with no checks shows only its header: no subtotal and no summary row. Its events stay in the record.
+	for i, l := range lines {
+		if strings.HasPrefix(l, "  ── 0 passed · 0 failed") || strings.HasPrefix(l, "  toolbox ") || strings.HasPrefix(l, "  ipxe ") {
+			t.Errorf("line %d %q: a phase with no checks has a subtotal or a summary row", i, l)
+		}
+		if l == "▸ Toolbox image" && (i+2 >= len(lines) || lines[i+1] != "" || lines[i+2] != "▸ Boot ovmf  amd64 · UEFI · file mode") {
+			t.Errorf("the check-free toolbox phase is not followed directly by the next phase header")
+		}
+	}
+	tables := 0
+	for _, l := range lines {
+		if strings.HasPrefix(l, "  phase ") {
+			tables++
+		}
+	}
+	if tables != 2 {
+		t.Errorf("the console has %d summary tables, want 2: the stopped run has no phase with checks, so no table", tables)
 	}
 	// A phase header follows a blank line, so phases stand apart.
 	for i, l := range lines {
@@ -843,79 +859,6 @@ func TestEvents_RealClockRecordValidates(t *testing.T) {
 	}
 }
 
-// captureScript sources the library ($0), runs capture <log> <command...> under set -eu as run.sh does, then prints
-// what capture returned and exits with it.
-const captureScript = `. "$0"; set -eu; st=0; log=$1; shift; capture "$log" "$@" || st=$?; echo "capture returned $st"; exit "$st"`
-
-func TestCapture_KeepsExitStatusAndOutput(t *testing.T) {
-	log := filepath.Join(t.TempDir(), "run.log")
-	inner := `echo out; echo err >&2; printf '\033[1;31mred\033[0m plain\n'; exit 3`
-	cmd := exec.CommandContext(t.Context(), "sh", "-c", captureScript, eventsLib, log, "sh", "-c", inner)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	err := cmd.Run()
-	if exitErr, ok := errors.AsType[*exec.ExitError](err); !ok || exitErr.ExitCode() != 3 {
-		t.Errorf("the wrapper exited with %v, want exit status 3", err)
-	}
-	if want := "out\nerr\n\x1b[1;31mred\x1b[0m plain\ncapture returned 3\n"; stdout.String() != want || stderr.Len() != 0 {
-		t.Errorf("stdout = %q, stderr = %q; want stdout %q and nothing on stderr", &stdout, &stderr, want)
-	}
-	got, err := os.ReadFile(log)
-	if err != nil {
-		t.Fatalf("read %s: %v", log, err)
-	}
-	if want := "out\nerr\nred plain\n"; string(got) != want {
-		t.Errorf("run.log = %q, want %q (stdout and stderr, without colour codes)", got, want)
-	}
-	if _, err := os.Stat(log + ".status"); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("stat %s.status = %v, want it removed", log, err)
-	}
-}
-
-func TestCapture_InterruptWaitsForTheRunsCleanup(t *testing.T) {
-	log := filepath.Join(t.TempDir(), "run.log")
-	// The run's own traps, as run.sh's: SIGINT exits 130, and the EXIT trap cleans up and prints.
-	inner := `trap 'exit 130' INT; trap 'echo cleanup ran' EXIT; echo ready; while :; do sleep 1; done`
-	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "sh", "-c", captureScript, eventsLib, log, "sh", "-c", inner)
-	// Its own process group, so the SIGINT reaches every process in it, as a terminal's Ctrl-C does. On a timeout the
-	// whole group is killed: a survivor holding the pipe would keep the read below waiting.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		t.Fatalf("stdout pipe: %v", err)
-	}
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start: %v", err)
-	}
-	var lines []string
-	sc := bufio.NewScanner(stdout)
-	for sc.Scan() {
-		lines = append(lines, sc.Text())
-		if sc.Text() == "ready" {
-			if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGINT); err != nil {
-				t.Errorf("send SIGINT to the process group: %v", err)
-			}
-		}
-	}
-	err = cmd.Wait()
-	if exitErr, ok := errors.AsType[*exec.ExitError](err); !ok || exitErr.ExitCode() != 130 {
-		t.Errorf("the wrapper exited with %v, want exit status 130", err)
-	}
-	if want := []string{"ready", "cleanup ran", "capture returned 130"}; !slices.Equal(lines, want) {
-		t.Errorf("stdout lines = %q, want %q", lines, want)
-	}
-	got, err := os.ReadFile(log)
-	if err != nil {
-		t.Fatalf("read %s: %v", log, err)
-	}
-	if want := "ready\ncleanup ran\n"; string(got) != want {
-		t.Errorf("run.log = %q, want %q: the cleanup output reaches the log", got, want)
-	}
-}
-
 func TestEvents_AllPassedUntilACheckFails(t *testing.T) {
 	script := `. "$0"; ev_init "$1" 20261120T000000Z ` + sampleCommit + ` file+proxy 0 >/dev/null; step only 'The only phase' >/dev/null
 ev_all_passed && echo "before any check: yes"
@@ -926,5 +869,141 @@ ev_all_passed || echo "after a failure: no"`
 	out, err := exec.CommandContext(t.Context(), "sh", "-c", script, eventsLib, t.TempDir()).CombinedOutput()
 	if want := "before any check: yes\nafter a pass and a note: yes\nafter a failure: no\n"; err != nil || string(out) != want {
 		t.Errorf("sh = %v, output %q; want %q", err, out, want)
+	}
+}
+
+// captureScript is a run shaped as run.sh is: it sources the library ($0), sends its own output through capture_start
+// into the log ($1) and sets run.sh's three traps. Its cleanup prints, ends the capture, writes a manifest stand-in
+// beside the log once the log is complete, and exits with the run's status. The run's body is $2.
+const captureScript = `. "$0"; set -eu; log=$1
+capture_start "$log"
+cleanup() {
+	st=$?
+	trap - EXIT INT TERM
+	echo "cleanup ran"
+	capture_finish
+	cp "$log" "$log.manifest"
+	echo "finished $st"
+	exit "$st"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+eval "$2"`
+
+// readCaptured returns the log and checks that the manifest stand-in holds exactly the log (so the log was complete
+// when it was written) and that the FIFO is gone.
+func readCaptured(t *testing.T, log string) string {
+	t.Helper()
+	got, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatalf("read %s: %v", log, err)
+	}
+	if manifest, err := os.ReadFile(log + ".manifest"); err != nil || !bytes.Equal(manifest, got) {
+		t.Errorf("manifest stand-in = %q, %v; want a copy of the complete log %q", manifest, err, got)
+	}
+	if _, err := os.Stat(log + ".fifo"); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("stat %s.fifo = %v, want it removed", log, err)
+	}
+	return string(got)
+}
+
+func TestCapture_KeepsExitStatusAndOutput(t *testing.T) {
+	log := filepath.Join(t.TempDir(), "run.log")
+	body := `echo out; echo err >&2; printf '\033[1;31mred\033[0m plain\n'; exit 3`
+	cmd := exec.CommandContext(t.Context(), "sh", "-c", captureScript, eventsLib, log, body)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	err := cmd.Run()
+	if exitErr, ok := errors.AsType[*exec.ExitError](err); !ok || exitErr.ExitCode() != 3 {
+		t.Errorf("the run exited with %v, want exit status 3", err)
+	}
+	if want := "out\nerr\n\x1b[1;31mred\x1b[0m plain\ncleanup ran\nfinished 3\n"; stdout.String() != want || stderr.Len() != 0 {
+		t.Errorf("stdout = %q, stderr = %q; want stdout %q and nothing on stderr", &stdout, &stderr, want)
+	}
+	if got, want := readCaptured(t, log), "out\nerr\nred plain\ncleanup ran\n"; got != want {
+		t.Errorf("run.log = %q, want %q (stdout and stderr, without colour codes)", got, want)
+	}
+}
+
+// signalRun starts captureScript with a five-second body and sends sig once the run prints ready: to the run's whole
+// process group when group is set, as a terminal's Ctrl-C does, else to the started process only, as kill <pid> does.
+// It returns the stdout lines and the exit error.
+func signalRun(t *testing.T, log string, sig syscall.Signal, group bool) ([]string, error) {
+	t.Helper()
+	body := `echo ready; i=0; while [ "$i" -lt 5 ]; do sleep 1; i=$((i + 1)); done; echo finished normally`
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "sh", "-c", captureScript, eventsLib, log, body)
+	// Its own process group; on a timeout the whole group is killed, since a survivor holding the pipe would keep the
+	// read below waiting.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("stdout pipe: %v", err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	target := cmd.Process.Pid
+	if group {
+		target = -target
+	}
+	var lines []string
+	sc := bufio.NewScanner(stdout)
+	for sc.Scan() {
+		lines = append(lines, sc.Text())
+		if sc.Text() == "ready" {
+			if err := syscall.Kill(target, sig); err != nil {
+				t.Errorf("send %v: %v", sig, err)
+			}
+		}
+	}
+	return lines, cmd.Wait()
+}
+
+func TestCapture_InterruptToTheGroupRunsCleanup(t *testing.T) {
+	log := filepath.Join(t.TempDir(), "run.log")
+	lines, err := signalRun(t, log, syscall.SIGINT, true)
+	if exitErr, ok := errors.AsType[*exec.ExitError](err); !ok || exitErr.ExitCode() != 130 {
+		t.Errorf("the run exited with %v, want exit status 130", err)
+	}
+	if want := []string{"ready", "cleanup ran", "finished 130"}; !slices.Equal(lines, want) {
+		t.Errorf("stdout lines = %q, want %q", lines, want)
+	}
+	if got, want := readCaptured(t, log), "ready\ncleanup ran\n"; got != want {
+		t.Errorf("run.log = %q, want %q: the cleanup output reaches the log", got, want)
+	}
+}
+
+func TestCapture_TermToTheStartedProcessRunsCleanup(t *testing.T) {
+	log := filepath.Join(t.TempDir(), "run.log")
+	lines, err := signalRun(t, log, syscall.SIGTERM, false)
+	if exitErr, ok := errors.AsType[*exec.ExitError](err); !ok || exitErr.ExitCode() != 143 {
+		t.Errorf("the run exited with %v, want exit status 143", err)
+	}
+	if want := []string{"ready", "cleanup ran", "finished 143"}; !slices.Equal(lines, want) {
+		t.Errorf("stdout lines = %q, want %q: the cleanup runs and the run does not finish normally", lines, want)
+	}
+	if got, want := readCaptured(t, log), "ready\ncleanup ran\n"; got != want {
+		t.Errorf("run.log = %q, want %q: the cleanup output reaches the log", got, want)
+	}
+}
+
+func TestCapture_TermToTheGroupRunsCleanup(t *testing.T) {
+	// A supervisor that stops a job signals its whole process group: tee must outlive it to copy the cleanup. The TERM
+	// also kills the run's foreground sleep, which dash reports with its own "Terminated" line, so the lines between
+	// ready and the cleanup are the shell's.
+	log := filepath.Join(t.TempDir(), "run.log")
+	lines, err := signalRun(t, log, syscall.SIGTERM, true)
+	if exitErr, ok := errors.AsType[*exec.ExitError](err); !ok || exitErr.ExitCode() != 143 {
+		t.Errorf("the run exited with %v, want exit status 143", err)
+	}
+	if n := len(lines); n < 3 || lines[0] != "ready" || lines[n-2] != "cleanup ran" || lines[n-1] != "finished 143" || slices.Contains(lines, "finished normally") {
+		t.Errorf("stdout lines = %q, want ready first, then cleanup ran and finished 143 last", lines)
+	}
+	if got := readCaptured(t, log); !strings.HasPrefix(got, "ready\n") || !strings.HasSuffix(got, "cleanup ran\n") {
+		t.Errorf("run.log = %q, want it to start with ready and end with the cleanup output", got)
 	}
 }

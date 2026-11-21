@@ -8,9 +8,9 @@
 # Writes every log to build/e2e/<UTC timestamp>/, with events.jsonl (one event per phase start and end, check and run
 # start and end; test/e2e/events.schema.json), run.log (everything it printed) and manifest.json (every file's size and
 # sha256). The console shows the same events through test/e2e/lib/events.sh: a header per phase, a PASS, FAIL or NOTE
-# line per check, a subtotal per phase and a summary. On any exit it removes the heph-e2e-* containers, network and
-# volume, and the temporary source copy, fake-upstream files, certificates and test-CA build outputs that this run
-# created. The names, network and subnet are fixed: one run at a time.
+# line per check, a subtotal per phase that has checks, and a summary. On any exit it removes the heph-e2e-*
+# containers, network and volume, and the temporary source copy, fake-upstream files, certificates and test-CA build
+# outputs that this run created. The names, network and subnet are fixed: one run at a time.
 set -eu
 
 root=$(cd "$(dirname "$0")/../.." && pwd -P)
@@ -53,12 +53,13 @@ UTILITY_TIMEOUT=300
 INSTALL_TIMEOUT=300
 TASK=${TASK_EXE:-task}
 
-# --- the run directory and the capture wrapper ---
-# Started without E2E_RUN_ID, this script is the wrapper: it picks the run's timestamp, runs itself again as the run
-# under capture (test/e2e/lib/events.sh), which copies everything the run prints, every docker build and pull
-# included, to $out/run.log, then writes $out/manifest.json once run.log is complete, and exits with the run's exit
-# status. Colour is decided here, while stdout may still be the terminal: the run's stdout is the capture's pipe.
-ts=${E2E_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}
+# --- the run directory and the capture ---
+# The run captures itself: from capture_start on (test/e2e/lib/events.sh), everything it prints, every docker build
+# and pull included, also goes to $out/run.log. It stays the process that was started, so SIGINT and SIGTERM reach
+# the traps below as they would without the capture. The cleanup trap ends the capture, so run.log is complete, then
+# writes $out/manifest.json and exits with the run's status. Colour is decided before capture_start, while stdout may
+# still be the terminal.
+ts=$(date -u +%Y%m%dT%H%M%SZ)
 out=build/e2e/$ts
 commit=$(git rev-parse HEAD)
 
@@ -79,29 +80,16 @@ write_manifest() {
 		>"$out/manifest.json"
 }
 
-if [ -z "${E2E_RUN_ID:-}" ]; then
-	if ! docker info >/dev/null 2>&1; then
-		echo "e2e: cannot reach a Docker daemon. With colima: export DOCKER_HOST=unix://\$HOME/.colima/default/docker.sock" >&2
-		exit 1
-	fi
-	mkdir -p "$out"
-	E2E_COLOR=0
-	if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then # https://no-color.org
-		E2E_COLOR=1
-	fi
-	E2E_RUN_ID=$ts
-	export E2E_RUN_ID E2E_COLOR
-	status=0
-	capture "$out/run.log" sh "$root/test/e2e/run.sh" || status=$?
-	if ! merr=$(write_manifest 2>&1); then
-		rm -f "$out/manifest.json"
-		printf 'e2e: could not write %s/manifest.json\n%s\n' "$out" "$merr" | tee -a "$out/run.log" >&2
-		if [ "$status" -eq 0 ]; then
-			status=1 # a run whose record is incomplete has not passed
-		fi
-	fi
-	exit "$status"
+if ! docker info >/dev/null 2>&1; then
+	echo "e2e: cannot reach a Docker daemon. With colima: export DOCKER_HOST=unix://\$HOME/.colima/default/docker.sock" >&2
+	exit 1
 fi
+mkdir -p "$out"
+colour=0
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then # https://no-color.org
+	colour=1
+fi
+capture_start "$out/run.log"
 
 # --- the run ---
 certs=build/e2e/run/certs
@@ -113,7 +101,7 @@ own_pem=no # whether this run created the test-CA files under build/ipxe/out, wh
 own_testca=no
 heph_mode='file'
 # The run's record and console: step, pass, fail, note and check come from test/e2e/lib/events.sh.
-ev_init "$out" "$ts" "$commit" file+proxy "${E2E_COLOR:-0}"
+ev_init "$out" "$ts" "$commit" file+proxy "$colour"
 
 ge() { [ -n "$1" ] && [ "$1" -ge "$2" ] 2>/dev/null; } # ge <n> <min>: a missing or non-numeric n fails
 
@@ -207,6 +195,14 @@ cleanup() {
 	[ "$own_testca" = yes ] && rm -rf "${testca_dir:?}"
 	if [ "$status" -eq 0 ] && ! ev_all_passed; then status=1; fi
 	ev_end "$status"
+	capture_finish # run.log is complete from here on
+	if ! merr=$(write_manifest 2>&1); then
+		rm -f "$out/manifest.json"
+		printf 'e2e: could not write %s/manifest.json\n%s\n' "$out" "$merr" | tee -a "$out/run.log" >&2
+		if [ "$status" -eq 0 ]; then
+			status=1 # a run whose record is incomplete has not passed
+		fi
+	fi
 	exit "$status"
 }
 trap cleanup EXIT

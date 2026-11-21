@@ -15,8 +15,8 @@
 # succeeds while no check has failed. POSIX sh has no local variables, so every variable here starts with ev_ and the
 # caller's own are never touched.
 #
-# capture <log> <command...> runs a command with its stdout and stderr merged, copies the stream to stdout and to
-# <log>, there without colour codes, and returns the command's exit status.
+# capture_start <log> sends this shell's stdout and stderr, merged, to the console and to <log>; capture_finish ends
+# that and leaves <log> without colour codes.
 
 EV_SCHEMA=hephaestus.e2e.event/v1
 EV_WIDTH=72 # the columns of the header and summary rules
@@ -102,7 +102,8 @@ ev_init() {
 	ev_rule "hephaestus e2e · run $2 · $4 mode" ${#ev_twin}
 }
 
-# ev_close ends the open phase, if there is one: phase_end, the subtotal line, and the phase's summary row.
+# ev_close ends the open phase, if there is one: phase_end, and, when the phase had checks, the subtotal line and
+# the phase's summary row (a setup phase with no checks shows only its header).
 ev_close() {
 	if [ -z "$ev_phase" ]; then
 		return 0
@@ -110,8 +111,10 @@ ev_close() {
 	ev_now
 	ev_d=$((ev_epoch - ev_phase_t0))
 	ev_emit phase_end ",\"phase\":$(ev_str "$ev_phase"),\"passed\":$ev_pp,\"failed\":$ev_pf,\"notes\":$ev_pn,\"duration_s\":$ev_d"
-	printf '  %s── %s%s\n' "$ev_dim" "$(ev_counts "$ev_pp" "$ev_pf" "$ev_pn" "$ev_d")" "$ev_rst"
-	ev_rows="$ev_rows$ev_phase$ev_tab$ev_pp$ev_tab$ev_pf$ev_tab$(ev_dur "$ev_d")$ev_nl"
+	if [ $((ev_pp + ev_pf + ev_pn)) -gt 0 ]; then
+		printf '  %s── %s%s\n' "$ev_dim" "$(ev_counts "$ev_pp" "$ev_pf" "$ev_pn" "$ev_d")" "$ev_rst"
+		ev_rows="$ev_rows$ev_phase$ev_tab$ev_pp$ev_tab$ev_pf$ev_tab$(ev_dur "$ev_d")$ev_nl"
+	fi
 	ev_phase=
 }
 
@@ -243,6 +246,7 @@ ev_end() {
 	printf '%s' "$ev_rows" | awk -F "$ev_tab" '
 		{ id[NR] = $1; p[NR] = $2; f[NR] = $3; t[NR] = $4; if (length($1) > w) w = length($1) }
 		END {
+			if (NR == 0) exit # no phase had checks, so there is no table
 			if (w < 5) w = 5
 			fmt = "  %-" w "s  %4s  %4s  %6s\n"
 			printf fmt, "phase", "pass", "fail", "time"
@@ -257,30 +261,31 @@ ev_end() {
 		"$ev_out/events.jsonl" "$ev_out/run.log" "$ev_out/manifest.json"
 }
 
-# capture <log> <command...>: tee copies the stream as it comes (POSIX tee does not buffer; awk would, mawk by blocks),
-# so <log> holds the colour codes until the command ends, and then capture rewrites it without them. sh has no
-# pipefail, so the command's status leaves the pipeline through <log>.status, which capture removes. A terminal's
-# Ctrl-C signals the whole process group: tee ignores SIGINT and SIGTERM, and capture and the pipeline's left side wait
-# them out, so the command's own traps (run.sh's cleanup) run to the end, their output still reaches both copies, and
-# capture returns the command's status. capture leaves SIGINT and SIGTERM at their defaults afterwards.
-capture() {
+# capture_start <log>: from here on this shell's stdout and stderr go through a FIFO to tee, which copies them to the
+# console and to <log>. The shell stays the process that was started, so every signal sent to it reaches its own
+# traps as it would without the capture (a terminal's Ctrl-C to the process group, or kill <pid>); a pipeline or a
+# wrapper process would hold a trapped signal until the run ended. tee runs in the background and ignores SIGINT and
+# SIGTERM, so it outlives them and copies the cleanup's output too. fds 8 and 9 keep the original stdout and stderr.
+capture_start() {
 	ev_log=$1
-	shift
-	trap : INT TERM
-	{
-		trap : INT TERM
-		ev_rc=0
-		"$@" 2>&1 || ev_rc=$?
-		printf '%s\n' "$ev_rc" >"$ev_log.status"
-	} | (
+	exec 8>&1 9>&2
+	rm -f "$ev_log.fifo"
+	mkfifo "$ev_log.fifo"
+	(
 		trap '' INT TERM
-		exec tee "$ev_log"
-	)
-	trap - INT TERM
-	ev_rc=$(cat "$ev_log.status" 2>/dev/null) || ev_rc=
-	rm -f "$ev_log.status"
+		exec tee "$ev_log" <"$ev_log.fifo"
+	) &
+	ev_tee=$!
+	exec >"$ev_log.fifo" 2>&1
+	rm -f "$ev_log.fifo"
+}
+
+# capture_finish puts stdout and stderr back, waits for tee to copy the rest (it ends when the FIFO's last writer
+# closes it), then rewrites <log> without colour codes. tee does not buffer; <log> holds the codes until here.
+capture_finish() {
+	exec 1>&8 2>&9 8>&- 9>&-
+	wait "$ev_tee" || :
 	ev_sgr="$(printf '\033')\[[0-9;]*m"
 	LC_ALL=C sed "s/$ev_sgr//g" "$ev_log" >"$ev_log.plain"
 	mv "$ev_log.plain" "$ev_log"
-	return "${ev_rc:-1}"
 }

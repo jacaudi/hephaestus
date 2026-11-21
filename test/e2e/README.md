@@ -178,8 +178,10 @@ three files that record the run:
   No secret, ticket, rendered config or fixture value goes into an event, and the install phase checks that neither the
   ticket nor any value of `fixture-cluster/values.json` appears in `events.jsonl` or `run.log`.
 - `run.log`: everything the run printed to stdout and stderr, every docker build and pull included, as the console showed
-  it, without colour codes. `run.sh` runs itself again under a capture that copies the stream with `tee` and hands the run's
-  exit status back to the wrapper, which a plain `| tee` would lose (POSIX `sh` has no `pipefail`).
+  it, without colour codes. `run.sh` sends its own stdout and stderr through a FIFO to a background `tee` and stays the
+  process that was started, so its exit status and its signal traps are its own, as without the capture (a `| tee`
+  pipeline would lose the status, since POSIX `sh` has no `pipefail`, and a wrapper process would hold a SIGTERM until the
+  run ended).
 - `manifest.json`: every other file in the directory with its `path`, `size` and `sha256`, and `run_id` and `git_commit`,
   written once `run.log` is complete, in the toolbox container (the host is not assumed to have a sha256 tool). A run
   whose manifest cannot be written exits non-zero.
@@ -200,10 +202,10 @@ jq -c 'select(.type == "check" and .result == "fail") | {phase, name, detail, ev
 The run exits non-zero on any failure and zero only when every check passed. A trap on exit, SIGINT and SIGTERM removes every
 `heph-e2e-*` container, the network, the volume, `build/e2e/run/tree`, `build/e2e/run/upstream` and the certificates, and the
 test-CA build output under `build/ipxe/out` only if this run created it (it never deletes files that were already there). On
-Ctrl-C the capture ignores the signal and waits for that trap, so the cleanup and the summary still reach the terminal and
-`run.log`, and the manifest is still written. If a run was killed with SIGKILL, the next run removes the containers, network,
-volume, tree and upstream directory it left; the git-ignored files it left under `build/ipxe/out` are overwritten by the next
-run.
+Ctrl-C or a `kill <pid>`, `tee` ignores the signal, so the cleanup and the summary still reach the terminal and `run.log`, the
+run exits 130 or 143, and the manifest is still written; a second Ctrl-C during the cleanup stops it. If a run was killed
+with SIGKILL, the next run removes the containers, network, volume, tree and upstream directory it left; the git-ignored files
+it left under `build/ipxe/out` are overwritten by the next run.
 
 ## Console
 
@@ -251,12 +253,13 @@ disagree. A shortened run with two failures:
 
 A header names the run. Each phase starts after a blank line with `▸` and its title, its labels dimmed beside it; each check is
 indented with `PASS`, `FAIL` or `NOTE` in a fixed column (a pass or note shows its detail in parentheses); a failure shows what
-it got and its evidence files under it; and a `──` subtotal closes the phase. A failed boot also prints the tail of its serial
-console (`serial|`) under the failure, and a step that stops the run, such as a failed image build, prints its build log's
-tail; when no check failed but the run stopped, the summary says so. The summary has a row per phase, the result with the
-totals and the run's duration, every failure again, and where the record, the full output and the manifest are. Durations read
-`14s`, `5m12s` or `1h02m`. Colour is used only when stdout is a terminal and `NO_COLOR` is unset (https://no-color.org), and
-the words `PASS` and `FAIL` stay, so `grep FAIL build/e2e/<UTC timestamp>/run.log` works.
+it got and its evidence files under it; and a `──` subtotal closes each phase that had checks (a setup phase with none shows
+only its header). A failed boot also prints the tail of its serial console (`serial|`) under the failure, and a step that
+stops the run, such as a failed image build, prints its build log's tail; when no check failed but the run stopped, the
+summary says so. The summary has a row per phase with checks, the result with the totals and the run's duration, every failure
+again, and where the record, the full output and the manifest are. Durations read `14s`, `5m12s` or `1h02m`. Colour is used
+only when stdout is a terminal and `NO_COLOR` is unset (https://no-color.org), and the words `PASS` and `FAIL` stay, so
+`grep FAIL build/e2e/<UTC timestamp>/run.log` works.
 
 ## Pins
 
