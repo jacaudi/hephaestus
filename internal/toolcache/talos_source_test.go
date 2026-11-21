@@ -554,9 +554,9 @@ func TestTalosSpoolName(t *testing.T) {
 		n    int
 		want string
 	}{
-		{"plain id", fleet.TalosKey{Schematic: plainSchematicID, Version: talosTestVersion, Arch: fleet.ArchAMD64}, 0, "talos-376567988ad3-v1.12.11-amd64-0"},
+		{"plain id", fleet.TalosKey{Schematic: plainSchematicID, Version: talosTestVersion, Arch: fleet.ArchAMD64}, 0, "talos-" + plainSchematicID + "-v1.12.11-amd64-0"},
 		{"short schematic", fleet.TalosKey{Schematic: "abcde", Version: talosTestVersion, Arch: fleet.ArchAMD64}, 0, "talos-abcde-v1.12.11-amd64-0"},
-		{"cmdline on arm64", fleet.TalosKey{Schematic: plainSchematicID, Version: talosTestVersion, Arch: fleet.ArchARM64}, 2, "talos-376567988ad3-v1.12.11-arm64-2"},
+		{"cmdline on arm64", fleet.TalosKey{Schematic: plainSchematicID, Version: talosTestVersion, Arch: fleet.ArchARM64}, 2, "talos-" + plainSchematicID + "-v1.12.11-arm64-2"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -564,6 +564,20 @@ func TestTalosSpoolName(t *testing.T) {
 				t.Errorf("TalosSpoolName(%v, %d) = %q, want %q", tt.key, tt.n, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestTalosSpoolName_DistinctSchematicsDoNotShareAFile: two rows whose schematic ids begin alike spool to different files,
+// since the Talos jobs of different keys run at the same time.
+func TestTalosSpoolName_DistinctSchematicsDoNotShareAFile(t *testing.T) {
+	a := fleet.TalosKey{Schematic: plainSchematicID, Version: talosTestVersion, Arch: fleet.ArchAMD64}
+	b := a
+	b.Schematic = plainSchematicID[:12] + strings.Repeat("0", len(plainSchematicID)-12)
+
+	for n := range 3 {
+		if TalosSpoolName(a, n) == TalosSpoolName(b, n) {
+			t.Errorf("part %d: both keys spool to %q", n, TalosSpoolName(a, n))
+		}
 	}
 }
 

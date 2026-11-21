@@ -39,11 +39,11 @@ const (
 )
 
 // TalosSpoolName is the spool file of part n of the row at key, n counting
-// kernel 0, initramfs 1 and cmdline 2: "talos-<schematic>-<version>-<arch>-<n>"
-// with the schematic cut to its first 12 characters. A shorter schematic is
-// used whole, so any stored row has a name.
+// kernel 0, initramfs 1 and cmdline 2: "talos-<schematic>-<version>-<arch>-<n>".
+// The whole schematic is in the name, so rows of different keys never share a
+// file.
 func TalosSpoolName(key fleet.TalosKey, n int) string {
-	return "talos-" + key.Schematic[:min(12, len(key.Schematic))] + "-" + key.Version + "-" + string(key.Arch) + "-" + strconv.Itoa(n)
+	return "talos-" + key.Schematic + "-" + key.Version + "-" + string(key.Arch) + "-" + strconv.Itoa(n)
 }
 
 // talosSource claims talos_cache rows. Each row it claims is a talosJob, which
