@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -112,9 +113,13 @@ type hostDiff struct {
 // clusterDiff is what "cluster diff" reports. PairID is the pending pair, which an approval names; a drift diff has
 // none, and its NewHash is what the drift approval names.
 type clusterDiff struct {
-	Name   string     `json:"name"`
-	PairID string     `json:"pair_id,omitempty"`
-	Hosts  []hostDiff `json:"hosts"`
+	Name   string `json:"name"`
+	PairID string `json:"pair_id,omitempty"`
+	// References are the 1Password references the pending pair resolved, and NewReferences those the approved pair did
+	// not: which items fill the redacted values. Their names are not secret; their values are never shown.
+	References    []string   `json:"references,omitempty"`
+	NewReferences []string   `json:"new_references,omitempty"`
+	Hosts         []hostDiff `json:"hosts"`
 }
 
 // newClusterCmd builds the cluster command group.
@@ -392,7 +397,9 @@ func newClusterDiffCmd(deps cliDeps) *cobra.Command {
 		Short: "Show what the pending pair changes, or what a host's drift changed",
 		Long: `Show, host by host, a unified diff of the redacted render of the pending pair against the approved
 one, and the id that "cluster approve" takes. A host whose redacted render did not change but whose
-real config did shows "secret values changed". With --host, show the drift of that host in the
+real config did shows "secret values changed". It also lists the 1Password references the pending
+pair resolved and those the approved pair did not, so you can see which items fill the redacted values.
+With --host, show the drift of that host in the
 approved pair: its stored render against the running config's, and the hash that "cluster approve
 --host --hash" takes. Secret values are never shown.`,
 		Example: `  hephaestus cluster diff lab
@@ -444,6 +451,9 @@ func clusterDiffOf(ctx context.Context, repo *clusters.Repository, name, host st
 		return clusterDiff{}, err
 	}
 	out := clusterDiff{Name: name, PairID: pairID, Hosts: make([]hostDiff, 0, len(hosts))}
+	if out.References, out.NewReferences, err = diffReferences(ctx, repo, name); err != nil {
+		return clusterDiff{}, err
+	}
 	for i := range hosts {
 		h, err := hostDiffOf("approved/"+hosts[i].Host, "pending/"+hosts[i].Host, hosts[i])
 		if err != nil {
@@ -452,6 +462,42 @@ func clusterDiffOf(ctx context.Context, repo *clusters.Repository, name, host st
 		out.Hosts = append(out.Hosts, h)
 	}
 	return out, nil
+}
+
+// diffReferences returns the references the pending pair of the cluster resolved, and those the approved pair did not.
+func diffReferences(ctx context.Context, repo *clusters.Repository, name string) (all, added []string, err error) {
+	c, err := repo.Get(ctx, name)
+	if err != nil {
+		return nil, nil, err
+	}
+	if all, err = pairReferences(ctx, repo, c.PendingPairID); err != nil {
+		return nil, nil, err
+	}
+	var approved []string
+	if c.ApprovedPairID != "" {
+		if approved, err = pairReferences(ctx, repo, c.ApprovedPairID); err != nil {
+			return nil, nil, err
+		}
+	}
+	for _, ref := range all {
+		if !slices.Contains(approved, ref) {
+			added = append(added, ref)
+		}
+	}
+	return all, added, nil
+}
+
+// pairReferences is the sorted references of the pair's secret version; its values stay in the repository's call.
+func pairReferences(ctx context.Context, repo *clusters.Repository, pairID string) ([]string, error) {
+	p, err := repo.Pair(ctx, pairID)
+	if err != nil {
+		return nil, err
+	}
+	values, err := repo.Values(ctx, p.SecretVersionID)
+	if err != nil {
+		return nil, err
+	}
+	return slices.Sorted(maps.Keys(values)), nil
 }
 
 // hostDiffOf is d as a unified diff of its redacted renders, from fromFile to toFile.
@@ -493,6 +539,8 @@ func diffText(d clusterDiff, drift bool) string {
 			d.Name, safeText(h.Host), d.Name, safeText(h.Host), safeText(h.NewHash))
 	} else {
 		fmt.Fprintf(&b, "pending pair %s of %s; approve it with: cluster approve %s %s\n", d.PairID, d.Name, d.Name, d.PairID)
+		writeReferences(&b, "references", d.References)
+		writeReferences(&b, "new references", d.NewReferences)
 	}
 	for i := range d.Hosts {
 		h := &d.Hosts[i]
@@ -508,6 +556,17 @@ func diffText(d clusterDiff, drift bool) string {
 		}
 	}
 	return b.String()
+}
+
+// writeReferences prints the titled list of references, or nothing when there are none.
+func writeReferences(b *strings.Builder, title string, refs []string) {
+	if len(refs) == 0 {
+		return
+	}
+	fmt.Fprintf(b, "%s:\n", title)
+	for _, ref := range refs {
+		fmt.Fprintf(b, "  %s\n", safeText(ref))
+	}
 }
 
 func newClusterApproveCmd(deps cliDeps) *cobra.Command {

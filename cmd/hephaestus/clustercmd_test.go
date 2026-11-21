@@ -50,6 +50,12 @@ func (c *cliTest) importLab(t *testing.T) clusters.Cluster {
 // storePending stores renders as the pending pair of lab's tree and returns the pair id.
 func (c *cliTest) storePending(t *testing.T, tree string, renders ...render.HostRender) string {
 	t.Helper()
+	return c.storePendingValues(t, tree, map[string]string{"ref+op://vault/item/field": labSecret}, renders...)
+}
+
+// storePendingValues is storePending with the resolved values of the pair's references.
+func (c *cliTest) storePendingValues(t *testing.T, tree string, values map[string]string, renders ...render.HostRender) string {
+	t.Helper()
 	cl, err := c.clusters.Get(t.Context(), labName)
 	if err != nil {
 		t.Fatalf("Get: %v", err)
@@ -59,7 +65,7 @@ func (c *cliTest) storePending(t *testing.T, tree string, renders ...render.Host
 		t.Fatalf("MarkProcessing(%s) = %v, %v; want true, nil", tree, ok, err)
 	}
 	id, stored, err := c.clusters.StorePending(t.Context(), clusters.StorePendingRequest{
-		ClusterID: cl.ID, Tree: tree, Revision: cl.Revision, Values: map[string]string{"ref+op://vault/item/field": labSecret},
+		ClusterID: cl.ID, Tree: tree, Revision: cl.Revision, Values: values,
 		TalosVersion: labTalos, Renders: renders, At: cliT0,
 	})
 	if err != nil || !stored {
@@ -406,6 +412,38 @@ func TestClusterDiff_SecretValuesChanged(t *testing.T) {
 	first, _ := hosts[0].(map[string]any)
 	if len(hosts) != 1 || first["secret_values_changed"] != true || first["diff"] != "" {
 		t.Errorf("JSON hosts = %v, want cp-01 with secret_values_changed and an empty diff", obj["hosts"])
+	}
+}
+
+// TestClusterDiff_ListsReferences: the approver sees which 1Password items fill the redacted values, and which of them the
+// approved pair did not use; the values stay out.
+func TestClusterDiff_ListsReferences(t *testing.T) {
+	c := newCLITest(t)
+	c.importLab(t)
+	const (
+		kept  = "ref+op://vault/item/field"
+		added = "ref+op://other-vault/item2/field2"
+	)
+	c.approveLab(t, c.storePending(t, "T1", labHost("cp-01", labConfig("cp-01", 1), "c1", "d1")))
+	c.storePendingValues(t, "T2", map[string]string{kept: labSecret, added: labSecret + "-2"},
+		labHost("cp-01", labConfig("cp-01", 1), "c2", "d1"))
+
+	out := c.mustRun(t, "cluster", "diff", labName)
+
+	for _, want := range []string{"references:\n  " + added + "\n  " + kept + "\n", "new references:\n  " + added + "\n"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output lacks %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, labSecret) {
+		t.Errorf("output holds a secret value:\n%s", out)
+	}
+	obj := jsonObject(t, c.mustRun(t, "cluster", "diff", labName, "--json"))
+	if got, _ := obj["references"].([]any); len(got) != 2 || got[0] != added || got[1] != kept {
+		t.Errorf("JSON references = %v, want [%s %s], sorted", obj["references"], added, kept)
+	}
+	if got, _ := obj["new_references"].([]any); len(got) != 1 || got[0] != added {
+		t.Errorf("JSON new_references = %v, want [%s]", obj["new_references"], added)
 	}
 }
 
