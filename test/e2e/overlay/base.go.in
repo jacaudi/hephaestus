@@ -1,0 +1,6 @@
+package factory
+
+// Base is the address of the end-to-end harness's fake image factory: test/e2e/run.sh copies this file over
+// internal/factory/base.go in its temporary copy of the tracked tree, and test/e2e/upstreams serves the name. It is not
+// compiled in the repository, so the production binary always talks to the public factory.
+const Base = "https://factory.e2e.test"

@@ -2,7 +2,9 @@
 # QEMU end-to-end test (design §7 criterion 6). Run it as `task e2e`; it needs a reachable Docker daemon
 # (colima: set DOCKER_HOST) and nothing else on the host (see test/e2e/README.md). Boots amd64 UEFI, amd64 BIOS
 # and arm64 UEFI VMs through hephaestus in file mode, then the M2 utility phase against a local TLS 1.3 fake upstream
-# (three cases on the same firmwares), then amd64 UEFI again with hephaestus behind Caddy.
+# (three cases on the same firmwares), then the M3 install phase (a fixture cluster imported from a git host, approved,
+# and the amd64 UEFI VM booted to its install script, against the upstreams program's fake factory), then amd64 UEFI
+# again with hephaestus behind Caddy.
 # Prints a PASS or FAIL line per check and writes every log to build/e2e/<UTC timestamp>/. On any exit it
 # removes the heph-e2e-* containers, network and volume, and the temporary source copy, fake-upstream files, certificates
 # and test-CA build outputs that this run created. The names, network and subnet are fixed: one run at a time.
@@ -18,6 +20,8 @@ fi
 # --- pins and topology (the spike's, design §7) ---
 # Caddy is pinned by the digest of its multi-arch index (caddy:2 on 2026-11-15); the toolbox pins its own base.
 CADDY_IMAGE=docker.io/library/caddy:2@sha256:4e2425f6009577e7c651010f16679c28f7d12df3e7b1914f941a7a3370746b3c
+# The upstreams program runs with `go run` in the image the production Dockerfile builds with (it carries git).
+GO_IMAGE=docker.io/library/golang:1.27.4-trixie@sha256:b54b2639de8c1bfe538ec5ffc45f29b1932235ac5f6d63c059853646677112d9
 TOOLS=hephaestus-e2e-qemu:local
 FIXTURE=hephaestus-e2e-fixture:local # test/e2e/fixture: the files the fake upstream serves
 PIN_IMAGE=hephaestus-catalogpin:e2e
@@ -39,13 +43,23 @@ DNS_IP=10.99.0.2
 HEPH_IP=10.99.0.10
 CADDY_IP=10.99.0.11
 UPSTREAM_IP=10.99.0.12
+UPSTREAMS_IP=10.99.0.13 # test/e2e/upstreams: the fake factory, its assets host and the git host
 QEMU_IP=10.99.0.20
 FQDN=hephaestus.e2e.test
 UPSTREAM_FQDN=upstream.e2e.test
+FACTORY_FQDN=factory.e2e.test # test/e2e/overlay/base.go.in points hephaestus here
+ASSETS_FQDN=assets.factory.e2e.test
+GIT_FQDN=git.e2e.test
+# The fixture cluster (test/e2e/fixture-cluster/lab): its plain schematic and Talos version, and the test data key.
+TALOS_SCHEMATIC=376567988ad370138ad8b2698212367b8edcb69b5fd68c80be1f2ec7d603b4ba
+TALOS_VERSION=v1.12.11
+DATA_KEY=AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=
 BOOT_TIMEOUT=120 # seconds per boot
 # A utility boot runs a TCG VM through a kernel and, for e2e-live, a second-stage fetch: a fail line takes up to about
 # 2 minutes on its own (30 s for the interface, 30 s for DHCP, 60 s for the fetch).
 UTILITY_TIMEOUT=300
+# An install boot holds at row 8 until the Talos assets are fetched; the hold script asks /boot again every 30 s.
+INSTALL_TIMEOUT=300
 TASK=${TASK_EXE:-task}
 
 ts=$(date -u +%Y%m%dT%H%M%SZ)
@@ -132,7 +146,7 @@ mark() { docker logs "$1" 2>&1 | wc -l | tr -d ' '; }
 since() { docker logs "$1" 2>&1 | tail -n +$(($2 + 1)); }
 
 save_logs() {
-	for c in dnsmasq hephaestus caddy upstream qemu; do
+	for c in dnsmasq hephaestus caddy upstream upstreams qemu; do
 		if docker inspect "heph-e2e-$c" >/dev/null 2>&1; then
 			case $c in hephaestus | dnsmasq) label=$c-$heph_mode ;; *) label=$c ;; esac
 			docker logs "heph-e2e-$c" >"$out/$label.log" 2>&1 || true
@@ -180,6 +194,8 @@ start_hephaestus() { # file | proxy
 		--cap-drop ALL --cap-add NET_BIND_SERVICE --sysctl net.ipv4.ip_unprivileged_port_start=1024 \
 		-v "$VOL":/var/lib/hephaestus -v "$root/$certs:/certs:ro" \
 		--add-host "$UPSTREAM_FQDN:$UPSTREAM_IP" -e SSL_CERT_FILE=/certs/ca.pem \
+		--add-host "$FACTORY_FQDN:$UPSTREAMS_IP" --add-host "$ASSETS_FQDN:$UPSTREAMS_IP" --add-host "$GIT_FQDN:$UPSTREAMS_IP" \
+		-e HEPHAESTUS_DATA_KEY="$DATA_KEY" -e HEPHAESTUS_OP_TOKEN=e2e-dummy \
 		-e HEPHAESTUS_FQDN="$FQDN" -e HEPHAESTUS_PROVISIONING_INTERFACE=eth0 \
 		-e HEPHAESTUS_PROVISIONING_ADDRESS="$HEPH_IP" -e HEPHAESTUS_PROVISIONING_SUBNET=10.99.0.0/24 \
 		-e HEPHAESTUS_TLS_MODE="$heph_mode" -e HEPHAESTUS_LOG_LEVEL=debug
@@ -205,10 +221,38 @@ wait_for() { # <what> <seconds> <command...>
 	done
 }
 
-# unknown_action defaults to local (row 7 exit); M1 has no UI, so seed hold straight into the database.
-seed_hold() {
-	sqlite_q "UPDATE settings SET value='hold' WHERE key='unknown_action'"
-	[ "$(sqlite_q "SELECT value FROM settings WHERE key='unknown_action'")" = hold ]
+# unknown_is_hold: the unknown_action setting is hold (it defaults to local, the row 7 exit).
+unknown_is_hold() { [ "$(sqlite_q "SELECT value FROM settings WHERE key='unknown_action'")" = hold ]; }
+
+# The upstreams program (test/e2e/upstreams), built from the working tree with `go run`. Its work directory is a tmpfs:
+# it commits the fixture tree to /work/lab.git at start.
+start_upstreams() {
+	docker run -d --name heph-e2e-upstreams --network "$NET" --ip "$UPSTREAMS_IP" \
+		-v "$root:/src:ro" -v "$root/$certs:/certs:ro" --tmpfs /work -w /src \
+		-e GOFLAGS=-buildvcs=false -e GOTOOLCHAIN=local -e UPSTREAMS_ADDR=:443 \
+		-e UPSTREAMS_FACTORY_CERT_FILE=/certs/factory-fullchain.pem -e UPSTREAMS_FACTORY_KEY_FILE=/certs/factory-privkey.pem \
+		-e UPSTREAMS_ASSETS_CERT_FILE=/certs/assets-fullchain.pem -e UPSTREAMS_ASSETS_KEY_FILE=/certs/assets-privkey.pem \
+		-e UPSTREAMS_GIT_CERT_FILE=/certs/git-fullchain.pem -e UPSTREAMS_GIT_KEY_FILE=/certs/git-privkey.pem \
+		-e UPSTREAMS_FIXTURE_DIR=/src/test/e2e/fixture-cluster -e UPSTREAMS_WORK_DIR=/work \
+		"$GO_IMAGE" go run ./test/e2e/upstreams >/dev/null
+	# The first run compiles the program in a fresh container.
+	wait_for "the upstreams program listening" 300 sh -c 'docker logs heph-e2e-upstreams 2>&1 | grep -q "\"msg\":\"listening\""'
+}
+
+# upstreams_tls_checks: each name the program serves completes a TLS 1.3 handshake whose certificate verifies for that
+# name against the test CA (the program picks the leaf by SNI), and TLS 1.2 is refused.
+upstreams_tls_checks() {
+	for h in "$FACTORY_FQDN" "$ASSETS_FQDN" "$GIT_FQDN"; do
+		r=$(docker run --rm --network "$NET" -v "$root/$certs:/certs:ro" "$TOOLS" \
+			sh -c "openssl s_client -connect $UPSTREAMS_IP:443 -servername $h -verify_hostname $h -CAfile /certs/ca.pem -tls1_3 </dev/null 2>&1" || true)
+		printf '%s\n' "$r" >"$out/tls13-upstreams-$h.txt"
+		check "upstreams: TLS 1.3 to $h verifies against the test CA for that name" \
+			sh -c 'grep -q "Verify return code: 0 (ok)" "$1" && grep -q "TLSv1.3" "$1"' _ "$out/tls13-upstreams-$h.txt"
+	done
+	r=$(docker run --rm --network "$NET" -v "$root/$certs:/certs:ro" "$TOOLS" \
+		sh -c "openssl s_client -connect $UPSTREAMS_IP:443 -servername $FACTORY_FQDN -CAfile /certs/ca.pem -tls1_2 </dev/null 2>&1" || true)
+	printf '%s\n' "$r" >"$out/tls12-upstreams.txt"
+	check "upstreams: openssl s_client -tls1_2 gets a protocol-version alert" grep -qi "alert protocol version" "$out/tls12-upstreams.txt"
 }
 
 # --- run-level checks ---
@@ -504,6 +548,150 @@ utility_boot() {
 	check "$name: one boot_next.cleared audit with reason $reason (${cleared0:-unread} -> ${cleared1:-unread})" one_more "$cleared0" "$cleared1"
 }
 
+# --- the install phase (M3, design 5.10) ---
+# lab_pending: `cluster list --json` shows a pending pair for lab.
+lab_pending() { heph cluster list --json | box jq -e '.[] | select(.name == "lab") | .pending_pair_id != ""'; }
+# machine_is <mac> <jq filter>: `machine show --json` of the machine satisfies the filter.
+machine_is() { heph machine show "$1" --json | box jq -e "$2"; }
+# tool_curl <curl args...>: curl from a container on the subnet, trusting only the test CA, over TLS 1.3, with the
+# hephaestus FQDN resolved to hephaestus.
+tool_curl() {
+	docker run --rm --network "$NET" -v "$root/$certs:/certs:ro" "$TOOLS" \
+		curl --cacert /certs/ca.pem --tlsv1.3 --resolve "$FQDN:443:$HEPH_IP" "$@"
+}
+# served_controlplane: $cfg, the body /config served, is a control-plane machine config.
+served_controlplane() { printf '%s\n' "$cfg" | grep -q 'type: controlplane'; }
+# ticket_not_in <log>: the log is not empty and does not hold $token, the ticket the install script carried.
+ticket_not_in() { [ -n "$token" ] && [ -s "$1" ] && ! printf '%s\n' "$token" | grep -qF -f /dev/stdin "$1"; }
+# no_fixture_secret <log>: the log is not empty and holds none of the fixture's secret values.
+no_fixture_secret() {
+	vals=$(box jq -r '.[]' <"$root/test/e2e/fixture-cluster/values.json") || return 1
+	[ -n "$vals" ] && [ -s "$1" ] || return 1
+	! printf '%s\n' "$vals" | grep -qF -f /dev/stdin "$1"
+}
+
+# cluster_setup <mac>: imports the fixture cluster from the git host, approves its first pair once it is pending, and
+# approves the machine into lab/cp-01.
+cluster_setup() {
+	check "cluster import lab exits 0" heph_to "$out/cluster-import.txt" cluster import lab --repo "https://$GIT_FQDN/lab.git" --ref main --path lab
+	check "cluster list --json shows a pending pair for lab within 120 polls" wait_for 'a pending pair for lab' 120 lab_pending
+	heph cluster list --json >"$out/cluster-list.json" 2>&1 || true
+	pair=$(box jq -r '.[] | select(.name == "lab") | .pending_pair_id' <"$out/cluster-list.json" || true)
+	check "cluster approve lab ${pair:-<no pair>} exits 0" heph_to "$out/cluster-approve.txt" cluster approve lab "$pair"
+	check "machine approve $1 lab/cp-01 exits 0" heph_to "$out/machine-approve.txt" machine approve "$1" lab/cp-01
+}
+
+# install_boot <name> <firmware> <mac> <arch>: boots the approved machine until iPXE runs the fake kernel the install
+# script loaded (the upstreams program serves an iPXE script as the kernel, which prints HEPHAESTUS-E2E-TALOS-KERNEL),
+# then judges each leg: row 10 install, the kernel and initramfs from hephaestus, the ready Talos row, the live ticket.
+install_boot() {
+	name=$1 fw=$2 mac=$3 arch=$4
+	uuid=e2e00000-0000-4000-8000-$(printf '%s' "$mac" | tr -d :)
+	serial=$out/$name.serial.log
+	st=$out/$name.serial.txt
+	base=/t/$TALOS_SCHEMATIC/$TALOS_VERSION/$arch
+	step "install boot $name ($fw, $arch)"
+	hm=$(mark heph-e2e-hephaestus)
+	: >"$serial"
+	: >"$st"
+	docker exec heph-e2e-qemu /e2e/run-vm.sh "$name" "$fw" "$mac" "$uuid" "$((INSTALL_TIMEOUT + 10))" >"$out/$name.vm.log" 2>&1 &
+	vm=$!
+
+	started=$(date +%s)
+	result=timeout
+	while [ "$(($(date +%s) - started))" -lt "$INSTALL_TIMEOUT" ]; do
+		tr -d '\r' <"$serial" >"$st"
+		grep -qF 'HEPHAESTUS-E2E-TALOS-KERNEL booted' "$st" && { result=reached; break; }
+		grep -qE 'Could not boot|giving up' "$st" && { result=failed; break; }
+		kill -0 "$vm" 2>/dev/null || { result=exited; break; }
+		sleep 2
+	done
+	elapsed=$(($(date +%s) - started))
+	docker exec heph-e2e-qemu pkill -f qemu-system >/dev/null 2>&1 || true
+	wait "$vm" || true
+	tr -d '\r' <"$serial" >"$st"
+	since heph-e2e-hephaestus "$hm" >"$out/$name.hephaestus.log"
+	docker logs heph-e2e-dnsmasq >"$out/dnsmasq-$heph_mode.log" 2>&1 || true
+	hlog=$out/$name.hephaestus.log
+
+	if [ "$result" = reached ]; then
+		pass "$name: iPXE booted the fake Talos kernel after ${elapsed}s (serial: HEPHAESTUS-E2E-TALOS-KERNEL booted)"
+	else
+		fail "$name: $result after ${elapsed}s (no fake Talos kernel on serial within ${INSTALL_TIMEOUT}s)"
+		tail -n 15 "$st" | sed 's/^/    serial| /'
+	fi
+	re=$(lease_re "$out/dnsmasq-$heph_mode.log" "$mac")
+	check "$name: dnsmasq leased an address to $mac" test -n "$re"
+	[ -n "$re" ] || re='^no-lease$' # an empty pattern would match every address
+	check "$name: $(basename "$hlog") is not empty" test -s "$hlog"
+	n=$(jn "$hlog" --arg ip "$re" 'fromjson? | select(.msg=="request" and .path=="/boot" and .status==200 and .tls==true and .decision_row==10 and .action=="install" and (.remote_ip|test($ip)))')
+	check "$name: /boot 200 row 10, action install, over TLS" ge "$n" 1
+	for f in kernel initramfs; do
+		n=$(jn "$hlog" --arg ip "$re" --arg p "$base/$f" 'fromjson? | select(.msg=="request" and .path==$p and .status==200 and .tls==false and (.remote_ip|test($ip)))')
+		check "$name: GET $base/$f 200 from the VM over plain HTTP" ge "$n" 1
+	done
+	heph machine show "$mac" --json >"$out/$name.machine.json" 2>&1 || true
+	check "$name: machine show: assigned to lab/cp-01" machine_is "$mac" '.state == "assigned" and .cluster == "lab" and .host == "cp-01"'
+	check "$name: machine show: the Talos row is ready" machine_is "$mac" '.talos.state == "ready"'
+	check "$name: machine show: a live ticket, its config not yet asked for" machine_is "$mac" '.ticket != null and .ticket.config_requested == false'
+}
+
+# config_fetch <name> <mac>: Talos's own HTTPS /config fetch cannot trust the test CA (it stays lab test 3), so the
+# harness stands in for it. It asks /boot as the machine from a container on the subnet, as iPXE does (the machine's
+# UUID, MAC, serial and product, so row 2 sees no other identity), takes the talos.config URL from the install script and
+# fetches it twice: the first is served and recorded, the second refused, since a ticket is single-use. The script and the
+# config carry the ticket and the fixture's secret values, so neither is written to the output directory.
+config_fetch() {
+	name=$1 mac=$2
+	uuid=e2e00000-0000-4000-8000-$(printf '%s' "$mac" | tr -d :)
+	step "config fetch $name (the harness in Talos's place)"
+	hm=$(mark heph-e2e-hephaestus)
+	heph machine show "$mac" --json >"$out/$name.before.json" 2>&1 || true
+	ser=$(box jq -r '.serial' <"$out/$name.before.json" || true)
+	prod=$(box jq -r '.product' <"$out/$name.before.json" || true)
+	script=$(tool_curl -fsS -G "https://$FQDN/boot" --data-urlencode "uuid=$uuid" \
+		--data-urlencode "mac=$(printf '%s' "$mac" | tr : -)" --data-urlencode arch=x86_64 --data-urlencode platform=efi \
+		--data-urlencode "serial=$ser" --data-urlencode "product=$prod" 2>"$out/$name.boot.err" || true)
+	url=$(printf '%s\n' "$script" | sed -n 's/.* talos\.config=\([^ ]*\).*/\1/p' | sed 's/\${uuid}/'"$uuid"'/')
+	token=${url##*&t=}
+	check "$name: /boot as the machine answers an install script with a talos.config URL and a ticket" \
+		sh -c 'case $1 in "https://$2/config?u=$3&t="?*) ;; *) exit 1 ;; esac' _ "$url" "$FQDN" "$uuid"
+	cfg=$(tool_curl -fsS "$url" 2>"$out/$name.config.err" || true)
+	check "$name: GET /config with the ticket is served a control-plane machine config" served_controlplane
+	code=$(tool_curl -s -o /dev/null -w '%{http_code}' "$url" || true)
+	check "$name: the same ticket again gets 404 (got ${code:-none})" test "$code" = 404
+	since heph-e2e-hephaestus "$hm" >"$out/$name.hephaestus.log"
+	hlog=$out/$name.hephaestus.log
+	n=$(jn "$hlog" 'fromjson? | select(.msg=="request" and .path=="/config" and .status==200 and .outcome=="served")')
+	check "$name: hephaestus logged exactly one /config 200 served (found ${n:-0})" test "${n:-0}" -eq 1
+	n=$(jn "$hlog" 'fromjson? | select(.msg=="request" and .path=="/config" and .status==404 and (.outcome|startswith("refused_")))')
+	check "$name: hephaestus logged exactly one /config 404 refusal (found ${n:-0})" test "${n:-0}" -eq 1
+	check "$name: the ticket appears nowhere in the hephaestus log" ticket_not_in "$hlog"
+	unset script cfg url token
+	check "$name: machine show: installing, with no live ticket (the delivery is recorded)" machine_is "$mac" '.state == "installing" and .ticket == null'
+	heph audit list --machine "$mac" --json >"$out/$name.audit.json" 2>&1 || true
+	n=$(box jq '[.[] | select(.action == "config.served")] | length' <"$out/$name.audit.json" || true)
+	check "$name: one config.served audit event (found ${n:-unread})" test "${n:-0}" -eq 1
+}
+
+# upstreams_checks <arch>: the upstreams program's request log shows hephaestus cloning lab.git and following the
+# factory's 302 to the assets host for each Talos part; no fixture secret value appears in either program's log.
+upstreams_checks() {
+	ulog=$out/upstreams.log
+	docker logs heph-e2e-upstreams >"$ulog" 2>&1 || true
+	n=$(jn "$ulog" --arg h "$GIT_FQDN" 'fromjson? | select(.msg=="request" and .host==$h and .status==200 and (.path|startswith("/lab.git/")))')
+	check "upstreams: hephaestus fetched lab.git over smart HTTP (found ${n:-0} requests)" ge "$n" 1
+	for f in "kernel-$1" "initramfs-$1.xz" "cmdline-metal-$1"; do
+		n=$(jn "$ulog" --arg h "$FACTORY_FQDN" --arg p "/image/$TALOS_SCHEMATIC/$TALOS_VERSION/$f" 'fromjson? | select(.msg=="request" and .host==$h and .path==$p and .status==302)')
+		check "upstreams: $FACTORY_FQDN answered the image request for $f with a 302" ge "$n" 1
+	done
+	n=$(jn "$ulog" --arg h "$ASSETS_FQDN" 'fromjson? | select(.msg=="request" and .host==$h and (.status==200 or .status==206) and (.path|startswith("/assets/")))')
+	check "upstreams: hephaestus followed the 302s to $ASSETS_FQDN, which served the assets (found ${n:-0}, want 3 or more)" ge "$n" 3
+	docker logs heph-e2e-hephaestus >"$out/install-phase.hephaestus.log" 2>&1 || true
+	check "no fixture secret value appears in the hephaestus log" no_fixture_secret "$out/install-phase.hephaestus.log"
+	check "no fixture secret value appears in the upstreams log" no_fixture_secret "$ulog"
+}
+
 # --- main ---
 step "clean up anything a killed run left behind"
 remove_all
@@ -538,6 +726,10 @@ docker run -d --name heph-e2e-upstream --network "$NET" --ip "$UPSTREAM_IP" \
 	"$CADDY_IMAGE" caddy run --config /caddy/upstream.json >/dev/null
 wait_for "the upstream listening" 30 sh -c 'docker logs heph-e2e-upstream 2>&1 | grep -q "serving initial configuration"'
 
+step "the upstreams program at $UPSTREAMS_IP: fake image factory, its assets host and the fixture cluster's git host"
+start_upstreams
+upstreams_tls_checks
+
 step "temporary copy of the tracked tree, with the e2e catalog overlay and the test-CA binaries"
 # The repository tree and the production Dockerfile never hold the overlay or test-CA binaries: they live only in this
 # copy. sh has no pipefail, so the archive goes through a file and each tar's status is checked (set -e): a tracked file
@@ -565,11 +757,15 @@ cp "$tree/internal/catalog/catalog_pins.go" "$out/catalog_pins.go.txt" # not .go
 check "pin: the catalogpin summary says PINNED 4 ABSENT 0" grep -qx 'PINNED 4 ABSENT 0' "$out/pin.out"
 [ "$fails" -eq 0 ] || { cat "$out/pin-report.txt"; exit 1; }
 
-step "hephaestus:e2e from that copy, with the test-CA binaries overlaid"
+step "hephaestus:e2e from that copy, with the test-CA binaries, the factory base and the fixture resolver overlaid"
 # The test-CA binaries go in only now: the pin image does not need them, and changing its build context every run (the test
 # CA is new every run) would rerun its go build. DATE is the HEAD commit's, so a per-run value does not invalidate the
-# build cache from the first RUN after ARG DATE on.
+# build cache from the first RUN after ARG DATE on. The two overlays point the factory at the upstreams program and resolve
+# references from the fixture's values.json, embedded beside the resolver (//go:embed paths are package-relative).
 cp "$testca_dir"/* "$tree/internal/boot/ipxe/bin/"
+cp "$root/test/e2e/overlay/base.go.in" "$tree/internal/factory/base.go"
+cp "$root/test/e2e/overlay/resolver.go.in" "$tree/internal/secrets/onepassword.go"
+cp "$root/test/e2e/fixture-cluster/values.json" "$tree/internal/secrets/e2e_values.json"
 docker buildx build --platform "$PLATFORM" --load -q \
 	--build-arg VERSION=e2e --build-arg COMMIT="$(git rev-parse --short HEAD)" \
 	--build-arg DATE="$(TZ=UTC git log -1 --date=format-local:%Y-%m-%dT%H:%M:%SZ --format=%cd)" \
@@ -581,7 +777,8 @@ docker run -d --name heph-e2e-qemu --network "$NET" --ip "$QEMU_IP" --cap-add NE
 	-v "$root/test/e2e/qemu:/e2e:ro" -v "$root/$out:/out" "$TOOLS" sleep infinity >/dev/null
 start_dnsmasq "$HEPH_IP"
 start_hephaestus file
-check "seed: unknown_action = hold" seed_hold
+check "unknown-action set hold --yes exits 0" heph_to "$out/unknown-action.txt" unknown-action set hold --yes
+check "settings: unknown_action is hold" unknown_is_hold
 
 step "run-level checks (file mode)"
 tls_checks file "$HEPH_IP" heph-e2e-hephaestus
@@ -606,6 +803,12 @@ utility_boot live-aarch64 aarch64 52:54:00:e2:e0:05 arm64 e2e-live live live/vml
 
 step "case 3: a UEFI-only entry set on the BIOS VM is cleared as unsupported and the VM holds at row 7"
 utility_boot unsupported-seabios seabios 52:54:00:e2:e0:04 amd64 e2e-shell unsupported
+
+step "install phase (M3): import the fixture cluster from $GIT_FQDN, approve its pair and the ovmf machine into lab/cp-01"
+cluster_setup 52:54:00:e2:e0:03
+install_boot install-ovmf ovmf 52:54:00:e2:e0:03 amd64
+config_fetch install-ovmf 52:54:00:e2:e0:03
+upstreams_checks amd64
 
 step "proxy mode: Caddy at $CADDY_IP terminates TLS, hephaestus serves plain HTTP behind it"
 save_logs

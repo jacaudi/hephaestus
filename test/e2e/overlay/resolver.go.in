@@ -1,0 +1,88 @@
+package secrets
+
+// The end-to-end resolver: test/e2e/run.sh copies this file over internal/secrets/onepassword.go in its temporary copy
+// of the tracked tree, and test/e2e/fixture-cluster/values.json beside it as e2e_values.json. It keeps the exported API
+// of the 1Password resolver and answers from those fixture values without calling 1Password. It is not compiled in the
+// repository, so it never reaches the production binary, and the harness's dummy token only satisfies serve's rule that
+// a token is set.
+
+import (
+	"context"
+	_ "embed" // the fixture values
+	"encoding/json"
+	"errors"
+
+	"go.jacaudi.dev/hephaestus/internal/secret"
+)
+
+// e2eValues maps each fixture reference (ref+op://...) to its value.
+//
+//go:embed e2e_values.json
+var e2eValues []byte
+
+// ErrRateLimited means 1Password refused a call because the service account reached its rate limit. The fixture
+// resolver never returns it.
+var ErrRateLimited = errors.New("secrets: 1Password rate limit reached")
+
+// Result is the outcome for one reference: a value, or the reason there is none.
+type Result struct {
+	Value secret.Secret
+	Err   error
+}
+
+// ReferenceError is the failure of one reference while the call as a whole succeeded: here always Kind "missing", a
+// reference the fixture values do not hold. It never holds a value.
+type ReferenceError struct {
+	Ref  string
+	Kind string
+}
+
+// Error names the reference and the kind of failure.
+func (e *ReferenceError) Error() string {
+	return "secrets: reference " + e.Ref + " not resolved: " + e.Kind
+}
+
+// WholeCallError is a failure of the call as a whole: here only fixture values that do not decode.
+type WholeCallError struct {
+	Err      error
+	Panicked bool
+}
+
+// Error reports a whole-call failure without the cause's text.
+func (e *WholeCallError) Error() string {
+	if e.Panicked {
+		return "secrets: 1Password call failed: the SDK core panicked"
+	}
+
+	return "secrets: 1Password call failed"
+}
+
+// Unwrap returns the cause.
+func (e *WholeCallError) Unwrap() error { return e.Err }
+
+// OnePassword resolves references from the fixture values.
+type OnePassword struct{}
+
+// NewOnePassword returns the fixture resolver; the token and version are not used.
+func NewOnePassword(_ secret.Secret, _ string) *OnePassword {
+	return &OnePassword{}
+}
+
+// ResolveAll answers every reference from the fixture values, keyed by the reference.
+func (*OnePassword) ResolveAll(_ context.Context, refs []string) (map[string]Result, error) {
+	var values map[string]string
+	if err := json.Unmarshal(e2eValues, &values); err != nil {
+		return nil, &WholeCallError{Err: err}
+	}
+
+	results := make(map[string]Result, len(refs))
+	for _, ref := range refs {
+		if v, ok := values[ref]; ok {
+			results[ref] = Result{Value: secret.Secret(v)}
+		} else {
+			results[ref] = Result{Err: &ReferenceError{Ref: ref, Kind: "missing"}}
+		}
+	}
+
+	return results, nil
+}

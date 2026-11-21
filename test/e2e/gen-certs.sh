@@ -1,6 +1,8 @@
 #!/bin/sh
-# Generates the e2e test CA and two leaves into /certs: hephaestus.e2e.test (privkey.pem, fullchain.pem) and
-# upstream.e2e.test, the fake upstream's (upstream-privkey.pem, upstream-fullchain.pem). Runs inside the toolbox image.
+# Generates the e2e test CA and five leaves into /certs: hephaestus.e2e.test (privkey.pem, fullchain.pem),
+# upstream.e2e.test, the fake upstream's (upstream-privkey.pem, upstream-fullchain.pem), and the three names the
+# upstreams program serves: factory.e2e.test (factory-*), assets.factory.e2e.test (assets-*) and git.e2e.test (git-*).
+# Runs inside the toolbox image.
 # RSA-2048, with notBefore back-dated so clock skew between host and VM cannot reject the chain.
 set -eu
 cd /certs
@@ -18,4 +20,7 @@ issue() {
 }
 issue hephaestus.e2e.test privkey.pem fullchain.pem
 issue upstream.e2e.test upstream-privkey.pem upstream-fullchain.pem
+issue factory.e2e.test factory-privkey.pem factory-fullchain.pem
+issue assets.factory.e2e.test assets-privkey.pem assets-fullchain.pem
+issue git.e2e.test git-privkey.pem git-fullchain.pem
 chmod 0644 ./*.pem ca.key # readable by UID 65532 through a :ro mount; throwaway test keys
