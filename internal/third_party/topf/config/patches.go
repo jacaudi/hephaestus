@@ -190,11 +190,30 @@ func (w *patchWalker) link(name string, chain []string) error {
 	return nil
 }
 
+// MaxTemplateOutput is the most bytes one template may render.
+//
+// hephaestus: new — Topf renders into an unbounded buffer; it is an operator-run CLI, not a long-running server.
+const MaxTemplateOutput = 16 << 20
+
+// ErrTemplateOutput is a template that renders more than MaxTemplateOutput bytes.
+var ErrTemplateOutput = errors.New("template output exceeds the limit")
+
+// limitedBuffer is a bytes.Buffer that refuses a write that would take it past MaxTemplateOutput.
+type limitedBuffer struct{ bytes.Buffer }
+
+func (b *limitedBuffer) Write(p []byte) (int, error) {
+	if b.Len()+len(p) > MaxTemplateOutput {
+		return 0, ErrTemplateOutput
+	}
+
+	return b.Buffer.Write(p)
+}
+
 // RenderTemplate renders a Go template file with the given data.
 // The template has access to funcs and uses "missingkey=error".
 //
 // hephaestus: changed — the file is read from fsys, and the function map is a parameter where Topf fixed it to
-// the sprig function library (http://masterminds.github.io/sprig/).
+// the sprig function library (http://masterminds.github.io/sprig/). The output is bounded by MaxTemplateOutput.
 func RenderTemplate(fsys fs.FS, name string, funcs template.FuncMap, data any) ([]byte, error) {
 	content, err := fs.ReadFile(fsys, name)
 	if err != nil {
@@ -206,7 +225,7 @@ func RenderTemplate(fsys fs.FS, name string, funcs template.FuncMap, data any) (
 		return nil, fmt.Errorf("failed to parse template %s: %w", name, err)
 	}
 
-	var buf bytes.Buffer
+	var buf limitedBuffer
 
 	if err := tmpl.Execute(&buf, data); err != nil {
 		return nil, fmt.Errorf("failed to execute template %s: %w", name, err)

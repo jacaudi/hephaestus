@@ -1,6 +1,8 @@
 package render
 
 import (
+	"fmt"
+	"math"
 	"path"
 	"slices"
 	"strings"
@@ -60,7 +62,16 @@ func DeniedFuncs() []string {
 	}
 }
 
-// FuncMap returns the template functions of a definition: sprig.HermeticTxtFuncMap() restricted to AllowedFuncs().
+// The bounds on what one call of the functions that build a sequence may build: a definition is untrusted text, and
+// a count it names is not.
+const (
+	maxRepeatBytes = 1 << 20
+	maxSequence    = 100_000
+)
+
+// FuncMap returns the template functions of a definition: sprig.HermeticTxtFuncMap() restricted to AllowedFuncs(),
+// with repeat, until, untilStep and seq refusing a call that would build more than maxRepeatBytes or maxSequence
+// items.
 func FuncMap() template.FuncMap {
 	hermetic := sprig.HermeticTxtFuncMap()
 	allowed := AllowedFuncs()
@@ -72,7 +83,68 @@ func FuncMap() template.FuncMap {
 		}
 	}
 
+	boundSequences(funcs)
+
 	return funcs
+}
+
+// boundSequences replaces the functions of funcs that build a string or list as long as an argument says.
+func boundSequences(funcs template.FuncMap) {
+	// The signatures are sprig's; TestFuncMap_BoundedFunctionsKeepSprigResults fails on an upgrade that changes one.
+	repeat := funcs["repeat"].(func(int, string) string)        //nolint:forcetypeassert // pinned by the test named above
+	until := funcs["until"].(func(int) []int)                   //nolint:forcetypeassert // pinned by the test named above
+	untilStep := funcs["untilStep"].(func(int, int, int) []int) //nolint:forcetypeassert // pinned by the test named above
+	seq := funcs["seq"].(func(...int) string)                   //nolint:forcetypeassert // pinned by the test named above
+
+	funcs["repeat"] = func(count int, s string) (string, error) {
+		if count > 0 && len(s) > 0 && count > maxRepeatBytes/len(s) {
+			return "", fmt.Errorf("repeat: %d copies of %d bytes exceed the limit of %d bytes", count, len(s), maxRepeatBytes)
+		}
+
+		return repeat(count, s), nil
+	}
+	funcs["until"] = func(count int) ([]int, error) {
+		if err := checkSpan("until", 0, float64(count), 1); err != nil {
+			return nil, err
+		}
+
+		return until(count), nil
+	}
+	funcs["untilStep"] = func(start, stop, step int) ([]int, error) {
+		if err := checkSpan("untilStep", float64(start), float64(stop), float64(step)); err != nil {
+			return nil, err
+		}
+
+		return untilStep(start, stop, step), nil
+	}
+	funcs["seq"] = func(params ...int) (string, error) {
+		from, to, step := 1.0, 0.0, 1.0
+
+		switch len(params) {
+		case 1:
+			to = float64(params[0])
+		case 2: //nolint:mnd // seq start end
+			from, to = float64(params[0]), float64(params[1])
+		case 3: //nolint:mnd // seq start step end
+			from, step, to = float64(params[0]), float64(params[1]), float64(params[2])
+		}
+
+		if err := checkSpan("seq", from, to, step); err != nil {
+			return "", err
+		}
+
+		return seq(params...), nil
+	}
+}
+
+// checkSpan refuses a sequence from from to to in steps of step that has more than maxSequence items. A step of 0
+// builds none.
+func checkSpan(name string, from, to, step float64) error {
+	if step != 0 && math.Abs(to-from)/math.Abs(step) > maxSequence {
+		return fmt.Errorf("%s: a sequence from %.0f to %.0f in steps of %.0f exceeds the limit of %d items", name, from, to, step, maxSequence)
+	}
+
+	return nil
 }
 
 // templateRule parses the template text of the file name with funcs, as the render does, and returns the load rule it

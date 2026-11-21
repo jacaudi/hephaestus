@@ -242,3 +242,56 @@ func TestTemplateData_PlainOnly(t *testing.T) {
 		t.Errorf("netip.Addr has %d value methods, want the 31 the allow-list names", valueMethods)
 	}
 }
+
+// TestFuncMap_BoundedFunctionsKeepSprigResults: the bounded repeat, until, untilStep and seq return what sprig's do for a
+// request within the bounds, so a template that worked still renders the same text.
+func TestFuncMap_BoundedFunctionsKeepSprigResults(t *testing.T) {
+	funcs := FuncMap()
+
+	repeat, ok := funcs["repeat"].(func(int, string) (string, error))
+	if !ok {
+		t.Fatalf("repeat is a %T", funcs["repeat"])
+	}
+
+	until, ok := funcs["until"].(func(int) ([]int, error))
+	if !ok {
+		t.Fatalf("until is a %T", funcs["until"])
+	}
+
+	untilStep, ok := funcs["untilStep"].(func(int, int, int) ([]int, error))
+	if !ok {
+		t.Fatalf("untilStep is a %T", funcs["untilStep"])
+	}
+
+	seq, ok := funcs["seq"].(func(...int) (string, error))
+	if !ok {
+		t.Fatalf("seq is a %T", funcs["seq"])
+	}
+
+	sprigFuncs := sprig.HermeticTxtFuncMap()
+
+	if got, err := repeat(3, "ab"); err != nil || got != sprigFuncs["repeat"].(func(int, string) string)(3, "ab") { //nolint:forcetypeassert // a test of sprig's own signature
+		t.Errorf("repeat(3, ab) = %q, %v", got, err)
+	}
+
+	for _, n := range []int{3, 0, -3} {
+		want := sprigFuncs["until"].(func(int) []int)(n) //nolint:forcetypeassert // a test of sprig's own signature
+		if got, err := until(n); err != nil || !slices.Equal(got, want) {
+			t.Errorf("until(%d) = %v, %v; want %v", n, got, err, want)
+		}
+	}
+
+	for _, args := range [][3]int{{0, 10, 3}, {10, 0, -3}, {0, 10, 0}, {5, 0, 1}} {
+		want := sprigFuncs["untilStep"].(func(int, int, int) []int)(args[0], args[1], args[2]) //nolint:forcetypeassert // a test of sprig's own signature
+		if got, err := untilStep(args[0], args[1], args[2]); err != nil || !slices.Equal(got, want) {
+			t.Errorf("untilStep%v = %v, %v; want %v", args, got, err, want)
+		}
+	}
+
+	for _, args := range [][]int{{5}, {-3}, {2, 6}, {1, 2, 9}, {9, -2, 1}, {}} {
+		want := sprigFuncs["seq"].(func(...int) string)(args...) //nolint:forcetypeassert // a test of sprig's own signature
+		if got, err := seq(args...); err != nil || got != want {
+			t.Errorf("seq%v = %q, %v; want %q", args, got, err, want)
+		}
+	}
+}

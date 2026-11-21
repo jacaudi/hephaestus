@@ -225,3 +225,48 @@ func TestSchematicBody_RefusalNamesCleanedPath(t *testing.T) {
 		t.Fatalf("Render error = %v, want a *RefusalError naming %s", err, schematicTpl)
 	}
 }
+
+// TestRender_TemplateBounds: a template that asks for more than a bounded amount, in one call or in all its output, fails
+// the render with an error instead of building it, and a template within the bounds renders.
+func TestRender_TemplateBounds(t *testing.T) {
+	const huge = "1099511627776"
+
+	tests := []struct {
+		name    string
+		body    string
+		wantErr string
+	}{
+		{name: "repeat within the bound", body: "machine:\n  network:\n    hostname: {{ repeat 3 \"ab\" }}\n"},
+		{name: "repeat beyond the bound", body: "x: {{ repeat " + huge + " \"x\" }}\n", wantErr: "repeat"},
+		{name: "until beyond the bound", body: "x: {{ until " + huge + " }}\n", wantErr: "until"},
+		{name: "until negative beyond the bound", body: "x: {{ until -" + huge + " }}\n", wantErr: "until"},
+		{name: "untilStep beyond the bound", body: "x: {{ untilStep 0 " + huge + " 1 }}\n", wantErr: "untilStep"},
+		{name: "seq beyond the bound", body: "x: {{ seq " + huge + " }}\n", wantErr: "seq"},
+		{name: "seq with a step beyond the bound", body: "x: {{ seq 1 1 " + huge + " }}\n", wantErr: "seq"},
+		{
+			name:    "output beyond the bound",
+			body:    "x: \"{{ range 200 }}{{ range 100 }}{{ repeat 1024 \"x\" }}{{ end }}{{ end }}\"\n",
+			wantErr: "output",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fsys := renderTree(t)
+			apply(t, fsys, writeFile("all/bound.yaml.tpl", tt.body))
+
+			_, err := loadAndRender(t, fsys, bundleValues(t))
+
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Render error = %v, want nil", err)
+				}
+
+				return
+			}
+
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) || !strings.Contains(err.Error(), "limit") {
+				t.Fatalf("Render error = %v, want one naming %q and a limit", err, tt.wantErr)
+			}
+		})
+	}
+}
