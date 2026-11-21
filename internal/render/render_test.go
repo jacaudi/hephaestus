@@ -226,6 +226,26 @@ func TestSchematicBody_RefusalNamesCleanedPath(t *testing.T) {
 	}
 }
 
+// TestSchematicBody_TemplateNamedWithADecoratedPath: a schematic file is a template by the name the renderer resolves,
+// so a path that cleans to a .tpl name gets the secret check however it is written.
+func TestSchematicBody_TemplateNamedWithADecoratedPath(t *testing.T) {
+	for _, id := range []string{"@" + schematicTpl + "/", "@" + schematicTpl + "/.", "@" + schematicTpl + "//", "@./" + schematicTpl + "/"} {
+		t.Run(id, func(t *testing.T) {
+			fsys := renderTree(t)
+			apply(t, fsys,
+				appendTopf("schematicId: \""+id+"\"\ndata:\n  x: "+refClusterID+"\n"),
+				writeFile(schematicTpl, hashedArgBody),
+			)
+
+			_, err := loadAndRender(t, fsys, bundleValues(t))
+
+			if refusal, ok := errors.AsType[*RefusalError](err); !ok || refusal.Rule != "secret reaches schematic" || refusal.File != schematicTpl {
+				t.Fatalf("Render error = %v, want a *RefusalError for a secret reaching the schematic, naming %s", err, schematicTpl)
+			}
+		})
+	}
+}
+
 // TestRender_TemplateBounds: a template that asks for more than a bounded amount, in one call or in all its output, fails
 // the render with an error instead of building it, and a template within the bounds renders.
 func TestRender_TemplateBounds(t *testing.T) {

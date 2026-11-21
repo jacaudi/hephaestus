@@ -90,12 +90,16 @@ func (c *Cluster) Render(ctx context.Context, values map[string]string) ([]HostR
 // error is dropped: it can quote a value.
 func (c *Cluster) checkSchematic(ctx context.Context, node *topfrender.Node, dummies map[string]string) error {
 	file, ok := strings.CutPrefix(c.schematics[node.Host], "@")
-	if !ok || !strings.HasSuffix(file, templateSuffix) {
+	if !ok {
 		return nil
 	}
 
 	// Load cleaned the path with config.CleanRel and refused one that escapes the tree, so path.Clean gives the same name.
+	// The resolver decides on that name whether the file is a template, so this does too.
 	file = path.Clean(file)
+	if !strings.HasSuffix(file, templateSuffix) {
+		return nil
+	}
 
 	_, body, err := topfrender.Schematic(ctx, topfrender.Input{FS: c.FS, Values: dummies, Funcs: FuncMap()}, node.Host)
 	if err != nil || !bytes.Equal(body, node.SchematicBody) {
