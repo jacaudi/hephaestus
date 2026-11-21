@@ -273,23 +273,36 @@ func TestClusterList_ShowsErrors(t *testing.T) {
 		t.Fatalf("RecordWholeCallFailure: %v", err)
 	}
 
+	// The error texts can quote a secret fragment, so the routine listing says only that each exists.
+	const hidden = "(hidden: pass --errors)"
 	rows := jsonRows(t, c.mustRun(t, "cluster", "list", "--json"))
-
 	if len(rows) != 1 {
 		t.Fatalf("rows = %v, want one", rows)
 	}
-	want := map[string]any{
-		"name": labName, "failed_tree": "T9", "failed_error": "patch broke[2K the render",
-		"fetch_error": "fetch refused[2K", "last_call_error": "vault unreachable[2K", "last_fetch_at": "2026-11-14T12:00:00Z",
-		"refresh_incomplete": false,
-	}
-	for key, w := range want {
+	for key, w := range map[string]any{
+		"name": labName, "failed_tree": "T9", "failed_error": hidden, "fetch_error": hidden, "last_call_error": hidden,
+		"last_fetch_at": "2026-11-14T12:00:00Z", "refresh_incomplete": false,
+	} {
 		if rows[0][key] != w {
 			t.Errorf("%s = %q, want %q", key, rows[0][key], w)
 		}
 	}
+	routine := c.mustRun(t, "cluster", "list")
+	for _, leaked := range []string{"patch broke", "fetch refused", "vault unreachable"} {
+		if strings.Contains(routine, leaked) {
+			t.Errorf("the routine listing prints %q:\n%s", leaked, routine)
+		}
+	}
 
-	text := c.mustRun(t, "cluster", "list")
+	rows = jsonRows(t, c.mustRun(t, "cluster", "list", "--errors", "--json"))
+	for key, w := range map[string]any{
+		"failed_error": "patch broke[2K the render", "fetch_error": "fetch refused[2K", "last_call_error": "vault unreachable[2K",
+	} {
+		if rows[0][key] != w {
+			t.Errorf("with --errors, %s = %q, want %q", key, rows[0][key], w)
+		}
+	}
+	text := c.mustRun(t, "cluster", "list", "--errors")
 	for _, w := range []string{"NAME", labName, "T9", `patch broke\x1b[2K the render`} {
 		if !strings.Contains(text, w) {
 			t.Errorf("text output lacks %q:\n%s", w, text)
@@ -297,6 +310,30 @@ func TestClusterList_ShowsErrors(t *testing.T) {
 	}
 	if strings.Contains(text, "\x1b") {
 		t.Errorf("text output holds a raw escape character:\n%q", text)
+	}
+}
+
+// TestClusterList_UnreadableErrorTextKeepsTheRest: one stored error text that does not open is shown as unreadable;
+// the listing still prints the cluster and its other texts.
+func TestClusterList_UnreadableErrorTextKeepsTheRest(t *testing.T) {
+	c := newCLITest(t)
+	cl := c.importLab(t)
+	if err := c.clusters.RecordFetch(t.Context(), cl.ID, errors.New("fetch refused"), cliT0); err != nil {
+		t.Fatalf("RecordFetch: %v", err)
+	}
+	whole := clusters.WholeCallFailure{ClusterID: cl.ID, Trigger: clusters.TriggerHead, Error: "vault unreachable", At: cliT0}
+	if err := c.clusters.RecordWholeCallFailure(t.Context(), whole); err != nil {
+		t.Fatalf("RecordWholeCallFailure: %v", err)
+	}
+	// A sealed text moved to another column does not open: its additional data names the column it was sealed for.
+	if _, err := c.d.Bun().ExecContext(t.Context(), "UPDATE clusters SET fetch_error_sealed = last_call_error_sealed WHERE id = ?", cl.ID); err != nil {
+		t.Fatalf("damage the fetch error: %v", err)
+	}
+
+	rows := jsonRows(t, c.mustRun(t, "cluster", "list", "--errors", "--json"))
+
+	if len(rows) != 1 || rows[0]["fetch_error"] != "(unreadable)" || rows[0]["last_call_error"] != "vault unreachable" {
+		t.Fatalf("rows = %v, want the fetch error unreadable and the last call error shown", rows)
 	}
 }
 

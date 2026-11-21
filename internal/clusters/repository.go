@@ -717,12 +717,14 @@ func (r *Repository) RecordRefresh(ctx context.Context, rec RefreshRecord) (bool
 	return recorded, nil
 }
 
-// ClusterErrors are the cluster's stored error texts, opened; each is "" when there is none. Each can quote a
-// secret value: show them to an admin, never log them.
+// TextUnreadable stands in for a stored error text that does not open, so one damaged text does not hide the others.
+const TextUnreadable = "(unreadable)"
+
+// ClusterErrors are the cluster's stored error texts, opened; each is "" when there is none and TextUnreadable when
+// it does not open. Each can quote a secret value: show them to an admin on request, never log them.
 type ClusterErrors struct{ Fetch, Failed, LastCall string }
 
-// Errors opens the cluster's three sealed error texts. A text that does not open is an error matching
-// datakey.ErrDecrypt.
+// Errors opens the cluster's three sealed error texts.
 func (r *Repository) Errors(ctx context.Context, clusterID string) (ClusterErrors, error) {
 	var c Cluster
 	err := r.bdb.NewSelect().Model(&c).Column(columnFetchError, columnFailedError, columnLastCall).Where("id = ?", clusterID).Scan(ctx)
@@ -747,7 +749,8 @@ func (r *Repository) Errors(ctx context.Context, clusterID string) (ClusterError
 		}
 		text, err := r.key.OpenField(clusterField(clusterID, f.column), f.sealed)
 		if err != nil {
-			return ClusterErrors{}, fmt.Errorf("clusters: open %s of %s: %w", f.column, clusterID, err)
+			*f.dst = TextUnreadable
+			continue
 		}
 		*f.dst = string(text)
 	}

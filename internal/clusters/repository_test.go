@@ -910,8 +910,9 @@ func runRepositorySuite(t *testing.T, open func(testing.TB) *db.DB) {
 		c := mustImport(t, r, labImport(t0))
 		mustFail(t, r, c, "T1", "boom", t0)
 		execRaw(t, d, "UPDATE clusters SET fetch_error_sealed = failed_error_sealed WHERE id = ?", c.ID)
-		if _, err := r.Errors(t.Context(), c.ID); !errors.Is(err, datakey.ErrDecrypt) {
-			t.Fatalf("Errors with a value moved to another column error = %v, want datakey.ErrDecrypt", err)
+		got, err := r.Errors(t.Context(), c.ID)
+		if want := (ClusterErrors{Fetch: TextUnreadable, Failed: "boom"}); err != nil || got != want {
+			t.Fatalf("Errors with a value moved to another column = %+v, %v; want %+v: one unreadable text keeps the others", got, err, want)
 		}
 	})
 

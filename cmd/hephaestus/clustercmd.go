@@ -19,8 +19,12 @@ import (
 // diffContext is how many unchanged lines a unified diff shows around a change.
 const diffContext = 3
 
-// clusterRow is a cluster as "cluster list", "cluster import" and "cluster set" print it. The three error texts are
-// the cluster's stored ones, opened.
+// errorHidden is what the routine listing prints for a stored error text: the text can quote a fragment of a secret
+// value, so it is shown only on request.
+const errorHidden = "(hidden: pass --errors)"
+
+// clusterRow is a cluster as "cluster list", "cluster import" and "cluster set" print it. Each error text is the
+// cluster's stored one, opened, or errorHidden when there is one and the caller did not ask for it.
 type clusterRow struct {
 	Name              string `json:"name"`
 	Repo              string `json:"repo"`
@@ -46,11 +50,18 @@ func (r clusterRow) printable() clusterRow {
 	return r
 }
 
-// clusterRowOf is c with its error texts opened.
-func clusterRowOf(ctx context.Context, repo *clusters.Repository, c *clusters.Cluster) (clusterRow, error) {
+// clusterRowOf is c with its error texts opened; unless showErrors, each one that exists is errorHidden.
+func clusterRowOf(ctx context.Context, repo *clusters.Repository, c *clusters.Cluster, showErrors bool) (clusterRow, error) {
 	errs, err := repo.Errors(ctx, c.ID)
 	if err != nil {
 		return clusterRow{}, err
+	}
+	if !showErrors {
+		for _, s := range []*string{&errs.Fetch, &errs.Failed, &errs.LastCall} {
+			if *s != "" {
+				*s = errorHidden
+			}
+		}
 	}
 	return clusterRow{
 		Name: c.Name, Repo: c.RepoURL, Ref: c.Ref, Path: c.Subpath, Revision: c.Revision,
@@ -289,15 +300,22 @@ any machine is bound to the cluster.`,
 }
 
 func newClusterListCmd(deps cliDeps) *cobra.Command {
-	var asJSON bool
+	var (
+		asJSON     bool
+		showErrors bool
+	)
 	cmd := &cobra.Command{
 		Use:   "list",
 		Short: "List the clusters and their state",
 		Long: `List every cluster: its repository, ref and path, its revision (it counts each change of the
 source), the approved and pending pair ids, the tree that failed to render, when serve last fetched,
-whether the last refresh could not finish, and the fetch, render and whole-call errors serve stored.`,
+whether the last refresh could not finish, and whether serve stored a fetch, render or whole-call error.
+
+The error texts are not printed: they come from git, the 1Password SDK and the render, and can quote a
+fragment of a secret value. Pass --errors to print them, and keep that output out of tickets and logs.`,
 		Example: `  hephaestus cluster list
-  hephaestus cluster list --json`,
+  hephaestus cluster list --json
+  hephaestus cluster list --errors`,
 		Args: noArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return withCLI(cmd, deps, func(s cliStores) error {
@@ -307,7 +325,7 @@ whether the last refresh could not finish, and the fetch, render and whole-call 
 				}
 				rows := make([]clusterRow, 0, len(list)) // JSON must print [], not null
 				for i := range list {
-					row, err := clusterRowOf(cmd.Context(), s.Clusters, &list[i])
+					row, err := clusterRowOf(cmd.Context(), s.Clusters, &list[i], showErrors)
 					if err != nil {
 						return err
 					}
@@ -324,12 +342,13 @@ whether the last refresh could not finish, and the fetch, render and whole-call 
 		},
 	}
 	cmd.Flags().BoolVar(&asJSON, "json", false, "print the clusters as JSON")
+	cmd.Flags().BoolVar(&showErrors, "errors", false, "print the stored error texts; they can quote fragments of secret values")
 	return cmd
 }
 
-// printCluster prints c as one object in JSON, or as a table.
+// printCluster prints c as one object in JSON, or as a table, its error texts hidden.
 func printCluster(cmd *cobra.Command, repo *clusters.Repository, c *clusters.Cluster, asJSON bool) error {
-	row, err := clusterRowOf(cmd.Context(), repo, c)
+	row, err := clusterRowOf(cmd.Context(), repo, c, false)
 	if err != nil {
 		return err
 	}
