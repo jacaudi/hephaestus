@@ -518,6 +518,45 @@ func runRepositorySuite(t *testing.T, open func(testing.TB) *db.DB) {
 		}
 	})
 
+	t.Run("ConsumeTrigger", func(t *testing.T) {
+		r, _ := testRepo(t, open)
+		c := mustImport(t, r, labImport(t0))
+		if err := r.RequestRefresh(t.Context(), labName, t0); err != nil {
+			t.Fatalf("RequestRefresh: %v", err)
+		}
+		at := t0.Add(time.Minute)
+		if err := r.ConsumeTrigger(t.Context(), c.ID, c.Revision, TriggerDaily, at); err != nil {
+			t.Fatalf("ConsumeTrigger daily: %v", err)
+		}
+		if got := mustGet(t, r, labName); !got.LastDailyAt.Equal(at) || !got.RefreshRequested || got.ProcessingTree != "" {
+			t.Fatalf("cluster = %+v, want last_daily_at at the call, the flag kept and no mark", got)
+		}
+		if err := r.ConsumeTrigger(t.Context(), c.ID, c.Revision, TriggerRefresh, at); err != nil {
+			t.Fatalf("ConsumeTrigger refresh: %v", err)
+		}
+		if got := mustGet(t, r, labName); got.RefreshRequested || !got.LastDailyAt.Equal(at) || got.ProcessingTree != "" {
+			t.Fatalf("cluster = %+v, want the flag consumed, last_daily_at kept and no mark", got)
+		}
+		if err := r.ConsumeTrigger(t.Context(), c.ID, c.Revision, Trigger("bogus"), at); err == nil {
+			t.Fatal("ConsumeTrigger of an unknown trigger succeeded")
+		}
+	})
+
+	t.Run("ConsumeTriggerRefusedOnStaleRevision", func(t *testing.T) {
+		r, _ := testRepo(t, open)
+		c := mustImport(t, r, labImport(t0))
+		if err := r.RequestRefresh(t.Context(), labName, t0); err != nil {
+			t.Fatalf("RequestRefresh: %v", err)
+		}
+		mustSet(t, r, SetRequest{Name: labName, Username: new("other"), At: t0})
+		if err := r.ConsumeTrigger(t.Context(), c.ID, c.Revision, TriggerRefresh, t0); err != nil {
+			t.Fatalf("ConsumeTrigger at the old revision: %v", err)
+		}
+		if got := mustGet(t, r, labName); !got.RefreshRequested {
+			t.Fatalf("cluster = %+v, want the request kept: it belongs to the new revision", got)
+		}
+	})
+
 	t.Run("MarkRefusesUnknownTrigger", func(t *testing.T) {
 		r, _ := testRepo(t, open)
 		c := mustImport(t, r, labImport(t0))

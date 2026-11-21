@@ -442,6 +442,25 @@ func (r *Repository) MarkProcessing(ctx context.Context, req MarkRequest) (bool,
 	return ok, nil
 }
 
+// ConsumeTrigger consumes a refresh trigger of a cluster that has no tree to mark, as MarkProcessing consumes it
+// for one that has: a refresh clears the request flag, the daily timer stamps last_daily_at. It writes only while
+// the cluster is at the revision; a cluster changed since belongs to a newer trigger.
+func (r *Repository) ConsumeTrigger(ctx context.Context, clusterID string, revision int64, trigger Trigger, at time.Time) error {
+	q := r.bdb.NewUpdate().Model((*Cluster)(nil)).Where("id = ?", clusterID).Where("revision = ?", revision)
+	switch trigger {
+	case TriggerRefresh:
+		q = q.Set("refresh_requested = ?", false)
+	case TriggerDaily:
+		q = q.Set("last_daily_at = ?", stamp(at))
+	default:
+		return fmt.Errorf("clusters: consume trigger: not a refresh trigger: %q", trigger)
+	}
+	if _, err := applied(ctx, q); err != nil {
+		return fmt.Errorf("clusters: consume %s trigger of %s: %w", trigger, clusterID, err)
+	}
+	return nil
+}
+
 // ClearProcessing clears the processing mark without recording the tree as processed, so the next poll processes
 // it again: the graceful shutdown of work in flight.
 func (r *Repository) ClearProcessing(ctx context.Context, clusterID string) error {

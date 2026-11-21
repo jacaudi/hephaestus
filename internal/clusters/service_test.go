@@ -708,6 +708,43 @@ func TestService_MistypedCredentialNotRetried(t *testing.T) {
 	}
 }
 
+func TestService_FailedFirstCredentialRetriedOncePerTrigger(t *testing.T) {
+	srv := gittest.NewServer(t, gittest.Options{BasicAuth: &[2]string{svcUser, svcPassword}})
+	h := newSvcHarness(t, srv, svcCredRef)
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	defer srv.Close()
+	srv.Commit(t, svcFiles(t), nil)
+	h.fake.set(func(f *fakeResolver) { f.fail[svcCredRef] = svcKind })
+	s := h.service(h.fake)
+	h.poll(s)
+	if n := len(h.fake.seen()); n != 1 {
+		t.Fatalf("resolver called %d times by the first poll, want 1", n)
+	}
+
+	for want := 2; want <= 3; want++ {
+		h.requestRefresh()
+		h.poll(s)
+		h.poll(s)
+		if n := len(h.fake.seen()); n != want {
+			t.Fatalf("resolver called %d times after refresh request %d, want %d", n, want-1, want)
+		}
+		if c := h.cluster(); c.RefreshRequested {
+			t.Fatalf("refresh request %d is still pending after the poll that served it", want-1)
+		}
+	}
+
+	h.now = gitT0.Add(DailyInterval)
+	h.poll(s)
+	h.poll(s)
+	h.poll(s)
+	if n := len(h.fake.seen()); n != 4 {
+		t.Fatalf("resolver called %d times by a due daily trigger, want 4 (one more)", n)
+	}
+	if c := h.cluster(); !c.LastDailyAt.Equal(gitT0.Add(DailyInterval)) {
+		t.Fatalf("last daily = %v, want the daily trigger consumed at %v", c.LastDailyAt, gitT0.Add(DailyInterval))
+	}
+}
+
 func TestService_FetchDropNoMoveAside(t *testing.T) {
 	srv := gittest.NewServer(t, gittest.Options{DropAfter: 2048})
 	h := newSvcHarness(t, srv, "")
@@ -1358,7 +1395,7 @@ func TestService_RefreshOnHeadPollKeepsNewTree(t *testing.T) {
 	wantNoMark(t, c)
 }
 
-func TestService_RefreshWithoutTreeWaits(t *testing.T) {
+func TestService_RefreshWithoutTreeIsConsumed(t *testing.T) {
 	srv := gittest.NewServer(t, gittest.Options{BasicAuth: &[2]string{svcUser, svcPassword}})
 	h := newSvcHarness(t, srv, svcCredRef)
 	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
@@ -1377,8 +1414,8 @@ func TestService_RefreshWithoutTreeWaits(t *testing.T) {
 	if calls := h.fake.seen(); len(calls) != 1 {
 		t.Errorf("resolver calls = %q; want the first credential resolution only, while there is no tree to refresh", calls)
 	}
-	if c := h.cluster(); !c.RefreshRequested {
-		t.Error("the refresh request was consumed with no tree to refresh")
+	if c := h.cluster(); c.RefreshRequested || !c.LastRefreshAt.IsZero() {
+		t.Errorf("requested = %v, last refresh = %v; want the request consumed and no refresh recorded: there is nothing to refresh", c.RefreshRequested, c.LastRefreshAt)
 	}
 }
 

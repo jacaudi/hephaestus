@@ -596,7 +596,9 @@ func (s *Service) resolveTree(ctx context.Context, w work, refs []string) (value
 // refreshIfDue runs at most one refresh of c when a trigger is due, c carries no mark and no backoff or rate limit
 // holds it back. Without a resolver nothing runs and the trigger stays pending; secrets:token reports the missing
 // token. The cluster is read again first, since the poll's work on it so far may have changed it. After the refresh,
-// the hosts of its approved pair are checked for drift. It reports whether a corrupt read moved the store aside.
+// the hosts of its approved pair are checked for drift. A cluster with no tree to refresh has its trigger consumed
+// and, where a first credential failed, that reference tried again. It reports whether a corrupt read moved the
+// store aside.
 func (s *Service) refreshIfDue(ctx context.Context, c *Cluster, at time.Time) (moved bool) {
 	if s.cfg.Resolver == nil {
 		return false
@@ -615,9 +617,26 @@ func (s *Service) refreshIfDue(ctx context.Context, c *Cluster, at time.Time) (m
 	if !due || fresh.ProcessingTree != "" || waiting(&fresh, at) {
 		return false
 	}
+	if fresh.FailedTree == "" && fresh.PendingPairID == "" && fresh.ApprovedPairID == "" {
+		s.consumeIdle(ctx, &fresh, trigger, at)
+		return false
+	}
 	moved = s.refresh(ctx, &fresh, trigger, at)
 	s.detectDrift(ctx, &fresh, at)
 	return moved
+}
+
+// consumeIdle consumes trigger for c, which has no tree to refresh, so it does not stay due. The daily timer also
+// releases a failed first credential to be resolved at the next fetch; a refresh request already did, since the
+// fetch step of the same poll saw it pending (credentialMark.holds).
+func (s *Service) consumeIdle(ctx context.Context, c *Cluster, trigger Trigger, at time.Time) {
+	if err := s.cfg.Repo.ConsumeTrigger(ctx, c.ID, c.Revision, trigger, at); err != nil {
+		s.fail(ctx, stageRefresh, c.Name, err)
+		return
+	}
+	if trigger == TriggerDaily {
+		delete(s.credentialFailed, c.ID)
+	}
 }
 
 // refreshTrigger is the refresh trigger due for c at at: a refresh request, else the daily timer, a DailyInterval
@@ -637,13 +656,9 @@ func refreshTrigger(c *Cluster, at time.Time) (Trigger, bool) {
 }
 
 // refresh runs one refresh of c, started by trigger (design 5.4): it resolves the read credential again, retries the
-// failed tree, and when there is none or it fails again, resolves the newest good tree. A cluster with no tree to
-// mark runs nothing, so its trigger stays until one is stored. It reports whether a corrupt read moved the store
-// aside.
+// failed tree, and when there is none or it fails again, resolves the newest good tree. c has a failed, pending or
+// approved tree. It reports whether a corrupt read moved the store aside.
 func (s *Service) refresh(ctx context.Context, c *Cluster, trigger Trigger, at time.Time) (moved bool) {
-	if c.FailedTree == "" && c.PendingPairID == "" && c.ApprovedPairID == "" {
-		return false
-	}
 	if !s.refreshCredential(ctx, c, trigger, at) {
 		return false
 	}
