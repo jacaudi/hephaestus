@@ -17,13 +17,20 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 
 	"go.jacaudi.dev/hephaestus/internal/admin"
 	"go.jacaudi.dev/hephaestus/internal/boot"
 	"go.jacaudi.dev/hephaestus/internal/boot/ipxe"
 	"go.jacaudi.dev/hephaestus/internal/catalog"
+	"go.jacaudi.dev/hephaestus/internal/clusters"
+	"go.jacaudi.dev/hephaestus/internal/datakey"
 	"go.jacaudi.dev/hephaestus/internal/db"
+	"go.jacaudi.dev/hephaestus/internal/factory"
 	"go.jacaudi.dev/hephaestus/internal/fleet"
+	"go.jacaudi.dev/hephaestus/internal/secret"
+	"go.jacaudi.dev/hephaestus/internal/secrets"
 	"go.jacaudi.dev/hephaestus/internal/store"
 	"go.jacaudi.dev/hephaestus/internal/telemetry"
 	"go.jacaudi.dev/hephaestus/internal/third_party/omniprovider/dhcp"
@@ -56,6 +63,13 @@ Configuration comes from the environment. Required:
   HEPHAESTUS_PROVISIONING_INTERFACE  interface proxyDHCP listens on
   HEPHAESTUS_PROVISIONING_ADDRESS    this host's address on the provisioning subnet
   HEPHAESTUS_PROVISIONING_SUBNET     provisioning subnet, as a CIDR prefix
+  HEPHAESTUS_DATA_KEY                base64 of the 32-byte key that seals stored secrets, or
+  HEPHAESTUS_DATA_KEY_FILE           a file holding it: set exactly one; a key the database
+                                     was not sealed with stops serve
+
+The 1Password service account token is HEPHAESTUS_OP_TOKEN, or a file holding it
+in HEPHAESTUS_OP_TOKEN_FILE: set at most one. Without it serve still starts, and
+every cluster fails closed until it is set.
 
 TLS comes from one of two sources, chosen by HEPHAESTUS_TLS_MODE:
   file (default)  HEPHAESTUS_TLS_CERT_FILE and HEPHAESTUS_TLS_KEY_FILE name a
@@ -104,6 +118,10 @@ The process stops on SIGINT or SIGTERM after draining in-flight requests.`,
 // listenAndServe opens the boot and admin listeners and runs the service on
 // them until ctx is done.
 func listenAndServe(ctx context.Context, cfg serveConfig, logger *slog.Logger) error {
+	// First, before anything builds a client from the default transport or sends a request.
+	counter := secrets.NewCounter(http.DefaultTransport, time.Now)
+	setupDefaultTransport(counter)
+
 	files, err := ipxe.Files()
 	if err != nil {
 		return fmt.Errorf("load iPXE binaries: %w", err)
@@ -132,7 +150,8 @@ func listenAndServe(ctx context.Context, cfg serveConfig, logger *slog.Logger) e
 	}
 	deps := serveDeps{
 		httpLn: lns[0], adminLn: lns[2], udp: true, files: files, roots: roots, catalog: cat,
-		client: toolcache.NewHTTPClient("hephaestus/"+buildVersion(), nil),
+		client:  toolcache.NewHTTPClient("hephaestus/"+buildVersion(), nil),
+		counter: counter,
 	}
 	if cfg.TLSMode == tlsModeProxy {
 		deps.proxyLn = lns[1]
@@ -167,8 +186,15 @@ type serveDeps struct {
 	// catalog is the utility catalog boot-next entries are looked up in and the
 	// fetcher downloads.
 	catalog *catalog.Catalog
-	// client is the upstream client the fetcher downloads utility content with.
+	// client is the upstream client the fetcher downloads utility content and
+	// Talos assets with, and registers schematics through.
 	client *http.Client
+	// counter counts the requests to 1Password; http.DefaultClient sends
+	// through it.
+	counter *secrets.Counter
+	// resolver, when set, replaces the 1Password resolver built from the token.
+	// Only a test sets it, to hold the clusters service mid-resolve.
+	resolver clusters.Resolver
 }
 
 // listen opens a TCP listener on each address, in order. On a failure it
@@ -231,16 +257,13 @@ func runServe(ctx context.Context, cfg serveConfig, logger *slog.Logger, deps se
 		return err
 	}
 	defer func() { err = errors.Join(err, dbh.Close()) }()
-	if err := dbh.Migrate(ctx); err != nil {
+	if err := prepareDatabase(ctx, dbh, cfg.DataKey); err != nil {
 		return err
 	}
 
-	content, moved, err := store.Open(ctx, filepath.Join(cfg.DataDir, "store"), time.Now)
+	content, err := openStore(ctx, filepath.Join(cfg.DataDir, "store"), logger)
 	if err != nil {
 		return err
-	}
-	if moved != "" {
-		logger.ErrorContext(ctx, "store was unusable; moved aside", "path", moved)
 	}
 
 	repo := fleet.NewRepository(dbh)
@@ -250,10 +273,22 @@ func runServe(ctx context.Context, cfg serveConfig, logger *slog.Logger, deps se
 	rc := toolcache.ReconcileConfig{
 		Repo: repo, Store: content, Catalog: deps.catalog, SpoolDir: filepath.Join(cfg.DataDir, "spool"), At: time.Now(),
 	}
-	fc := toolcache.FetcherConfig{
-		Repo: rc.Repo, Store: rc.Store, Catalog: rc.Catalog, Client: deps.client, SpoolDir: rc.SpoolDir, Workers: cfg.FetchWorkers,
+	if err := reconcileCaches(ctx, logger, rc); err != nil {
+		return err
 	}
-	fetcher, err := prepareUtility(ctx, logger, metrics, rc, fc)
+
+	svc, err := startClusters(ctx, clusters.Config{
+		Repo: clusters.NewRepository(dbh, cfg.DataKey), Resolver: deps.resolver, Counter: deps.counter,
+		GitDir: filepath.Join(cfg.DataDir, "git"), Now: time.Now, OnError: clustersErrorHandler(logger), Meter: metrics.Meter(),
+	}, cfg.OPToken)
+	if err != nil {
+		return err
+	}
+
+	fetcher, err := newFetcher(logger, metrics, toolcache.FetcherConfig{
+		Repo: rc.Repo, Store: rc.Store, Catalog: rc.Catalog, Client: deps.client, SpoolDir: rc.SpoolDir, Workers: cfg.FetchWorkers,
+		Talos: factory.New(factory.Base, deps.client),
+	})
 	if err != nil {
 		return err
 	}
@@ -281,12 +316,14 @@ func runServe(ctx context.Context, cfg serveConfig, logger *slog.Logger, deps se
 		content.Checks(),
 		[]admin.Check{admin.DiskCheck("disk:data_dir", cfg.DataDir, minFreeDisk)},
 		tlsChecks,
+		svc.Checks(),
+		[]admin.Check{talosCacheCheck(repo), configPendingCheck(repo, time.Now)},
 	)...)
 	registry.RunOnce(ctx)
 
 	handlers, err := boot.NewHandlers(boot.Config{
 		Repo: repo, Store: content, Catalog: deps.catalog,
-		FQDN: cfg.FQDN, Address: cfg.Address, Subnet: cfg.Subnet, Files: deps.files,
+		FQDN: cfg.FQDN, Address: cfg.Address, Subnet: cfg.Subnet, Files: deps.files, Configs: svc,
 	}, boot.WithMeter(metrics.Meter()), boot.WithErrorHandler(bootErrorHandler(logger)))
 	if err != nil {
 		return err
@@ -314,6 +351,7 @@ func runServe(ctx context.Context, cfg serveConfig, logger *slog.Logger, deps se
 
 	p := &plane{
 		cfg: cfg, deps: deps, logger: logger, life: life, registry: registry, loader: loader, fetcher: fetcher,
+		clusters: svc, handlers: handlers, repo: repo,
 		adminSrv: newServer(deps.adminLn, adminHandler, 10*time.Second, logger),
 		httpSrv:  newServer(deps.httpLn, httpHandler, time.Minute, logger),
 	}
@@ -351,16 +389,106 @@ func bootErrorHandler(logger *slog.Logger) func(context.Context, error) {
 	}
 }
 
-// prepareUtility runs design section 5.7's steps 2 to 5: it reconciles the
-// cache rows, the store and the spool (creating the spool directory) with the
-// catalog, and collects the garbage of tags that are no longer current, logging
-// what each changed. A reconciliation failure is returned; a spool sweep or a
-// collection failure is logged at Warn and startup goes on. It returns the
-// fetcher built from fc, over the same rows, store and spool as rc, not yet started.
-func prepareUtility(ctx context.Context, logger *slog.Logger, metrics *telemetry.Metrics, rc toolcache.ReconcileConfig, fc toolcache.FetcherConfig) (*toolcache.Fetcher, error) {
+// prepareDatabase migrates the database and checks that key opens its canary,
+// writing the canary first when the database has none. A key that does not
+// open it is an error naming HEPHAESTUS_DATA_KEY.
+func prepareDatabase(ctx context.Context, dbh *db.DB, key *datakey.Key) error {
+	if err := dbh.Migrate(ctx); err != nil {
+		return err
+	}
+	if err := datakey.EnsureCanary(ctx, dbh.Bun(), key); err != nil {
+		if errors.Is(err, datakey.ErrCanary) {
+			return fmt.Errorf("check HEPHAESTUS_DATA_KEY: %w", err)
+		}
+		return err
+	}
+	return nil
+}
+
+// openStore opens the content store at root, its failures going to
+// storeErrorHandler. A layout it had to set aside is logged at Error.
+func openStore(ctx context.Context, root string, logger *slog.Logger) (*store.Store, error) {
+	content, moved, err := store.Open(ctx, root, time.Now, store.WithErrorHandler(storeErrorHandler(logger)))
+	if err != nil {
+		return nil, err
+	}
+	if moved != "" {
+		logger.ErrorContext(ctx, "store was unusable; moved aside", "path", moved)
+	}
+	return content, nil
+}
+
+// startClusters builds the clusters service over cfg and runs its Startup. The
+// resolver is cfg's when set, else the 1Password resolver for token; with no
+// token it stays a nil interface, never a nil *secrets.OnePassword, so the
+// service fails every cluster closed and secrets:token warns. It also reports
+// cfg.Counter's count as the hephaestus.secrets.requests gauge on cfg.Meter.
+func startClusters(ctx context.Context, cfg clusters.Config, token secret.Secret) (*clusters.Service, error) {
+	if cfg.Resolver == nil && token != "" {
+		cfg.Resolver = secrets.NewOnePassword(token, buildVersion())
+	}
+	svc, err := clusters.NewService(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if err := svc.Startup(ctx); err != nil {
+		return nil, fmt.Errorf("start clusters: %w", err)
+	}
+	if err := observeSecretsRequests(cfg.Meter, cfg.Counter); err != nil {
+		return nil, err
+	}
+	return svc, nil
+}
+
+// storeErrorHandler logs what the store survives. A filesystem that refuses to
+// fsync a directory is a known limit of some volumes, told once: a Warn.
+// Anything else is an Error.
+func storeErrorHandler(logger *slog.Logger) func(context.Context, error) {
+	return func(ctx context.Context, err error) {
+		level := slog.LevelError
+		if errors.Is(err, store.ErrDirSyncUnsupported) {
+			level = slog.LevelWarn
+		}
+		logger.Log(ctx, level, "store error", "error", err)
+	}
+}
+
+// clustersErrorHandler logs a failure the clusters service survives at Warn.
+// Its text names a stage and a cluster, never a value, a URL or a resolver's,
+// renderer's or git's own text. Render calls it from HTTP goroutines; a
+// logger is safe for that.
+func clustersErrorHandler(logger *slog.Logger) func(context.Context, error) {
+	return func(ctx context.Context, err error) {
+		logger.WarnContext(ctx, "clusters error", "error", err)
+	}
+}
+
+// observeSecretsRequests reports the requests counter saw to 1Password in the
+// last 24 hours as the gauge hephaestus.secrets.requests.
+func observeSecretsRequests(meter metric.Meter, counter *secrets.Counter) error {
+	_, err := meter.Int64ObservableGauge("hephaestus.secrets.requests",
+		metric.WithDescription("Requests to 1Password in the last 24 hours."),
+		metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
+			o.Observe(int64(counter.Last24h()))
+			return nil
+		}),
+	)
+	if err != nil {
+		return fmt.Errorf("secrets requests gauge: %w", err)
+	}
+	return nil
+}
+
+// reconcileCaches runs design section 5.7's steps 2 to 5: it reconciles the
+// utility cache rows, the store and the spool (creating the spool directory)
+// with the catalog, collects the garbage of tags that are no longer current,
+// then reconciles the Talos rows with the store, logging what each changed. A
+// reconciliation failure is returned; a spool sweep or a collection failure is
+// logged at Warn and startup goes on.
+func reconcileCaches(ctx context.Context, logger *slog.Logger, rc toolcache.ReconcileConfig) error {
 	rep, err := toolcache.Reconcile(ctx, rc)
 	if err != nil {
-		return nil, fmt.Errorf("reconcile utility cache: %w", err)
+		return fmt.Errorf("reconcile utility cache: %w", err)
 	}
 	logger.InfoContext(ctx, "utility reconciled",
 		"interrupted", rep.Interrupted, "deleted", rep.Deleted, "repinned", rep.Repinned,
@@ -376,27 +504,99 @@ func prepareUtility(ctx context.Context, logger *slog.Logger, metrics *telemetry
 		logger.InfoContext(ctx, "utility garbage collected", "untagged", untagged)
 	}
 
+	talos, err := toolcache.ReconcileTalos(ctx, rc)
+	if err != nil {
+		return fmt.Errorf("reconcile Talos cache: %w", err)
+	}
+	logger.InfoContext(ctx, "talos reconciled",
+		"interrupted", talos.Interrupted, "requeued", talos.Requeued, "restored", talos.Restored)
+	return nil
+}
+
+// newFetcher returns the fetcher of the utility and Talos rows over fc, not
+// yet started, logging every state change and alerting on a broken Talos row.
+func newFetcher(logger *slog.Logger, metrics *telemetry.Metrics, fc toolcache.FetcherConfig) (*toolcache.Fetcher, error) {
+	alerts, err := metrics.Meter().Int64Counter("hephaestus.alerts", metric.WithDescription("Operator alerts raised, by kind."))
+	if err != nil {
+		return nil, fmt.Errorf("alerts counter: %w", err)
+	}
 	return toolcache.NewFetcher(
 		fc,
 		toolcache.WithMeter(metrics.Meter()),
-		toolcache.WithEvents(func(ctx context.Context, ev toolcache.FetchEvent) { logFetchEvent(ctx, logger, ev) }),
+		toolcache.WithEvents(fetchEventHandler(logger, alerts)),
 		toolcache.WithErrorHandler(func(ctx context.Context, err error) {
 			logger.WarnContext(ctx, "utility fetch loop error", "error", err)
 		}),
 	)
 }
 
-// logFetchEvent logs one state change of a utility cache row at Info. The
-// event's error has the userinfo, query and fragment of any URL removed already.
+// fetchEventHandler logs every fetch event and adds a talos_broken alert for
+// each Talos row that goes broken (the fleet repository writes its talos.broken
+// audit row). Several workers call it at once; the logger and counter are safe
+// for that.
+func fetchEventHandler(logger *slog.Logger, alerts metric.Int64Counter) func(context.Context, toolcache.FetchEvent) {
+	return func(ctx context.Context, ev toolcache.FetchEvent) {
+		logFetchEvent(ctx, logger, ev)
+		if ev.Source == toolcache.SourceTalos && ev.To == fleet.CacheBroken {
+			alerts.Add(ctx, 1, metric.WithAttributes(attribute.String("kind", "talos_broken")))
+		}
+	}
+}
+
+// logFetchEvent logs one state change of a cache row at Info, with its source:
+// a utility row by entry, arch and pin, a Talos row by schematic, version and
+// arch. The event's error has the userinfo, query and fragment of any URL
+// removed already.
 func logFetchEvent(ctx context.Context, logger *slog.Logger, ev toolcache.FetchEvent) {
 	var cause string
 	if ev.Err != nil {
 		cause = fleet.PrintableText(ev.Err.Error())
 	}
-	logger.InfoContext(ctx, "utility fetch",
+	change := []any{
+		"source", ev.Source, "from", string(ev.From), "to", string(ev.To), "attempts", ev.Attempts,
+		"class", ev.Class, "error", cause, "bytes", ev.Bytes, "duration_ms", ev.Duration.Milliseconds(),
+	}
+	if ev.Source == toolcache.SourceTalos {
+		logger.InfoContext(ctx, "talos fetch", append([]any{
+			"schematic", ev.Talos.Schematic, "version", ev.Talos.Version, "arch", string(ev.Talos.Arch),
+		}, change...)...)
+		return
+	}
+	logger.InfoContext(ctx, "utility fetch", append([]any{
 		"entry", ev.Key.Entry, "arch", string(ev.Key.Arch), "pin", ev.Pin,
-		"from", string(ev.From), "to", string(ev.To), "attempts", ev.Attempts,
-		"class", ev.Class, "error", cause, "bytes", ev.Bytes, "duration_ms", ev.Duration.Milliseconds())
+	}, change...)...)
+}
+
+const (
+	// ticketRetention is how long a consumed, revoked or expired ticket is kept.
+	// A ticket whose config recording is still being retried is neither
+	// consumed nor revoked, and the retries start before it expires and give up
+	// an hour after, so pruning never deletes it.
+	ticketRetention = 7 * 24 * time.Hour
+	// ticketPruneInterval is the time between two prunings.
+	ticketPruneInterval = time.Hour
+)
+
+// runTicketPruning deletes the tickets consumed, revoked or expired more than
+// ticketRetention before now, at once and then every ticketPruneInterval,
+// until ctx ends. A failed pruning is logged at Warn and tried again at the
+// next interval. It returns nil.
+func runTicketPruning(ctx context.Context, repo *fleet.Repository, logger *slog.Logger, now func() time.Time) error {
+	tick := time.Tick(ticketPruneInterval)
+	for {
+		n, err := repo.PruneTickets(ctx, now().Add(-ticketRetention))
+		switch {
+		case err != nil && ctx.Err() == nil:
+			logger.WarnContext(ctx, "ticket pruning failed", "error", err)
+		case n > 0:
+			logger.InfoContext(ctx, "tickets pruned", "deleted", n)
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-tick:
+		}
+	}
 }
 
 // newServer returns an http.Server for ln with every timeout set. Its
@@ -423,8 +623,13 @@ type plane struct {
 	registry *admin.Registry
 	// loader serves and follows the certificate files; nil in proxy mode.
 	loader *tlscert.Loader
-	// fetcher downloads the utility content that cache rows ask for.
+	// fetcher downloads the utility content and Talos assets that cache rows ask for.
 	fetcher *toolcache.Fetcher
+	// clusters polls the imported clusters; handlers serves the boot routes and
+	// retries the config recordings; repo holds the tickets pruning deletes.
+	clusters *clusters.Service
+	handlers *boot.Handlers
+	repo     *fleet.Repository
 
 	adminSrv, httpSrv *http.Server
 	// httpsSrv is the boot HTTPS server in file mode and proxySrv the one behind
@@ -434,9 +639,12 @@ type plane struct {
 
 // run starts every component, marks the service ready and serves until ctx is
 // done or a component fails. It then shuts down in this order: proxyDHCP;
-// the boot servers (draining requests); TFTP, the checks and the certificate
-// loader; the admin server, which stays up the longest so probes and metrics
-// see the drain. The two server drains share one ShutdownGrace deadline, set
+// the boot servers (draining requests); the work stage: TFTP, the checks, the
+// fetcher, the clusters service, the config recorder (after the boot servers,
+// so a recording that fails during the drain is still reported as abandoned),
+// ticket pruning and the certificate loader, all before runServe closes the
+// store and the database; the admin server, which stays up the longest so
+// probes and metrics see the drain. The two server drains share one ShutdownGrace deadline, set
 // when draining starts. It returns the failure that stopped the service, if
 // any, joined with the shutdown errors.
 func (p *plane) run(ctx context.Context) error {
@@ -465,6 +673,9 @@ func (p *plane) run(ctx context.Context) error {
 	}
 	work.start("health checks", func() error { p.registry.Run(workCtx); return nil })
 	work.start("utility fetcher", func() error { return p.fetcher.Run(workCtx) })
+	work.start("clusters", func() error { return p.clusters.Run(workCtx) })
+	work.start("config recorder", func() error { return p.handlers.RunRecorder(workCtx) })
+	work.start("ticket pruning", func() error { return runTicketPruning(workCtx, p.repo, p.logger, time.Now) })
 	if p.loader != nil {
 		work.start("certificate loader", func() error { return p.loader.Run(workCtx) })
 	}

@@ -19,6 +19,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -26,14 +27,23 @@ import (
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"go.uber.org/goleak"
 
 	"go.jacaudi.dev/hephaestus/internal/boot"
 	"go.jacaudi.dev/hephaestus/internal/catalog"
 	"go.jacaudi.dev/hephaestus/internal/catalog/catalogtest"
+	"go.jacaudi.dev/hephaestus/internal/clusters"
+	"go.jacaudi.dev/hephaestus/internal/clusters/gittest"
+	"go.jacaudi.dev/hephaestus/internal/datakey"
 	"go.jacaudi.dev/hephaestus/internal/db"
+	"go.jacaudi.dev/hephaestus/internal/db/dbtest"
 	"go.jacaudi.dev/hephaestus/internal/fleet"
 	"go.jacaudi.dev/hephaestus/internal/secret"
+	"go.jacaudi.dev/hephaestus/internal/secrets"
 	"go.jacaudi.dev/hephaestus/internal/store"
 	"go.jacaudi.dev/hephaestus/internal/tlscert/tlscerttest"
 	"go.jacaudi.dev/hephaestus/internal/toolcache"
@@ -64,6 +74,7 @@ func testServeConfig(t *testing.T) (serveConfig, *x509.Certificate) {
 		TLSMode:       tlsModeFile,
 		TLSCertFile:   certFile,
 		TLSKeyFile:    keyFile,
+		DataKey:       parseKey(t, testDataKey),
 		ShutdownGrace: 5 * time.Second,
 		LogFormat:     "json",
 		LogLevel:      slog.LevelInfo,
@@ -89,6 +100,19 @@ func writeTestChain(t *testing.T, name string) (certFile, keyFile string, root *
 	t.Helper()
 	return tlscerttest.WriteChain(t, t.TempDir(), name, time.Now().Add(-time.Hour), time.Now().Add(90*24*time.Hour), true, true)
 }
+
+// parseKey parses an encoded data key.
+func parseKey(t *testing.T, encoded string) *datakey.Key {
+	t.Helper()
+	k, err := datakey.Parse(secret.Secret(encoded))
+	if err != nil {
+		t.Fatalf("datakey.Parse: %v", err)
+	}
+	return k
+}
+
+// testCounter is a 1Password request counter that no client sends through.
+func testCounter() *secrets.Counter { return secrets.NewCounter(http.DefaultTransport, time.Now) }
 
 // listenLoopback opens n loopback listeners; runServe takes ownership of the ones it is given.
 func listenLoopback(t *testing.T, n int) []net.Listener {
@@ -123,7 +147,7 @@ func testDeps(t *testing.T, root *x509.Certificate) serveDeps {
 	t.Helper()
 
 	lns := listenLoopback(t, 3)
-	return serveDeps{httpLn: lns[0], httpsLn: lns[1], adminLn: lns[2], files: testFiles(), roots: []*x509.Certificate{root}, catalog: testCatalog(t), client: testUpstreamClient()}
+	return serveDeps{httpLn: lns[0], httpsLn: lns[1], adminLn: lns[2], files: testFiles(), roots: []*x509.Certificate{root}, catalog: testCatalog(t), client: testUpstreamClient(), counter: testCounter()}
 }
 
 // testProxyDeps is the proxy-mode wiring: boot HTTP, proxy and admin listeners.
@@ -131,7 +155,7 @@ func testProxyDeps(t *testing.T) serveDeps {
 	t.Helper()
 
 	lns := listenLoopback(t, 3)
-	return serveDeps{httpLn: lns[0], proxyLn: lns[1], adminLn: lns[2], files: testFiles(), catalog: testCatalog(t), client: testUpstreamClient()}
+	return serveDeps{httpLn: lns[0], proxyLn: lns[1], adminLn: lns[2], files: testFiles(), catalog: testCatalog(t), client: testUpstreamClient(), counter: testCounter()}
 }
 
 func (d serveDeps) httpURL() string  { return "http://" + d.httpLn.Addr().String() }
@@ -885,6 +909,13 @@ func serveObjects(base string, objects map[string][]byte) http.Handler {
 // because an open database holds a goroutine.
 func openCache(t *testing.T, cfg serveConfig) (*fleet.Repository, func()) {
 	t.Helper()
+	d, closeDB := openDB(t, cfg)
+	return fleet.NewRepository(d), closeDB
+}
+
+// openDB opens and migrates the database cfg names; the returned function closes it, as openCache's does.
+func openDB(t *testing.T, cfg serveConfig) (*db.DB, func()) {
+	t.Helper()
 	d, err := db.Open(t.Context(), cfg.DatabaseURL)
 	if err != nil {
 		t.Fatalf("db.Open: %v", err)
@@ -892,7 +923,7 @@ func openCache(t *testing.T, cfg serveConfig) (*fleet.Repository, func()) {
 	if err := d.Migrate(t.Context()); err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	return fleet.NewRepository(d), func() {
+	return d, func() {
 		if err := d.Close(); err != nil {
 			t.Errorf("close database: %v", err)
 		}
@@ -1341,5 +1372,429 @@ func TestServeHelp_ListsFetchWorkers(t *testing.T) {
 
 	if !strings.Contains(optional, "HEPHAESTUS_FETCH_WORKERS") {
 		t.Errorf("serve's optional variables are %q, want HEPHAESTUS_FETCH_WORKERS among them", optional)
+	}
+}
+
+// otherDataKey is base64 of 32 bytes of 0x02: a key the fixture database was not sealed with.
+const otherDataKey = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI="
+
+// TestRunServe_WrongDataKeyStops pins that a data key other than the one the
+// database's canary was sealed with stops startup, naming the variable, before
+// anything serves.
+func TestRunServe_WrongDataKeyStops(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	cfg, root := testServeConfig(t)
+	d, closeDB := openDB(t, cfg)
+	if err := datakey.EnsureCanary(t.Context(), d.Bun(), cfg.DataKey); err != nil {
+		t.Fatalf("EnsureCanary: %v", err)
+	}
+	closeDB()
+	cfg.DataKey = parseKey(t, otherDataKey)
+	deps := testDeps(t, root)
+	probe := probeReadyz(t, deps)
+	_, done := startServe(t, cfg, discardLogger(), deps)
+
+	err := waitDone(t, done, 10*time.Second)
+
+	if err == nil || !strings.Contains(err.Error(), "HEPHAESTUS_DATA_KEY") || !errors.Is(err, datakey.ErrCanary) {
+		t.Errorf("runServe = %v, want datakey.ErrCanary naming HEPHAESTUS_DATA_KEY", err)
+	}
+	requireUnanswered(t, probe)
+}
+
+// healthEntry is one result of a check in the /health document.
+type healthEntry struct {
+	Status string `json:"status"`
+	Output string `json:"output"`
+}
+
+// health fetches and decodes the admin listener's /health document, by check name.
+func health(t *testing.T, deps serveDeps) map[string][]healthEntry {
+	t.Helper()
+	body := get(t, testClient(nil), deps.adminURL()+"/health").body
+	var doc struct {
+		Checks map[string][]healthEntry `json:"checks"`
+	}
+	if err := json.Unmarshal([]byte(body), &doc); err != nil {
+		t.Fatalf("decode /health: %v\n%s", err, body)
+	}
+	return doc.Checks
+}
+
+// TestRunServe_StartsWithoutOPToken pins that serve starts and comes ready with
+// no 1Password token, and that secrets:token warns, naming the variable, only
+// once a cluster exists. A refresh requested meanwhile stays pending.
+func TestRunServe_StartsWithoutOPToken(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	cfg, root := testServeConfig(t)
+	cfg.OPToken = ""
+	deps := testDeps(t, root)
+	stop, done := startServe(t, cfg, discardLogger(), deps)
+	waitStatus(t, deps.adminURL()+"/readyz", done)
+	checks := health(t, deps)
+	if got := checks["secrets:token"]; len(got) != 1 || got[0].Status != "pass" {
+		t.Errorf("secrets:token with no cluster = %+v, want one pass", got)
+	}
+	for _, name := range []string{"secrets:cache", "secrets:budget", "secrets:client", "git:fetch", "render:approved", "talos:cache", "config:pending"} {
+		if _, ok := checks[name]; !ok {
+			t.Errorf("GET /health lacks the %s check", name)
+		}
+	}
+	if metrics := get(t, testClient(nil), deps.adminURL()+"/metrics"); !strings.Contains(metrics.body, "hephaestus_secrets_requests") {
+		t.Errorf("GET /metrics lacks hephaestus_secrets_requests:\n%s", metrics.body)
+	}
+	stop()
+	if err := waitDone(t, done, 10*time.Second); err != nil {
+		t.Fatalf("runServe after cancel = %v, want nil", err)
+	}
+
+	d, closeDB := openDB(t, cfg)
+	defer closeDB()
+	clusterRepo := clusters.NewRepository(d, cfg.DataKey)
+	if _, err := clusterRepo.Import(t.Context(), clusters.ImportRequest{
+		Name: "lab", RepoURL: "https://127.0.0.1:1/lab.git", Ref: "main", Subpath: "lab", At: time.Now(),
+	}); err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+	if err := clusterRepo.RequestRefresh(t.Context(), "lab", time.Now()); err != nil {
+		t.Fatalf("RequestRefresh: %v", err)
+	}
+	deps = testDeps(t, root)
+	stop, done = startServe(t, cfg, discardLogger(), deps)
+	waitStatus(t, deps.adminURL()+"/readyz", done)
+	got := health(t, deps)["secrets:token"]
+	stop()
+	if err := waitDone(t, done, 10*time.Second); err != nil {
+		t.Fatalf("runServe after cancel = %v, want nil", err)
+	}
+
+	if len(got) != 1 || got[0].Status != "warn" || !strings.Contains(got[0].Output, "HEPHAESTUS_OP_TOKEN") {
+		t.Errorf("secrets:token with a cluster = %+v, want one warn naming HEPHAESTUS_OP_TOKEN", got)
+	}
+	if c, err := clusterRepo.Get(t.Context(), "lab"); err != nil || !c.RefreshRequested {
+		t.Errorf("cluster lab refresh requested = %t, %v; want the request still pending", c.RefreshRequested, err)
+	}
+}
+
+// labDefinition is a definition of cluster lab under lab/ that loads, with the
+// shared secrets bundle, whose references a resolver is asked for.
+func labDefinition(t *testing.T) map[string]string {
+	t.Helper()
+	bundle, err := os.ReadFile("../../internal/third_party/topf/render/testdata/bundle/secrets.yaml")
+	if err != nil {
+		t.Fatalf("read the secrets bundle: %v", err)
+	}
+	return map[string]string{
+		"lab/topf.yaml": `clusterName: lab
+clusterEndpoint: https://10.10.20.11:6443
+kubernetesVersion: v1.35.10
+talosVersion: v1.12.11
+nodes:
+  - host: cp-01
+    role: control-plane
+    ip: 10.10.20.11
+`,
+		"lab/secrets.yaml": string(bundle),
+	}
+}
+
+// blockingResolver waits for the end of its context on every call; entered is
+// closed when the first call starts.
+type blockingResolver struct {
+	once    sync.Once
+	entered chan struct{}
+}
+
+func (b *blockingResolver) ResolveAll(ctx context.Context, _ []string) (map[string]secrets.Result, error) {
+	b.once.Do(func() { close(b.entered) })
+	<-ctx.Done()
+	return nil, &secrets.WholeCallError{Err: ctx.Err()}
+}
+
+// TestRunServe_ShutdownOrderClearsProcessing pins that the clusters service
+// stops before the database closes: a processing mark it holds when serve is
+// told to stop, here on a resolve cut short, is cleared rather than left for the
+// next start to turn into a failed tree.
+func TestRunServe_ShutdownOrderClearsProcessing(t *testing.T) {
+	srv := gittest.NewServer(t, gittest.Options{})
+	srv.Commit(t, labDefinition(t), nil)
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	defer srv.Close()
+	tr := trustInDefaultTransport(t, srv.CAPEM())
+	defer tr.CloseIdleConnections() // before goleak looks; the restore runs after it
+
+	var logs bytes.Buffer
+	cfg, root := testServeConfig(t)
+	d, closeDB := openDB(t, cfg)
+	defer closeDB()
+	clusterRepo := clusters.NewRepository(d, cfg.DataKey)
+	if _, err := clusterRepo.Import(t.Context(), clusters.ImportRequest{
+		Name: "lab", RepoURL: srv.URL(gittest.DefaultRepo), Ref: "main", Subpath: "lab", At: time.Now(),
+	}); err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+	res := &blockingResolver{entered: make(chan struct{})}
+	deps := testDeps(t, root)
+	deps.resolver = res
+	stop, done := startServe(t, cfg, slog.New(slog.NewJSONHandler(&logs, nil)), deps)
+
+	select {
+	case <-res.entered:
+	case <-time.After(10 * time.Second):
+		stop()
+		err := waitDone(t, done, 10*time.Second)
+		t.Fatalf("the head tree never reached the resolver (runServe = %v):\n%s", err, logs.String())
+	}
+	if c, err := clusterRepo.Get(t.Context(), "lab"); err != nil || c.ProcessingTree == "" {
+		t.Fatalf("processing tree while resolving = %q, %v; want the head tree marked", c.ProcessingTree, err)
+	}
+	stop()
+	if err := waitDone(t, done, 10*time.Second); err != nil {
+		t.Fatalf("runServe after cancel = %v, want nil", err)
+	}
+
+	c, err := clusterRepo.Get(t.Context(), "lab")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if c.ProcessingTree != "" || c.ProcessingRevision != nil || c.FailedTree != "" {
+		t.Errorf("after shutdown: processing tree %q, revision %v, failed tree %q; want no mark and no failed tree\n%s",
+			c.ProcessingTree, c.ProcessingRevision, c.FailedTree, logs.String())
+	}
+}
+
+// TestServeHelp_ListsSecretVariables: serve's help names the data key and the
+// 1Password token variables loadConfig reads, with their _FILE forms.
+func TestServeHelp_ListsSecretVariables(t *testing.T) {
+	help := newServeCmd().Long
+	for _, name := range []string{"HEPHAESTUS_DATA_KEY", "HEPHAESTUS_DATA_KEY_FILE", "HEPHAESTUS_OP_TOKEN", "HEPHAESTUS_OP_TOKEN_FILE"} {
+		if !regexp.MustCompile(`\b` + name + `\b`).MatchString(help) {
+			t.Errorf("serve's help does not list %s:\n%s", name, help)
+		}
+	}
+}
+
+// TestLogFetchEvent_Source pins that a fetch event's line carries its source and
+// names its row: a utility row by entry, arch and pin, a Talos row by its tuple.
+func TestLogFetchEvent_Source(t *testing.T) {
+	talos := fleet.TalosKey{Schematic: plainSchematic, Version: "v1.12.11", Arch: fleet.ArchAMD64}
+	tests := []struct {
+		name string
+		ev   toolcache.FetchEvent
+		msg  string
+		want map[string]any
+	}{
+		{
+			name: "utility",
+			ev:   toolcache.FetchEvent{Source: toolcache.SourceUtility, Key: tshellAMD64Key(), Pin: "p1", From: fleet.CacheFetching, To: fleet.CacheReady},
+			msg:  "utility fetch",
+			want: map[string]any{"source": "utility", "entry": "tshell", "arch": "amd64", "pin": "p1", "to": "ready"},
+		},
+		{
+			name: "talos",
+			ev:   toolcache.FetchEvent{Source: toolcache.SourceTalos, Talos: talos, From: fleet.CacheFetching, To: fleet.CacheBroken, Class: "integrity"},
+			msg:  "talos fetch",
+			want: map[string]any{"source": "talos", "schematic": plainSchematic, "version": "v1.12.11", "arch": "amd64", "to": "broken", "class": "integrity"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+
+			logFetchEvent(t.Context(), slog.New(slog.NewJSONHandler(&buf, nil)), tt.ev)
+
+			recs := logRecords(buf.Bytes(), tt.msg)
+			if len(recs) != 1 {
+				t.Fatalf("%d %q lines, want 1:\n%s", len(recs), tt.msg, buf.String())
+			}
+			for k, want := range tt.want {
+				if got := recs[0][k]; got != want {
+					t.Errorf("%s = %v, want %v", k, got, want)
+				}
+			}
+		})
+	}
+}
+
+// alertCounts reads the hephaestus.alerts sums by kind.
+func alertCounts(t *testing.T, reader *sdkmetric.ManualReader) map[string]int64 {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(t.Context(), &rm); err != nil {
+		t.Fatalf("collect metrics: %v", err)
+	}
+	out := map[string]int64{}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			if m.Name != "hephaestus.alerts" || !ok {
+				continue
+			}
+			for _, dp := range sum.DataPoints {
+				kind, _ := dp.Attributes.Value(attribute.Key("kind"))
+				out[kind.AsString()] += dp.Value
+			}
+		}
+	}
+	return out
+}
+
+// TestFetchEvents_TalosBrokenAlerts pins that a Talos row going broken raises the
+// talos_broken alert, and that no other change does.
+func TestFetchEvents_TalosBrokenAlerts(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	alerts, err := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)).Meter("test").
+		Int64Counter("hephaestus.alerts", metric.WithDescription("Operator alerts raised, by kind."))
+	if err != nil {
+		t.Fatalf("alerts counter: %v", err)
+	}
+	handle := fetchEventHandler(discardLogger(), alerts)
+
+	handle(t.Context(), toolcache.FetchEvent{Source: toolcache.SourceTalos, From: fleet.CacheFetching, To: fleet.CacheBroken})
+	handle(t.Context(), toolcache.FetchEvent{Source: toolcache.SourceTalos, From: fleet.CacheFetching, To: fleet.CacheFailed})
+	handle(t.Context(), toolcache.FetchEvent{Source: toolcache.SourceUtility, From: fleet.CacheFetching, To: fleet.CacheBroken})
+
+	if got, want := alertCounts(t, reader), map[string]int64{"talos_broken": 1}; !maps.Equal(got, want) {
+		t.Errorf("alerts = %v, want %v", got, want)
+	}
+}
+
+// TestStoreErrorHandler_Level pins that a filesystem refusing a directory fsync,
+// a known limit of some volumes, logs at Warn, and anything else at Error.
+func TestStoreErrorHandler_Level(t *testing.T) {
+	tests := []struct {
+		name  string
+		err   error
+		level string
+	}{
+		{name: "directory fsync unsupported", err: fmt.Errorf("%w: fsync blobs: invalid argument", store.ErrDirSyncUnsupported), level: "WARN"},
+		{name: "any other error", err: errors.New("disk on fire"), level: "ERROR"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var logs bytes.Buffer
+
+			storeErrorHandler(slog.New(slog.NewJSONHandler(&logs, nil)))(t.Context(), tt.err)
+
+			got := logRecords(logs.Bytes(), "store error")
+			if len(got) != 1 || got[0]["level"] != tt.level {
+				t.Errorf("records = %v, want one \"store error\" at %s", got, tt.level)
+			}
+		})
+	}
+}
+
+// TestRunTicketPruning pins that pruning deletes the tickets consumed, revoked or
+// expired more than a week ago, at once and not only after the first hour, and
+// keeps the rest: one consumed six days ago, and a live one whose config
+// recording is still being retried after its expiry.
+func TestRunTicketPruning(t *testing.T) {
+	d := dbtest.SQLite(t)
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	repo := fleet.NewRepository(d)
+	m, err := repo.RecordBoot(t.Context(), fleet.BootRecord{
+		Identity: fleet.Identity{UUID: "4c4c4544-0042-3510-8052-b4c04f4e4d32", MAC: "aa:bb:cc:00:00:01", Serial: "S", Product: "P"},
+		Arch:     fleet.ArchAMD64, Trigger: fleet.TriggerFirstContact,
+		Event: fleet.BootEvent{Row: 7, Action: "hold", Reason: "awaiting approval"}, At: checkT0,
+	})
+	if err != nil {
+		t.Fatalf("RecordBoot: %v", err)
+	}
+	ticket := func(id string, minted time.Time, consumed bool) fleet.Ticket {
+		tk := fleet.Ticket{
+			ID: id, MachineID: m.ID, TokenSHA256: "hash-" + id, ClusterID: "cluster-1", HostName: "cp-01",
+			PairID: "pair-1", SecretVersionID: "version-1", MintedAt: minted, ExpiresAt: minted.Add(fleet.TicketTTL),
+		}
+		if consumed {
+			tk.ConsumedAt = minted.Add(time.Minute)
+		}
+		return tk
+	}
+	tickets := []fleet.Ticket{
+		ticket("old", checkT0.Add(-8*24*time.Hour), true),
+		ticket("recent", checkT0.Add(-6*24*time.Hour), true),
+		ticket("retrying", checkT0.Add(-fleet.TicketTTL-time.Hour), false),
+	}
+	if _, err := d.Bun().NewInsert().Model(&tickets).Exec(t.Context()); err != nil {
+		t.Fatalf("insert tickets: %v", err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- runTicketPruning(ctx, repo, discardLogger(), func() time.Time { return checkT0 }) }()
+
+	var ids []string
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+		ids = nil
+		if err := d.Bun().NewSelect().Model((*fleet.Ticket)(nil)).Column("id").Order("id").Scan(t.Context(), &ids); err != nil {
+			t.Fatalf("read tickets: %v", err)
+		}
+		if !slices.Contains(ids, "old") {
+			break
+		}
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Errorf("runTicketPruning = %v, want nil", err)
+	}
+
+	if want := []string{"recent", "retrying"}; !slices.Equal(ids, want) {
+		t.Errorf("tickets after pruning = %v, want %v", ids, want)
+	}
+}
+
+// refusingTransport fails every request without sending it.
+type refusingTransport struct{}
+
+func (refusingTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, errors.New("no upstream in this test")
+}
+
+// TestRunServe_ReconcilesTalos pins that serve reconciles the Talos rows after
+// the utility garbage collection and before anything serves: a row a dead
+// process left fetching is counted as interrupted. The upstream client refuses
+// every request, so the fetch that follows reaches no image factory.
+func TestRunServe_ReconcilesTalos(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	var logs bytes.Buffer
+	cfg, root := testServeConfig(t)
+	deps := testDeps(t, root)
+	deps.client = &http.Client{Transport: refusingTransport{}}
+	d, closeDB := openDB(t, cfg)
+	defer closeDB()
+	key := fleet.TalosKey{Schematic: plainSchematic, Version: "v1.12.11", Arch: fleet.ArchAMD64}
+	if _, err := fleet.WantTalosTx(t.Context(), d.Bun(), fleet.TalosWant{Key: key}, time.Now()); err != nil {
+		t.Fatalf("WantTalosTx: %v", err)
+	}
+	if _, ok, err := fleet.NewRepository(d).ClaimTalosRow(t.Context(), key, time.Now()); err != nil || !ok {
+		t.Fatalf("ClaimTalosRow = %v, %v; want the row fetching", ok, err)
+	}
+	stop, done := startServe(t, cfg, slog.New(slog.NewJSONHandler(&logs, nil)), deps)
+	waitStatus(t, deps.adminURL()+"/readyz", done)
+	stop()
+	if err := waitDone(t, done, 10*time.Second); err != nil {
+		t.Fatalf("runServe after cancel = %v, want nil", err)
+	}
+
+	// runServe has returned, so nothing writes to logs any more.
+	if rec := logRecords(logs.Bytes(), "talos reconciled"); len(rec) != 1 || rec[0]["interrupted"] != float64(1) {
+		t.Errorf("\"talos reconciled\" records = %v, want one with interrupted 1", rec)
+	}
+	var steps []string
+	for line := range bytes.SplitSeq(logs.Bytes(), []byte("\n")) {
+		var rec map[string]any
+		if json.Unmarshal(line, &rec) != nil {
+			continue
+		}
+		msg, _ := rec["msg"].(string)
+		if msg == "utility garbage collected" || msg == "talos reconciled" || (msg == "request" && !slices.Contains(steps, msg)) {
+			steps = append(steps, msg)
+		}
+	}
+	if want := []string{"utility garbage collected", "talos reconciled", "request"}; !slices.Equal(steps, want) {
+		t.Errorf("startup log order = %v, want %v", steps, want)
 	}
 }
