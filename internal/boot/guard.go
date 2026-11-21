@@ -13,13 +13,18 @@ import (
 // IPv4 subnet; an address that does not parse is refused.
 func RequireSubnet(subnet netip.Prefix, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		addr, err := clientAddr(r)
-		if err != nil || !subnet.Contains(addr) {
+		if !onSubnet(subnet, r) {
 			w.WriteHeader(http.StatusForbidden)
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// onSubnet reports whether r's client address (clientAddr) parses and is inside subnet.
+func onSubnet(subnet netip.Prefix, r *http.Request) bool {
+	addr, err := clientAddr(r)
+	return err == nil && subnet.Contains(addr)
 }
 
 // clientAddr is the client address of r, with an IPv4-mapped IPv6 address

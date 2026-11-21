@@ -146,6 +146,17 @@ func mustRecord(t *testing.T, r *Repository, ticketID string, at time.Time) Reco
 	return res
 }
 
+// seedCluster stores cluster lab with approved as its approved pair.
+func seedCluster(t *testing.T, d *db.DB, approved string) {
+	t.Helper()
+	const stamp = "'2026-11-19T12:00:00Z'"
+	q := "INSERT INTO clusters (id, name, repo_url, ref, subpath, approved_pair_id, created_at, updated_at) " +
+		"VALUES (?, 'lab', 'https://git.example.test/lab.git', 'main', '.', ?, " + stamp + ", " + stamp + ")"
+	if err := execRaw(t, d, q, labCluster, approved); err != nil {
+		t.Fatalf("seed cluster: %v", err)
+	}
+}
+
 // wantLive fails unless the ticket's row is live.
 func wantLive(t *testing.T, d *db.DB, id string) {
 	t.Helper()
@@ -490,6 +501,9 @@ func runTicketSuite(t *testing.T, open func(testing.TB) *db.DB, pair func(testin
 		if res.Recorded || res.AlreadyConsumed {
 			t.Fatalf("result = %+v, want not recorded", res)
 		}
+		if res.Machine.ID != m.ID || res.Machine.State != StateDiscovered {
+			t.Fatalf("result machine = %s %s, want %s as it is now, discovered", res.Machine.ID, res.Machine.State, m.ID)
+		}
 		if got := mustGet(t, r, m.ID); got.State != StateDiscovered {
 			t.Fatalf("State = %s, want discovered", got.State)
 		}
@@ -515,6 +529,27 @@ func runTicketSuite(t *testing.T, open func(testing.TB) *db.DB, pair func(testin
 		}
 		if row := readTicket(t, d, tk.ID); !row.ConsumedAt.IsZero() {
 			t.Fatalf("ConsumedAt = %v, want the ticket left unconsumed", row.ConsumedAt)
+		}
+	})
+
+	t.Run("RecordOlderPair", func(t *testing.T) {
+		d, r, m, tk := assignedWithTicket(t)
+		seedCluster(t, d, "pair-2")
+		if res := mustRecord(t, r, tk.ID, t0.Add(2*time.Minute)); !res.Recorded {
+			t.Fatalf("result = %+v, want recorded (the body was delivered)", res)
+		}
+		wantOneAudit(t, d, "config.older_pair", ActorSystem, m.ID,
+			`{"ticket_id":"`+tk.ID+`","pair_id":"pair-1","approved_pair_id":"pair-2"}`)
+	})
+
+	t.Run("RecordCurrentPair", func(t *testing.T) {
+		d, r, _, tk := assignedWithTicket(t)
+		seedCluster(t, d, "pair-1")
+		if res := mustRecord(t, r, tk.ID, t0.Add(2*time.Minute)); !res.Recorded {
+			t.Fatalf("result = %+v, want recorded", res)
+		}
+		if got := auditsOf(t, d, "config.older_pair"); len(got) != 0 {
+			t.Fatalf("config.older_pair audits = %+v, want none for the approved pair", got)
 		}
 	})
 

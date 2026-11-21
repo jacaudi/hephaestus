@@ -29,8 +29,9 @@ const (
 	// SMBIOS strings are far shorter; longer ones are hostile or broken.
 	maxValueBytes = 256
 
-	// scriptDeadline bounds writing an iPXE script; idleWrite bounds each write of
-	// a binary, so a slow client may take as long as it keeps making progress.
+	// scriptDeadline bounds writing an iPXE script or a machine config; idleWrite
+	// bounds each write of a binary, so a slow client may take as long as it
+	// keeps making progress.
 	scriptDeadline = 10 * time.Second
 	idleWrite      = 30 * time.Second
 
@@ -77,7 +78,8 @@ type Config struct {
 }
 
 // Handlers serves the boot routes: the iPXE chain scripts over plain HTTP, the
-// iPXE binaries over plain HTTP and TLS, and /boot and /discover over TLS.
+// iPXE binaries over plain HTTP and TLS, and /boot, /discover and /config over
+// TLS.
 type Handlers struct {
 	repo    *fleet.Repository
 	content *store.Store
@@ -92,10 +94,21 @@ type Handlers struct {
 	onError func(context.Context, error)
 
 	limit             limiterConfig
-	limiter           *windowLimiter
+	limiter           *windowLimiter[netip.Addr]
 	decisions, alerts metric.Int64Counter
 	reports, boots    metric.Int64Counter
 	minted            metric.Int64Counter
+
+	// refusals limits the /config refusal audits; requests and recordFailures
+	// count /config outcomes and failed tries to record a delivery.
+	refusals                 *windowLimiter[string]
+	requests, recordFailures metric.Int64Counter
+	// record stores a delivered config (fleet.Repository.RecordConfigServed);
+	// retryBase is the first wait before a failed one is tried again, and rec
+	// queues those for RunRecorder. Tests replace record and retryBase.
+	record    func(context.Context, fleet.RecordConfigRequest) (fleet.RecordConfigResult, error)
+	retryBase time.Duration
+	rec       recordQueue
 }
 
 // limiterConfig is what WithLimiter sets and NewHandlers builds the limiter from.
@@ -145,8 +158,10 @@ func NewHandlers(cfg Config, opts ...Option) (*Handlers, error) {
 		repo: cfg.Repo, content: cfg.Store, catalog: cfg.Catalog,
 		fqdn: cfg.FQDN, address: cfg.Address, subnet: cfg.Subnet, files: cfg.Files, configs: cfg.Configs,
 		now: time.Now, meter: noop.NewMeterProvider().Meter(""),
-		onError: func(context.Context, error) {},
-		limit:   limiterConfig{limit: discoverPerSource, window: discoverWindow, capacity: limiterCapacity},
+		onError:   func(context.Context, error) {},
+		limit:     limiterConfig{limit: discoverPerSource, window: discoverWindow, capacity: limiterCapacity},
+		retryBase: recordRetryBase,
+		rec:       recordQueue{entries: make(map[string]*pendingRecord), wake: make(chan struct{}, 1)},
 	}
 	for _, opt := range opts {
 		opt(h)
@@ -154,7 +169,9 @@ func NewHandlers(cfg Config, opts ...Option) (*Handlers, error) {
 	if err := h.validate(); err != nil {
 		return nil, err
 	}
-	h.limiter = newWindowLimiter(h.limit.limit, h.limit.window, h.limit.capacity, h.now)
+	h.limiter = newWindowLimiter[netip.Addr](h.limit.limit, h.limit.window, h.limit.capacity, h.now)
+	h.refusals = newWindowLimiter[string](1, refusalAuditWindow, limiterCapacity, h.now)
+	h.record = h.repo.RecordConfigServed
 	var err error
 	h.decisions, err = h.meter.Int64Counter("hephaestus.boot.decisions",
 		metric.WithDescription("Boot decisions served, by decision-table row and action."))
@@ -180,6 +197,16 @@ func NewHandlers(cfg Config, opts ...Option) (*Handlers, error) {
 		metric.WithDescription("Config tickets minted for Talos installs."))
 	if err != nil {
 		return nil, fmt.Errorf("boot: tickets minted counter: %w", err)
+	}
+	h.requests, err = h.meter.Int64Counter("hephaestus.config.requests",
+		metric.WithDescription("Machine config requests on /config, by outcome."))
+	if err != nil {
+		return nil, fmt.Errorf("boot: config requests counter: %w", err)
+	}
+	h.recordFailures, err = h.meter.Int64Counter("hephaestus.config.record.failures",
+		metric.WithDescription("Failed tries to record a delivered machine config."))
+	if err != nil {
+		return nil, fmt.Errorf("boot: config record failures counter: %w", err)
 	}
 	return h, nil
 }
@@ -217,25 +244,29 @@ func (h *Handlers) PlainHTTP() http.Handler {
 }
 
 // TLS returns the handler for the TLS listener: /boot, /discover, the iPXE
-// binaries and the Talos artifacts, behind the subnet guard. Which listener a
-// request came in on, not the request, says it is a TLS one: serving it is what
-// makes /boot decide.
+// binaries and the Talos artifacts, behind the subnet guard, and /config
+// (Config) outside it, behind its own. Which listener a request came in on, not
+// the request, says it is a TLS one: serving it is what makes /boot decide.
 func (h *Handlers) TLS() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /boot", h.boot)
 	mux.HandleFunc("POST /discover", h.discover)
 	mux.HandleFunc("GET /tftp/{arch}/snp.efi", h.tftp)
 	mux.HandleFunc(talosRoute, h.talosArtifact)
-	return RequireSubnet(h.subnet, mux)
+	routes := http.NewServeMux()
+	routes.Handle("/config", h.Config())
+	routes.Handle("/", RequireSubnet(h.subnet, mux))
+	return routes
 }
 
 // talosRoute is the pattern of the Talos artifact route, on both listeners.
 const talosRoute = "GET /t/{schematic}/{version}/{arch}/{asset}"
 
 // Proxied returns the handler for the listener a TLS-terminating reverse proxy
-// forwards to: the TLS routes, for clients named by X-Forwarded-For from a peer
-// inside trusted (see TrustProxies). The request arrives as plain HTTP because
-// the proxy has already terminated the TLS.
+// forwards to: the TLS routes, /config included, for clients named by
+// X-Forwarded-For from a peer inside trusted (see TrustProxies, whose refusals
+// stay 403s). The request arrives as plain HTTP because the proxy has already
+// terminated the TLS.
 func (h *Handlers) Proxied(trusted []netip.Prefix) http.Handler {
 	return TrustProxies(trusted, h.TLS())
 }

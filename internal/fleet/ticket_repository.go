@@ -18,7 +18,8 @@ import (
 )
 
 const (
-	actionConfigServed = "config.served"
+	actionConfigServed    = "config.served"
+	actionConfigOlderPair = "config.older_pair"
 
 	// tokenBytes is the entropy of a ticket token: 32 bytes, 43 base64url characters.
 	tokenBytes = 32
@@ -28,6 +29,14 @@ const (
 type configServedDetail struct {
 	TicketID string `json:"ticket_id"`
 	PairID   string `json:"pair_id"`
+}
+
+// olderPairDetail is the detail of a config.older_pair audit event: the
+// delivered pair and the one its cluster had approved when it was recorded.
+type olderPairDetail struct {
+	TicketID       string `json:"ticket_id"`
+	PairID         string `json:"pair_id"`
+	ApprovedPairID string `json:"approved_pair_id"`
 }
 
 // ErrMachineChanged is returned by MintTicket when the machine is no longer
@@ -163,12 +172,13 @@ func (r *Repository) MarkTicketRequested(ctx context.Context, id string, at time
 // RecordConfigServed records that /config was written in full with the ticket,
 // in one transaction: it consumes the ticket, moves the machine to installing
 // (config_served), revokes the machine's other live tickets and audits
-// config.served with the ticket and pair. The machine must be assigned and still
-// bound to the ticket's cluster and host. A revocation after the request was
-// checked does not stop the recording: the body was delivered, so the record
-// follows the fact. It records nothing, without an error, for a ticket that does
-// not exist, for one already consumed (AlreadyConsumed) and for a machine that
-// has moved on.
+// config.served with the ticket and pair. When the ticket's pair is no longer
+// its cluster's approved pair, it also audits config.older_pair with both. The
+// machine must be assigned and still bound to the ticket's cluster and host. A
+// revocation after the request was checked does not stop the recording: the
+// body was delivered, so the record follows the fact. It records nothing,
+// without an error, for a ticket that does not exist, for one already consumed
+// (AlreadyConsumed) and for a machine that has moved on.
 func (r *Repository) RecordConfigServed(ctx context.Context, req RecordConfigRequest) (RecordConfigResult, error) {
 	var res RecordConfigResult
 	err := db.RunInTxRetry(ctx, r.bdb, func(ctx context.Context, tx bun.Tx) error {
@@ -188,10 +198,10 @@ func recordConfigServed(ctx context.Context, tx bun.IDB, req RecordConfigRequest
 		return RecordConfigResult{}, err
 	}
 	if !t.ConsumedAt.IsZero() {
-		return RecordConfigResult{AlreadyConsumed: true}, nil
+		return RecordConfigResult{AlreadyConsumed: true, Machine: m}, nil
 	}
 	if m.State != StateAssigned || !boundTo(m, t.ClusterID, t.HostName) {
-		return RecordConfigResult{}, nil
+		return RecordConfigResult{Machine: m}, nil
 	}
 	served, err := recordDelivery(ctx, tx, t, req.At)
 	if err != nil {
@@ -229,7 +239,9 @@ func boundTo(m Machine, clusterID, host string) bool {
 
 // recordDelivery stores a delivered config: the ticket is consumed, the machine
 // moves to installing, the machine's other live tickets are revoked and the
-// delivery is audited. The caller holds the machine row and has checked the machine.
+// delivery is audited, with config.older_pair when the cluster has approved
+// another pair since the ticket was minted. The caller holds the machine row and
+// has checked the machine.
 func recordDelivery(ctx context.Context, tx bun.IDB, t Ticket, at time.Time) (Machine, error) {
 	consumed, err := applied(ctx, tx.NewUpdate().Model((*Ticket)(nil)).Set("consumed_at = ?", stamp(at)).
 		Where("id = ?", t.ID).Where("consumed_at IS NULL"))
@@ -253,7 +265,30 @@ func recordDelivery(ctx context.Context, tx bun.IDB, t Ticket, at time.Time) (Ma
 	if err := InsertAudit(ctx, tx, ev); err != nil {
 		return Machine{}, err
 	}
+	approved, err := approvedPairOf(ctx, tx, t.ClusterID)
+	if err != nil {
+		return Machine{}, err
+	}
+	if approved != t.PairID {
+		ev.Action, ev.Detail = actionConfigOlderPair, olderPairDetail{TicketID: t.ID, PairID: t.PairID, ApprovedPairID: approved}
+		if err := InsertAudit(ctx, tx, ev); err != nil {
+			return Machine{}, err
+		}
+	}
 	return served, nil
+}
+
+// approvedPairOf returns the id of the cluster's approved pair, "" when it has
+// none or the cluster is gone. A cluster approval changes it only while it holds
+// the rows of the cluster's machines, so a caller holding one of them reads the
+// pair that stays approved until its transaction ends.
+func approvedPairOf(ctx context.Context, q bun.IDB, clusterID string) (string, error) {
+	var id sql.NullString
+	err := q.NewSelect().Table("clusters").Column("approved_pair_id").Where("id = ?", clusterID).Scan(ctx, &id)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return "", fmt.Errorf("read the approved pair of cluster %s: %w", clusterID, err)
+	}
+	return id.String, nil
 }
 
 // PruneTickets deletes the tickets consumed, revoked or expired before the given

@@ -61,10 +61,11 @@ type RecordConfigRequest struct {
 }
 
 // RecordConfigResult is what RecordConfigServed did. Recorded is true when the
-// ticket was consumed and the machine moved to installing, and Machine is then
-// the machine as stored. AlreadyConsumed is true when another call recorded the
-// delivery first. Neither is true when the machine is no longer assigned to the
-// ticket's host.
+// ticket was consumed and the machine moved to installing. AlreadyConsumed is
+// true when another call recorded the delivery first. Neither is true when the
+// machine is no longer assigned to the ticket's host. Machine is the ticket's
+// machine, as stored by the recording or as found under its lock; it is zero
+// when the ticket or the machine is gone.
 type RecordConfigResult struct {
 	Recorded        bool
 	AlreadyConsumed bool

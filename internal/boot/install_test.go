@@ -126,7 +126,7 @@ const (
 )
 
 // fakeConfigs is a ConfigSource whose answers the test sets. It records the
-// machines EnsureAssets was asked for.
+// machines EnsureAssets was asked for and the tickets Render was asked for.
 type fakeConfigs struct {
 	drift     bool
 	pair      clusters.Pair
@@ -134,6 +134,12 @@ type fakeConfigs struct {
 	ensured   []string
 	// onApproved, when set, runs at the start of each Approved call.
 	onApproved func()
+	// render and renderErr are what Render answers; onRender, when set, runs
+	// at the start of each Render call.
+	render    []byte
+	renderErr error
+	rendered  []fleet.Ticket
+	onRender  func()
 }
 
 func newFakeConfigs() *fakeConfigs {
@@ -157,8 +163,12 @@ func (f *fakeConfigs) Approved(_ context.Context, clusterID string) (clusters.Pa
 	return f.pair, nil
 }
 
-func (f *fakeConfigs) Render(context.Context, fleet.Ticket) ([]byte, error) {
-	return nil, errors.New("fakeConfigs: Render is not used by /boot")
+func (f *fakeConfigs) Render(_ context.Context, t fleet.Ticket) ([]byte, error) {
+	f.rendered = append(f.rendered, t)
+	if f.onRender != nil {
+		f.onRender()
+	}
+	return f.render, f.renderErr
 }
 
 // newInstallRig is newRig with src as the config source.

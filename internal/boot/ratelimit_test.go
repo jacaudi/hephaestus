@@ -17,7 +17,7 @@ func TestWindowLimiter(t *testing.T) {
 
 	t.Run("limit then refuse then reopen", func(t *testing.T) {
 		clock := &fakeClock{t: testNow()}
-		l := newWindowLimiter(8, window, 4096, clock.now)
+		l := newWindowLimiter[netip.Addr](8, window, 4096, clock.now)
 		for i := range 8 {
 			if !l.Allow(a) {
 				t.Fatalf("Allow #%d = false, want true", i+1)
@@ -36,7 +36,7 @@ func TestWindowLimiter(t *testing.T) {
 
 	t.Run("keys are independent", func(t *testing.T) {
 		clock := &fakeClock{t: testNow()}
-		l := newWindowLimiter(1, window, 4096, clock.now)
+		l := newWindowLimiter[netip.Addr](1, window, 4096, clock.now)
 		if !l.Allow(a) || l.Allow(a) {
 			t.Fatal("key a: want one token")
 		}
@@ -47,7 +47,7 @@ func TestWindowLimiter(t *testing.T) {
 
 	t.Run("window is fixed from the first hit", func(t *testing.T) {
 		clock := &fakeClock{t: testNow()}
-		l := newWindowLimiter(2, window, 4096, clock.now)
+		l := newWindowLimiter[netip.Addr](2, window, 4096, clock.now)
 		l.Allow(a)
 		clock.t = clock.t.Add(window - time.Second)
 		l.Allow(a)
@@ -58,7 +58,7 @@ func TestWindowLimiter(t *testing.T) {
 
 	t.Run("capacity refuses new keys until the window passes", func(t *testing.T) {
 		clock := &fakeClock{t: testNow()}
-		l := newWindowLimiter(8, window, 2, clock.now)
+		l := newWindowLimiter[netip.Addr](8, window, 2, clock.now)
 		if !l.Allow(a) || !l.Allow(b) {
 			t.Fatal("the first two keys must be allowed")
 		}
@@ -78,7 +78,7 @@ func TestWindowLimiter(t *testing.T) {
 }
 
 func TestWindowLimiter_Concurrent(t *testing.T) {
-	l := newWindowLimiter(100, time.Hour, 4096, testNow)
+	l := newWindowLimiter[netip.Addr](100, time.Hour, 4096, testNow)
 	addr := netip.MustParseAddr("10.10.20.50")
 	allowed := make(chan bool, 400)
 
