@@ -1500,8 +1500,12 @@ nodes:
 	}
 }
 
-// blockingResolver waits for the end of its context on every call; entered is
-// closed when the first call starts.
+// resolveUnwind is how long blockingResolver takes to return once its context
+// ends, as a real call cut short takes a while to unwind.
+const resolveUnwind = 300 * time.Millisecond
+
+// blockingResolver waits for the end of its context on every call, then for
+// resolveUnwind more; entered is closed when the first call starts.
 type blockingResolver struct {
 	once    sync.Once
 	entered chan struct{}
@@ -1510,13 +1514,16 @@ type blockingResolver struct {
 func (b *blockingResolver) ResolveAll(ctx context.Context, _ []string) (map[string]secrets.Result, error) {
 	b.once.Do(func() { close(b.entered) })
 	<-ctx.Done()
+	time.Sleep(resolveUnwind)
 	return nil, &secrets.WholeCallError{Err: ctx.Err()}
 }
 
 // TestRunServe_ShutdownOrderClearsProcessing pins that the clusters service
 // stops before the database closes: a processing mark it holds when serve is
 // told to stop, here on a resolve cut short, is cleared rather than left for the
-// next start to turn into a failed tree.
+// next start to turn into a failed tree. The resolve unwinds for resolveUnwind
+// after its context ends, so a service that serve does not wait for releases
+// its mark only after the database is closed, and the mark stays.
 func TestRunServe_ShutdownOrderClearsProcessing(t *testing.T) {
 	srv := gittest.NewServer(t, gittest.Options{})
 	srv.Commit(t, labDefinition(t), nil)
