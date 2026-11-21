@@ -64,7 +64,12 @@ func TestConfigPendingCheck_Runbook(t *testing.T) {
 			if tt.want != admin.StatusWarn {
 				return
 			}
-			for _, want := range []string{m.ID, runbookInstalling, runbookUnconfirmed} {
+			// The runbook is spelled out here, not read from the production constants, so a changed branch fails.
+			for _, want := range []string{
+				m.ID,
+				"installing: machine abort, then reboot",
+				"install-unconfirmed: topf reset, machine reinstall --topf-reset-full-done, then reboot",
+			} {
 				if !strings.Contains(res.Output, want) {
 					t.Errorf("output %q lacks %q", res.Output, want)
 				}
