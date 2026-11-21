@@ -36,6 +36,31 @@ const moveAsideStamp = "20060102T150405Z"
 // movedAsideInfix joins the store's directory name and the time in the name of a moved-aside store.
 const movedAsideInfix = ".corrupt-"
 
+// The bounds on a tree readTree puts in memory before any load rule has judged it: a definition is a few text files, so
+// these leave room for a large one and stop a tree that expands far beyond its objects. Paths are counted once each, so
+// a subtree that many paths reach counts for all of them.
+const (
+	maxTreeFiles = 20000
+	maxTreeBytes = 128 << 20
+)
+
+// TreeTooLargeError reports a tree with more paths or more bytes than the store reads. Its text holds no content of the
+// tree.
+type TreeTooLargeError struct {
+	// Files is the path bound that was exceeded, or 0 when the byte bound was.
+	Files int
+	// Bytes is the byte bound that was exceeded, or 0 when the path bound was.
+	Bytes int64
+}
+
+// Error states the bound that was exceeded.
+func (e *TreeTooLargeError) Error() string {
+	if e.Files > 0 {
+		return fmt.Sprintf("the tree has more than %d files", e.Files)
+	}
+	return fmt.Sprintf("the tree holds more than %d bytes", e.Bytes)
+}
+
 // gitSource is where a cluster definition comes from.
 type gitSource struct {
 	// URL is the repository's HTTPS address.
@@ -61,13 +86,16 @@ type gitStore struct {
 	// longer has.
 	expected map[string]struct{}
 	now      func() time.Time
+	// maxFiles and maxBytes bound what readTree reads.
+	maxFiles int
+	maxBytes int64
 	// caBundle is an extra CA certificate for the fetches; tests use it to trust their server.
 	caBundle []byte
 }
 
 // newGitStore returns a store that keeps its repositories under dir. now is the clock moveAside falls back to.
 func newGitStore(dir string, now func() time.Time) *gitStore {
-	return &gitStore{dir: dir, expected: map[string]struct{}{}, now: now}
+	return &gitStore{dir: dir, expected: map[string]struct{}{}, now: now, maxFiles: maxTreeFiles, maxBytes: maxTreeBytes}
 }
 
 // fetch brings refs/heads/<src.Ref> into the cluster's repository, creating it on first use, with its whole history,
@@ -134,7 +162,8 @@ func subtreeHash(repo *git.Repository, ref plumbing.ReferenceName, subpath strin
 	return entry.Hash, nil
 }
 
-// readTree returns every file of the tree in memory; the tree is then expected.
+// readTree returns every file of the tree in memory; the tree is then expected. A tree with more paths or bytes than
+// the store's bounds is a *TreeTooLargeError, found before the contents are read.
 func (g *gitStore) readTree(ctx context.Context, clusterID, tree string) (fs.FS, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -149,9 +178,16 @@ func (g *gitStore) readTree(ctx context.Context, clusterID, tree string) (fs.FS,
 	}
 
 	files := map[string]memFile{}
+	var total int64
 	err = root.Files().ForEach(func(f *object.File) error {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		if len(files) >= g.maxFiles {
+			return &TreeTooLargeError{Files: g.maxFiles}
+		}
+		if total += f.Size; total > g.maxBytes {
+			return &TreeTooLargeError{Bytes: g.maxBytes}
 		}
 		content, err := f.Contents()
 		if err != nil {

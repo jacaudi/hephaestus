@@ -487,6 +487,12 @@ func (s *Service) readMarked(ctx context.Context, w work) (fsys fs.FS, moved, ok
 	if s.git.corrupt(w.tree, err) {
 		return nil, s.moveAside(ctx, w.c.Name, err, w.at), false
 	}
+	// A new head tree beyond the bounds fails as one a load rule refuses does, so it is not read again.
+	if tooLarge, isTooLarge := errors.AsType[*TreeTooLargeError](err); isTooLarge && w.trigger == TriggerHead {
+		s.storeFailed(ctx, w, tooLarge.Error())
+		s.report(ctx, stageRead, w.c.Name, "the tree is too large to read")
+		return nil, false, false
+	}
 	s.report(ctx, stageRead, w.c.Name, "the tree cannot be read")
 	return nil, false, false
 }

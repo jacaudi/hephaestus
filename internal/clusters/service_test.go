@@ -418,6 +418,39 @@ func TestService_UnparsableBundleRefusedBeforeResolving(t *testing.T) {
 	}
 }
 
+func TestService_OversizeTreeStoredFailedOnce(t *testing.T) {
+	srv := gittest.NewServer(t, gittest.Options{})
+	h := newSvcHarness(t, srv, "")
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	defer srv.Close()
+	srv.Commit(t, svcFiles(t), nil)
+	s := h.service(h.fake)
+	s.git.maxFiles = 2
+
+	h.poll(s)
+
+	c := h.cluster()
+	if c.FailedTree == "" || c.LastHeadTree != c.FailedTree || c.PendingPairID != "" {
+		t.Fatalf("failed tree = %q, last head = %q, pending = %q; want the tree failed and recorded as processed", c.FailedTree, c.LastHeadTree, c.PendingPairID)
+	}
+	if got := h.errors().Failed; !strings.Contains(got, "2 files") {
+		t.Errorf("failed error = %q, want it to state the bound", got)
+	}
+	wantNoMark(t, c)
+	if n := len(h.fake.seen()); n != 0 {
+		t.Errorf("resolver called %d times for a tree that was not read, want 0", n)
+	}
+
+	reports := len(h.reported())
+	for range 3 {
+		h.now = h.now.Add(PollInterval)
+		h.poll(s)
+	}
+	if got := len(h.reported()); got != reports {
+		t.Errorf("%d more reports over three polls of the same tree, want none: %q", got-reports, h.reported())
+	}
+}
+
 func TestService_FailedTreeErrorIsSealed(t *testing.T) {
 	srv := gittest.NewServer(t, gittest.Options{})
 	h := newSvcHarness(t, srv, "")

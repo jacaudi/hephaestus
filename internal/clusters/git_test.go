@@ -295,6 +295,45 @@ func TestGit_CorruptPackMovesAside(t *testing.T) {
 	}
 }
 
+// TestGit_ReadTreeBoundsWhatItReads: a tree with more paths or more bytes than the store's bounds is refused with a
+// *TreeTooLargeError before its contents are all in memory, and a tree within them reads as before.
+func TestGit_ReadTreeBoundsWhatItReads(t *testing.T) {
+	srv := gittest.NewServer(t, gittest.Options{})
+	srv.Commit(t, labFiles("1"), nil)
+	g := newTestStore(t, srv)
+	tree, err := g.fetch(t.Context(), gitCluster, labSource(srv, gitLab))
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+
+	tests := []struct {
+		name            string
+		maxFiles        int
+		maxBytes        int64
+		wantTooLarge    bool
+		wantUnderstated string
+	}{
+		{name: "within both bounds", maxFiles: 3, maxBytes: 128 << 10},
+		{name: "too many paths", maxFiles: 2, maxBytes: 128 << 10, wantTooLarge: true, wantUnderstated: "2 files"},
+		{name: "too many bytes", maxFiles: 3, maxBytes: 32 << 10, wantTooLarge: true, wantUnderstated: "32768 bytes"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g.maxFiles, g.maxBytes = tt.maxFiles, tt.maxBytes
+
+			_, err := g.readTree(t.Context(), gitCluster, tree)
+
+			tooLarge, isTooLarge := errors.AsType[*TreeTooLargeError](err)
+			if isTooLarge != tt.wantTooLarge || (err != nil) != tt.wantTooLarge {
+				t.Fatalf("readTree error = %v, want a *TreeTooLargeError: %t", err, tt.wantTooLarge)
+			}
+			if tt.wantTooLarge && !strings.Contains(tooLarge.Error(), tt.wantUnderstated) {
+				t.Errorf("error = %q, want it to state the bound %q", tooLarge, tt.wantUnderstated)
+			}
+		})
+	}
+}
+
 func TestGit_MoveAsideKeepsNewest(t *testing.T) {
 	srv := gittest.NewServer(t, gittest.Options{})
 	srv.Commit(t, labFiles("1"), nil)
