@@ -97,7 +97,7 @@ func boundSequences(funcs template.FuncMap) {
 	seq := funcs["seq"].(func(...int) string)                   //nolint:forcetypeassert // pinned by the test named above
 
 	funcs["repeat"] = func(count int, s string) (string, error) {
-		if count > 0 && len(s) > 0 && count > maxRepeatBytes/len(s) {
+		if count > 0 && s != "" && count > maxRepeatBytes/len(s) {
 			return "", fmt.Errorf("repeat: %d copies of %d bytes exceed the limit of %d bytes", count, len(s), maxRepeatBytes)
 		}
 

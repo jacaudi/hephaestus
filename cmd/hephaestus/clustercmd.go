@@ -277,6 +277,29 @@ func given(cmd *cobra.Command, flag, value string) *string {
 	return new(value)
 }
 
+// clusterActionRequest is a change to one cluster that a command makes and reports: Act makes it, and its outcome is
+// Out as JSON, or Text.
+type clusterActionRequest struct {
+	Name   string
+	AsJSON bool
+	Act    func(repo *clusters.Repository) error
+	Out    any
+	Text   string
+}
+
+// clusterAction makes the change of req through the stores and prints its outcome.
+func clusterAction(cmd *cobra.Command, deps cliDeps, req clusterActionRequest) error {
+	return withCLI(cmd, deps, func(s cliStores) error {
+		if err := req.Act(s.Clusters); err != nil {
+			return clusterErr(err, req.Name)
+		}
+		if req.AsJSON {
+			return writeJSON(cmd, req.Out)
+		}
+		return writeText(cmd, req.Text)
+	})
+}
+
 func newClusterRemoveCmd(deps cliDeps) *cobra.Command {
 	var asJSON bool
 	cmd := &cobra.Command{
@@ -289,14 +312,13 @@ any machine is bound to the cluster.`,
 		Args: exactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			name := args[0]
-			return withCLI(cmd, deps, func(s cliStores) error {
-				if err := s.Clusters.Remove(cmd.Context(), name, fleet.ActorCLI, deps.now()); err != nil {
-					return clusterErr(err, name)
-				}
-				if asJSON {
-					return writeJSON(cmd, clusterRemoved{Name: name, Removed: true})
-				}
-				return writeText(cmd, "removed cluster "+name+"\n")
+			return clusterAction(cmd, deps, clusterActionRequest{
+				Name: name, AsJSON: asJSON,
+				Act: func(repo *clusters.Repository) error {
+					return repo.Remove(cmd.Context(), name, fleet.ActorCLI, deps.now())
+				},
+				Out:  clusterRemoved{Name: name, Removed: true},
+				Text: "removed cluster " + name + "\n",
 			})
 		},
 	}
@@ -669,14 +691,13 @@ anything changed.`,
 		Args: exactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			name := args[0]
-			return withCLI(cmd, deps, func(s cliStores) error {
-				if err := s.Clusters.RequestRefresh(cmd.Context(), name, fleet.ActorCLI, deps.now()); err != nil {
-					return clusterErr(err, name)
-				}
-				if asJSON {
-					return writeJSON(cmd, clusterRefreshed{Name: name, RefreshRequested: true})
-				}
-				return writeText(cmd, "refresh of "+name+" requested\n")
+			return clusterAction(cmd, deps, clusterActionRequest{
+				Name: name, AsJSON: asJSON,
+				Act: func(repo *clusters.Repository) error {
+					return repo.RequestRefresh(cmd.Context(), name, fleet.ActorCLI, deps.now())
+				},
+				Out:  clusterRefreshed{Name: name, RefreshRequested: true},
+				Text: "refresh of " + name + " requested\n",
 			})
 		},
 	}

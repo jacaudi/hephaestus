@@ -465,8 +465,10 @@ func (r *Repository) ConsumeTrigger(ctx context.Context, clusterID string, revis
 		q = q.Set("refresh_requested = ?", false)
 	case TriggerDaily:
 		q = q.Set("last_daily_at = ?", stamp(at))
+	case TriggerHead, TriggerContinue, TriggerCredential:
+		return fmt.Errorf("clusters: consume trigger: %q is not a refresh trigger", trigger)
 	default:
-		return fmt.Errorf("clusters: consume trigger: not a refresh trigger: %q", trigger)
+		return fmt.Errorf("clusters: consume trigger: unknown trigger %q", trigger)
 	}
 	if _, err := applied(ctx, q); err != nil {
 		return fmt.Errorf("clusters: consume %s trigger of %s: %w", trigger, clusterID, err)

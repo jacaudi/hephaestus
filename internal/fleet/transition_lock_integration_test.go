@@ -23,7 +23,7 @@ func holdThenRun(t *testing.T, d *db.DB, machineID string, hold func(ctx context
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	defer tx.Rollback() //nolint:errcheck // a committed transaction has nothing to roll back
+	defer tx.Rollback()
 	if _, err := lockMachine(t.Context(), tx, machineID); err != nil {
 		t.Fatalf("lock machine: %v", err)
 	}
