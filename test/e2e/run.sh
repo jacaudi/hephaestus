@@ -3,8 +3,8 @@
 # (colima: set DOCKER_HOST) and nothing else on the host (see test/e2e/README.md). Boots amd64 UEFI, amd64 BIOS
 # and arm64 UEFI VMs through hephaestus in file mode, then the M2 utility phase against a local TLS 1.3 fake upstream
 # (three cases on the same firmwares), then the M3 install phase (a fixture cluster imported from a git host, approved,
-# and the amd64 UEFI VM booted to its install script, against the upstreams program's fake factory), then amd64 UEFI
-# again with hephaestus behind Caddy.
+# and one VM per firmware, amd64 UEFI, amd64 BIOS and arm64 UEFI, approved into it and booted to its install script,
+# against the upstreams program's fake factory), then amd64 UEFI again with hephaestus behind Caddy.
 # Writes every log to build/e2e/<UTC timestamp>/, with events.jsonl (one event per phase start and end, check and run
 # start and end; test/e2e/events.schema.json), run.log (everything it printed) and manifest.json (every file's size and
 # sha256). The console shows the same events through test/e2e/lib/events.sh: a header per phase, a PASS, FAIL or NOTE
@@ -612,6 +612,11 @@ no_fixture_secret() {
 	! printf '%s\n' "$vals" | grep -qF -f /dev/stdin "$1"
 }
 
+# machine_approve <mac> <host>: approves the machine into lab/<host>.
+machine_approve() {
+	check -e "$out/machine-approve-$2.txt" "machine approve $1 lab/$2 exits 0" heph_to "$out/machine-approve-$2.txt" machine approve "$1" "lab/$2"
+}
+
 # cluster_setup <mac>: imports the fixture cluster from the git host, approves its first pair once it is pending, and
 # approves the machine into lab/cp-01.
 cluster_setup() {
@@ -620,20 +625,24 @@ cluster_setup() {
 	heph cluster list --json >"$out/cluster-list.json" 2>&1 || true
 	pair=$(box jq -r '.[] | select(.name == "lab") | .pending_pair_id' <"$out/cluster-list.json" || true)
 	check -d "${pair:-none}" -e "$out/cluster-approve.txt" "cluster approve lab <pending pair> exits 0" heph_to "$out/cluster-approve.txt" cluster approve lab "$pair"
-	check -e "$out/machine-approve.txt" "machine approve $1 lab/cp-01 exits 0" heph_to "$out/machine-approve.txt" machine approve "$1" lab/cp-01
+	machine_approve "$1" cp-01
 }
 
-# install_boot <name> <firmware> <mac> <arch>: boots the approved machine until iPXE runs the fake kernel the install
-# script loaded (the upstreams program serves an iPXE script as the kernel, which prints HEPHAESTUS-E2E-TALOS-KERNEL),
-# then judges each leg: row 10 install, the kernel and initramfs from hephaestus, the ready Talos row, the live ticket.
+# install_boot <name> <firmware> <mac> <arch> <host>: boots the machine, approved into lab/<host>, until iPXE runs the
+# fake kernel the install script loaded (the upstreams program serves an iPXE script as the kernel, which prints
+# HEPHAESTUS-E2E-TALOS-KERNEL), then judges each leg: row 10 install, the kernel and initramfs from hephaestus, the ready
+# Talos row, the live ticket. A BIOS VM writes to VGA only, so its evidence is the initramfs request in the server log, the
+# last file the install script loads before it boots the kernel.
 install_boot() {
-	name=$1 fw=$2 mac=$3 arch=$4
+	name=$1 fw=$2 mac=$3 arch=$4 host=$5
 	uuid=e2e00000-0000-4000-8000-$(printf '%s' "$mac" | tr -d :)
 	serial=$out/$name.serial.log
 	st=$out/$name.serial.txt
 	base=/t/$TALOS_SCHEMATIC/$TALOS_VERSION/$arch
-	if [ "$fw" = seabios ]; then firmware=BIOS; else firmware=UEFI; fi
-	step install-boot "Install boot $name" arch="$arch" firmware=$firmware
+	uefi=yes
+	[ "$fw" = seabios ] && uefi=no
+	if [ "$uefi" = yes ]; then firmware=UEFI; else firmware=BIOS; fi
+	step "$name" "Install boot $name" arch="$arch" firmware=$firmware host="$host"
 	hm=$(mark heph-e2e-hephaestus)
 	: >"$serial"
 	: >"$st"
@@ -644,25 +653,34 @@ install_boot() {
 	result=timeout
 	while [ "$(($(date +%s) - started))" -lt "$INSTALL_TIMEOUT" ]; do
 		tr -d '\r' <"$serial" >"$st"
-		grep -qF 'HEPHAESTUS-E2E-TALOS-KERNEL booted' "$st" && { result=reached; break; }
-		grep -qE 'Could not boot|giving up' "$st" && { result=failed; break; }
+		if [ "$uefi" = yes ]; then
+			grep -qF 'HEPHAESTUS-E2E-TALOS-KERNEL booted' "$st" && { result=reached; break; }
+			grep -qE 'Could not boot|giving up' "$st" && { result=failed; break; }
+		else
+			since heph-e2e-hephaestus "$hm" >"$out/$name.poll.log"
+			ge "$(jn "$out/$name.poll.log" --arg p "$base/initramfs" 'fromjson? | select(.msg=="request" and .path==$p and .status==200)')" 1 && { result=reached; break; }
+		fi
 		kill -0 "$vm" 2>/dev/null || { result=exited; break; }
 		sleep 2
 	done
 	elapsed=$(($(date +%s) - started))
 	docker exec heph-e2e-qemu pkill -f qemu-system >/dev/null 2>&1 || true
 	wait "$vm" || true
+	rm -f "$out/$name.poll.log"
 	tr -d '\r' <"$serial" >"$st"
 	since heph-e2e-hephaestus "$hm" >"$out/$name.hephaestus.log"
 	docker logs heph-e2e-dnsmasq >"$out/dnsmasq-$heph_mode.log" 2>&1 || true
 	hlog=$out/$name.hephaestus.log
 
-	if [ "$result" = reached ]; then
-		pass -d "after ${elapsed}s" -e "$st" -e "$hlog" \
-			"iPXE booted the fake Talos kernel within ${INSTALL_TIMEOUT}s (serial: HEPHAESTUS-E2E-TALOS-KERNEL booted)"
+	if [ "$uefi" = yes ]; then
+		what='iPXE booted the fake Talos kernel (serial: HEPHAESTUS-E2E-TALOS-KERNEL booted)'
 	else
-		fail -d "$result after ${elapsed}s" -e "$st" -e "$hlog" \
-			"iPXE booted the fake Talos kernel within ${INSTALL_TIMEOUT}s (serial: HEPHAESTUS-E2E-TALOS-KERNEL booted)"
+		what='iPXE loaded the initramfs the install script names (the request in the server log)'
+	fi
+	if [ "$result" = reached ]; then
+		pass -d "after ${elapsed}s" -e "$st" -e "$hlog" "$what within ${INSTALL_TIMEOUT}s"
+	else
+		fail -d "$result after ${elapsed}s" -e "$st" -e "$hlog" "$what within ${INSTALL_TIMEOUT}s"
 		tail -n 15 "$st" | sed 's/^/        serial| /'
 	fi
 	re=$(lease_re "$out/dnsmasq-$heph_mode.log" "$mac")
@@ -676,7 +694,7 @@ install_boot() {
 		check -e "$hlog" "GET $base/$f 200 from the VM over plain HTTP" ge "$n" 1
 	done
 	heph machine show "$mac" --json >"$out/$name.machine.json" 2>&1 || true
-	check -e "$out/$name.machine.json" "machine show: assigned to lab/cp-01" machine_is "$mac" '.state == "assigned" and .cluster == "lab" and .host == "cp-01"'
+	check -e "$out/$name.machine.json" "machine show: assigned to lab/$host" machine_is "$mac" '.state == "assigned" and .cluster == "lab" and .host == "'"$host"'"'
 	check -e "$out/$name.machine.json" "machine show: the Talos row is ready" machine_is "$mac" '.talos.state == "ready"'
 	check -e "$out/$name.machine.json" "machine show: a live ticket, its config not yet asked for" machine_is "$mac" '.ticket != null and .ticket.config_requested == false'
 }
@@ -721,20 +739,22 @@ config_fetch() {
 	check -d "${n:-unread}" -e "$out/$name.audit.json" "one config.served audit event" test "${n:-0}" -eq 1
 }
 
-# upstreams_checks <arch>: the upstreams program's request log shows hephaestus cloning lab.git and following the
-# factory's 302 to the assets host for each Talos part; no fixture secret value appears in either program's log.
+# upstreams_checks <arch>...: the upstreams program's request log shows hephaestus cloning lab.git and following the
+# factory's 302 to the assets host for each Talos part of each arch; no fixture secret value appears in either program's log.
 upstreams_checks() {
 	step upstreams-log "The upstreams program's log, and no fixture secret value in the captured logs"
 	ulog=$out/upstreams.log
 	docker logs heph-e2e-upstreams >"$ulog" 2>&1 || true
 	n=$(jn "$ulog" --arg h "$GIT_FQDN" 'fromjson? | select(.msg=="request" and .host==$h and .status==200 and (.path|startswith("/lab.git/")))')
 	check -d "${n:-0}" -e "$ulog" "hephaestus fetched lab.git over smart HTTP" ge "$n" 1
-	for f in "kernel-$1" "initramfs-$1.xz" "cmdline-metal-$1"; do
-		n=$(jn "$ulog" --arg h "$FACTORY_FQDN" --arg p "/image/$TALOS_SCHEMATIC/$TALOS_VERSION/$f" 'fromjson? | select(.msg=="request" and .host==$h and .path==$p and .status==302)')
-		check -e "$ulog" "$FACTORY_FQDN answered the image request for $f with a 302" ge "$n" 1
+	for arch; do
+		for f in "kernel-$arch" "initramfs-$arch.xz" "cmdline-metal-$arch"; do
+			n=$(jn "$ulog" --arg h "$FACTORY_FQDN" --arg p "/image/$TALOS_SCHEMATIC/$TALOS_VERSION/$f" 'fromjson? | select(.msg=="request" and .host==$h and .path==$p and .status==302)')
+			check -e "$ulog" "$FACTORY_FQDN answered the image request for $f with a 302" ge "$n" 1
+		done
 	done
 	n=$(jn "$ulog" --arg h "$ASSETS_FQDN" 'fromjson? | select(.msg=="request" and .host==$h and (.status==200 or .status==206) and (.path|startswith("/assets/")))')
-	check -d "${n:-0}" -e "$ulog" "hephaestus followed the 302s to $ASSETS_FQDN, which served 3 or more assets" ge "$n" 3
+	check -d "${n:-0}" -e "$ulog" "hephaestus followed the 302s to $ASSETS_FQDN, which served $(($# * 3)) or more assets" ge "$n" "$(($# * 3))"
 	docker logs heph-e2e-hephaestus >"$out/install-phase.hephaestus.log" 2>&1 || true
 	check -e "$out/install-phase.hephaestus.log" "no fixture secret value appears in the hephaestus log" no_fixture_secret "$out/install-phase.hephaestus.log"
 	check -e "$ulog" "no fixture secret value appears in the upstreams log" no_fixture_secret "$ulog"
@@ -865,12 +885,16 @@ utility_boot live-aarch64 aarch64 52:54:00:e2:e0:05 arm64 e2e-live live live/vml
 step utility-case-3 'Case 3: a UEFI-only entry set on the BIOS VM is cleared as unsupported and the VM holds at row 7'
 utility_boot unsupported-seabios seabios 52:54:00:e2:e0:04 amd64 e2e-shell unsupported
 
-step install "Install phase (M3): import the fixture cluster from $GIT_FQDN, approve its pair and the ovmf machine into lab/cp-01" \
-	machine=52:54:00:e2:e0:03 cluster=lab host=cp-01
+step install "Install phase (M3): import the fixture cluster from $GIT_FQDN, approve its pair and one machine per firmware into lab" \
+	cluster=lab hosts=cp-01,wrk-01,wrk-02
 cluster_setup 52:54:00:e2:e0:03
-install_boot install-ovmf ovmf 52:54:00:e2:e0:03 amd64
+machine_approve 52:54:00:e2:e0:04 wrk-01
+machine_approve 52:54:00:e2:e0:05 wrk-02
+install_boot install-ovmf ovmf 52:54:00:e2:e0:03 amd64 cp-01
 config_fetch install-ovmf 52:54:00:e2:e0:03
-upstreams_checks amd64
+install_boot install-seabios seabios 52:54:00:e2:e0:04 amd64 wrk-01
+install_boot install-aarch64 aarch64 52:54:00:e2:e0:05 arm64 wrk-02
+upstreams_checks amd64 arm64
 
 step proxy "Proxy mode: Caddy at $CADDY_IP terminates TLS, hephaestus serves plain HTTP behind it" mode=proxy
 save_logs

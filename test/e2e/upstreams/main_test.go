@@ -195,6 +195,23 @@ func requestLines(t *testing.T, log *bytes.Buffer) []logLine {
 	return lines
 }
 
+// factoryPart is one file of one arch the fake factory serves.
+type factoryPart struct {
+	part fleet.TalosPart
+	arch fleet.Arch
+}
+
+// factoryParts is every part of every arch the install phase boots: amd64 on UEFI and BIOS, arm64 on UEFI.
+func factoryParts() []factoryPart {
+	var out []factoryPart
+	for _, arch := range []fleet.Arch{fleet.ArchAMD64, fleet.ArchARM64} {
+		for _, part := range fleet.TalosParts() {
+			out = append(out, factoryPart{part, arch})
+		}
+	}
+	return out
+}
+
 func TestUpstreams_FactoryRedirectAndRange(t *testing.T) {
 	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 	u := start(t)
@@ -205,14 +222,15 @@ func TestUpstreams_FactoryRedirectAndRange(t *testing.T) {
 	fc := factory.New("https://"+factoryHost, &noFollow)
 	assets := factoryAssets()
 
-	for _, part := range fleet.TalosParts() {
-		name := factory.FileName(part, fleet.ArchAMD64)
+	for _, tc := range factoryParts() {
+		part, arch := tc.part, tc.arch
+		name := factory.FileName(part, arch)
 		want, ok := assets[name]
 		if !ok {
 			t.Errorf("%s: the program serves no asset %q", part, name)
 			continue
 		}
-		imageURL := fc.URL(plainSchematic, talosVersion, fleet.ArchAMD64, part)
+		imageURL := fc.URL(plainSchematic, talosVersion, arch, part)
 
 		status, header, _ := get(t, &noFollow, imageURL, nil)
 		if status != http.StatusFound {
@@ -402,8 +420,8 @@ func TestFixtureCluster_Renders(t *testing.T) {
 	if err != nil {
 		t.Fatalf("render the fixture: %v", err)
 	}
-	if len(hosts) != 2 {
-		t.Errorf("rendered %d hosts, want 2 (cp-01 and wrk-01)", len(hosts))
+	if len(hosts) != 3 {
+		t.Errorf("rendered %d hosts, want 3 (cp-01, wrk-01 and wrk-02: one machine per firmware)", len(hosts))
 	}
 }
 

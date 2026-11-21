@@ -13,3 +13,6 @@ nodes:
   - host: cp-01
     role: control-plane
     ip: 10.10.20.11
+  - host: wrk-02
+    role: worker
+    ip: 10.10.20.22

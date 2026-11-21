@@ -4,8 +4,8 @@
 firmware PXE, proxyDHCP, TFTP, the embedded iPXE script, `/start`, HTTPS `/boot` (TLS 1.3), `/discover`, and the M1 hold. Its
 M2 utility phase then fetches test catalog entries from a local TLS 1.3 fake upstream into hephaestus's content store and boots
 them: an EFI chain, a kernel with an initrd and a squashfs, and an entry the firmware cannot boot. Its M3 install phase imports a
-fixture cluster from a local git host, approves its first pair and one machine into it, and boots that machine to its install
-script: hephaestus fetches the Talos kernel, initramfs and command line from a local fake image factory, following its
+fixture cluster from a local git host, approves its first pair and one machine per firmware into it, and boots each machine to
+its install script: hephaestus fetches the Talos kernel, initramfs and command line from a local fake image factory, following its
 redirects to a second host name, and serves them to the VM; the harness then fetches `/config` with the machine's ticket.
 
 ```sh
@@ -39,7 +39,7 @@ the same time on one daemon conflict (the second removes the first's containers)
    (`upstreams/`), `heph-e2e-upstreams` at `.13`, with `go run` from the working tree in the pinned Go image (which carries
    git). It is one TLS 1.3 listener for three names, each with its own leaf, picked by SNI:
    - `factory.e2e.test`: the fake image factory (`internal/factory/factorytest`) for the plain schematic and Talos
-     `v1.12.11`, amd64. It answers each image request with a 302 to `assets.factory.e2e.test`, as `factory.talos.dev` sends
+     `v1.12.11`, amd64 and arm64. It answers each image request with a 302 to `assets.factory.e2e.test`, as `factory.talos.dev` sends
      clients to `assets.factory.talos.dev`, so hephaestus must follow a redirect to another host. Its kernel is an iPXE
      script that prints `HEPHAESTUS-E2E-TALOS-KERNEL booted` and sleeps (iPXE's `kernel` refuses an image it does not
      recognise, which would end the install script before its `initrd` line); the initramfs and command line are a few
@@ -82,14 +82,17 @@ the same time on one daemon conflict (the second removes the first's containers)
    1. EFI chain: `e2e-shell` on `ovmf` and `aarch64`.
    2. Kernel, initrd and squashfs: `e2e-live` on `ovmf`, `seabios` and `aarch64`.
    3. Unsupported: `e2e-shell` set on the `seabios` VM. The entry has an amd64 build, so the CLI accepts it, but it lacks `pcbios`.
-9. The install phase (M3), on the `ovmf` machine (`52:54:00:e2:e0:03`), which M1 left `discovered`:
+9. The install phase (M3), on the three machines M1 left `discovered`, one per firmware:
    1. `cluster import lab --repo https://git.e2e.test/lab.git --ref main --path lab`; polls up to 120 times for `cluster list
       --json` to show a pending pair for `lab` (a new cluster is fetched at once); `cluster approve lab <pair id>`; `machine
-      approve 52:54:00:e2:e0:03 lab/cp-01`.
-   2. Boots `ovmf` with a 300 s timeout (`INSTALL_TIMEOUT`) until the serial console shows `HEPHAESTUS-E2E-TALOS-KERNEL
-      booted`. The first `/boot` may hold at row 8 while hephaestus fetches the Talos assets; the hold script asks again
-      every 30 s, and row 10 answers the install script.
-   3. Stands in for Talos: Talos's own HTTPS `/config` fetch cannot trust the test CA (it stays lab test 3), so the harness
+      approve` of `ovmf` (`52:54:00:e2:e0:03`, amd64 UEFI) into `lab/cp-01`, of `seabios` (`52:54:00:e2:e0:04`, amd64 BIOS)
+      into `lab/wrk-01` and of `aarch64` (`52:54:00:e2:e0:05`, arm64 UEFI) into `lab/wrk-02`.
+   2. Boots `ovmf`, then `seabios`, then `aarch64`, each with a 300 s timeout (`INSTALL_TIMEOUT`). A UEFI VM is done when the
+      serial console shows `HEPHAESTUS-E2E-TALOS-KERNEL booted`; a BIOS VM writes to VGA only, so the `seabios` VM is done
+      when the server log shows the initramfs request, the last file its install script loads before booting the kernel. The
+      first `/boot` may hold at row 8 while hephaestus fetches the Talos assets (the arm64 ones are fetched once `aarch64` is
+      approved); the hold script asks again every 30 s, and row 10 answers the install script.
+   3. Stands in for Talos, on `ovmf` only: Talos's own HTTPS `/config` fetch cannot trust the test CA (it stays lab test 3), so the harness
       asks `/boot` as the machine from a container on the subnet, as iPXE does (its UUID, MAC, serial and product), takes the
       `talos.config` URL from the install script and fetches it twice with curl, trusting only the test CA. The script and the
       config hold the ticket and the fixture's secret values, so neither is written to the output directory.
@@ -128,16 +131,17 @@ A `HEPHAESTUS-E2E-SECOND-STAGE fail <reason>` line means the kernel and initrd r
 the exact-line check fails; a `/u/` 200 for the `.efi` with no `UEFI Interactive Shell` would be a failure of the `chain`
 mechanism, and a missing second-stage evidence after the kernel and initrd were fetched one of `kernel`+`initrd`+`boot`.
 
-Install phase: `cluster import`, `cluster approve` and `machine approve` exit 0 and the pending pair appears within 120 polls;
-the VM reached `HEPHAESTUS-E2E-TALOS-KERNEL booted` on serial; dnsmasq leased it an address; `/boot` was 200 with decision row 10
-and action `install` over TLS from the VM; `GET /t/<schematic>/v1.12.11/amd64/kernel` and `/initramfs` were 200 from the VM over
-plain HTTP; `machine show --json` reports the machine `assigned` to `lab/cp-01`, its Talos row `ready` and a live ticket whose
-config was not asked for yet. Then, for the harness's own fetch: the install script carries a `talos.config` URL with a ticket;
+Install phase: `cluster import`, `cluster approve` and the three `machine approve` exit 0 and the pending pair appears within 120
+polls. For each of the three VMs: it reached `HEPHAESTUS-E2E-TALOS-KERNEL booted` on serial (BIOS: the initramfs request is in the
+server log); dnsmasq leased it an address; `/boot` was 200 with decision row 10 and action `install` over TLS from the VM;
+`GET /t/<schematic>/v1.12.11/<arch>/kernel` and `/initramfs` were 200 from the VM over plain HTTP; `machine show --json` reports the
+machine `assigned` to its host (`lab/cp-01`, `lab/wrk-01` or `lab/wrk-02`), its Talos row `ready` and a live ticket whose config was
+not asked for yet. Then, for the harness's own fetch, on `ovmf` only: the install script carries a `talos.config` URL with a ticket;
 `/config` with it serves a control-plane machine config and the same ticket again gets 404; hephaestus logged exactly one
 `/config` 200 `served` and one 404 `refused_*`; the ticket appears nowhere in its log, in `events.jsonl` or in `run.log` so far;
 `machine show` reports `installing` with no live ticket and the audit log holds one `config.served` event. In the upstreams log:
-`lab.git` was fetched over smart HTTP; each of `kernel-amd64`, `initramfs-amd64.xz` and `cmdline-metal-amd64` was answered 302 on
-`factory.e2e.test`; and `assets.factory.e2e.test` served at least three assets, so hephaestus followed the cross-host redirects.
+`lab.git` was fetched over smart HTTP; each of `kernel`, `initramfs` and `cmdline-metal` for amd64 and for arm64 was answered 302 on
+`factory.e2e.test`; and `assets.factory.e2e.test` served at least six assets, so hephaestus followed the cross-host redirects.
 No value from `fixture-cluster/values.json` appears in the hephaestus or the upstreams log, in `events.jsonl` or in `run.log` so
 far. Each upstreams name completes a TLS 1.3 handshake that verifies for that name against the test CA, and TLS 1.2 gets a
 protocol-version alert.
@@ -189,8 +193,8 @@ three files that record the run:
 The phases, in order: `leftovers`, `toolbox`, `certs`, `ipxe`, `network`, `upstream`, `upstreams`, `tree`, `pin`, `image`,
 `start-file`, `run-level-file`, `boot-ovmf`, `boot-seabios`, `boot-aarch64`, `utility-fetch`, `utility-case-1`,
 `utility-shell-ovmf`, `utility-shell-aarch64`, `utility-case-2`, `utility-live-ovmf`, `utility-live-seabios`,
-`utility-live-aarch64`, `utility-case-3`, `utility-unsupported-seabios`, `install`, `install-boot`, `config-fetch`,
-`upstreams-log`, `proxy`, `boot-ovmf-proxy`, `sqlite`, `cleanup`. A setup phase (`toolbox`, `ipxe`, …) has no checks; a
+`utility-live-aarch64`, `utility-case-3`, `utility-unsupported-seabios`, `install`, `install-ovmf`, `config-fetch`,
+`install-seabios`, `install-aarch64`, `upstreams-log`, `proxy`, `boot-ovmf-proxy`, `sqlite`, `cleanup`. A setup phase (`toolbox`, `ipxe`, …) has no checks; a
 phase the run stopped in ends where the cleanup starts.
 
 A run's failures, with what each got and where to look:

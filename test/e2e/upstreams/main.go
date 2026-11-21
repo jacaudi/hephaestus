@@ -95,12 +95,15 @@ func loadConfig(getenv func(string) string) (config, error) {
 	return cfg, errors.Join(missing...)
 }
 
-// factoryAssets is what the fake factory serves, by the file names factory.FileName gives the amd64 parts.
+// factoryAssets is what the fake factory serves, by the file names factory.FileName gives the amd64 and arm64 parts.
 func factoryAssets() map[string][]byte {
 	return map[string][]byte{
 		"kernel-amd64":        []byte(fakeKernel),
 		"initramfs-amd64.xz":  []byte("hephaestus e2e fake initramfs\n"),
 		"cmdline-metal-amd64": []byte("talos.platform=metal console=tty0 console=ttyS0 init_on_alloc=1 slab_nomerge pti=on\n"),
+		"kernel-arm64":        []byte(fakeKernel),
+		"initramfs-arm64.xz":  []byte("hephaestus e2e fake arm64 initramfs\n"),
+		"cmdline-metal-arm64": []byte("talos.platform=metal console=tty0 console=ttyAMA0 init_on_alloc=1 slab_nomerge\n"),
 	}
 }
 
