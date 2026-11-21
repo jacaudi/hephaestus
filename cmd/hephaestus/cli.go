@@ -16,14 +16,12 @@ import (
 	"github.com/spf13/cobra"
 
 	"go.jacaudi.dev/hephaestus/internal/catalog"
+	"go.jacaudi.dev/hephaestus/internal/clusters"
 	"go.jacaudi.dev/hephaestus/internal/db"
 	"go.jacaudi.dev/hephaestus/internal/fleet"
 )
 
 const (
-	// cliActor is the actor the admin commands audit their changes as.
-	cliActor = "cli"
-
 	// stateNotRequested is the utility state of an entry nothing has asked for:
 	// it has no cache row.
 	stateNotRequested = "not_requested"
@@ -44,42 +42,50 @@ func defaultCLIDeps() cliDeps {
 	return cliDeps{addrsOf: hostInterfaceAddrs, now: time.Now, catalog: catalog.Default}
 }
 
+// cliStores are what the admin commands read and write: the fleet and clusters repositories over one database,
+// and the catalog. The CLI opens the database and the data key, never the content store or the git store.
+type cliStores struct {
+	Fleet    *fleet.Repository
+	Clusters *clusters.Repository
+	Catalog  *catalog.Catalog
+}
+
 // openCLI loads the same configuration as serve and opens its database, which
-// it refuses while a migration is pending. It returns the fleet repository, the
-// catalog and the function that closes the database. It never opens the
-// content store and never migrates: serve owns both.
-func openCLI(cmd *cobra.Command, deps cliDeps) (*fleet.Repository, *catalog.Catalog, func() error, error) {
+// it refuses while a migration is pending. It returns the stores and the
+// function that closes the database. It never opens the content store or the
+// git store and never migrates: serve owns all three.
+func openCLI(cmd *cobra.Command, deps cliDeps) (cliStores, func() error, error) {
 	cfg, err := loadConfig(cmd.Flags(), deps.addrsOf)
 	if err != nil {
-		return nil, nil, nil, err
+		return cliStores{}, nil, err
 	}
 	cat, err := deps.catalog()
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("load utility catalog: %w", err)
+		return cliStores{}, nil, fmt.Errorf("load utility catalog: %w", err)
 	}
 	dbh, err := db.Open(cmd.Context(), cfg.DatabaseURL)
 	if err != nil {
-		return nil, nil, nil, err
+		return cliStores{}, nil, err
 	}
 	pending, err := dbh.Pending(cmd.Context())
 	if err == nil && pending {
 		err = errors.New(`database has pending migrations; start "hephaestus serve" once to apply them`)
 	}
 	if err != nil {
-		return nil, nil, nil, errors.Join(err, dbh.Close())
+		return cliStores{}, nil, errors.Join(err, dbh.Close())
 	}
-	return fleet.NewRepository(dbh), cat, dbh.Close, nil
+	stores := cliStores{Fleet: fleet.NewRepository(dbh), Clusters: clusters.NewRepository(dbh, cfg.DataKey), Catalog: cat}
+	return stores, dbh.Close, nil
 }
 
-// withCLI opens the CLI's database and catalog for run and closes the database
-// after it.
-func withCLI(cmd *cobra.Command, deps cliDeps, run func(*fleet.Repository, *catalog.Catalog) error) (err error) {
-	repo, cat, closeDB, err := openCLI(cmd, deps)
+// withCLI opens the CLI's stores for run and closes the database after it.
+func withCLI(cmd *cobra.Command, deps cliDeps, run func(cliStores) error) (err error) {
+	stores, closeDB, err := openCLI(cmd, deps)
 	if err != nil {
 		return err
 	}
 	defer func() { err = errors.Join(err, closeDB()) }()
-	return run(repo, cat)
+	return run(stores)
 }
 
 // exactArgs requires n positional arguments; any other count is a usageError

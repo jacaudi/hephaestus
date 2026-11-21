@@ -188,6 +188,31 @@ func (r *Repository) Audit(ctx context.Context, ev AuditEvent) error {
 	return nil
 }
 
+// AuditRecord is one stored audit event, as the admin reads it. Detail is the event's JSON.
+type AuditRecord struct {
+	At                               time.Time
+	Actor, Action, MachineID, Detail string
+}
+
+// AuditEvents returns the audit events at or after since, oldest first (by id). A machineID other than "" keeps
+// only the events that name that machine.
+func (r *Repository) AuditEvents(ctx context.Context, since time.Time, machineID string) ([]AuditRecord, error) {
+	var rows []auditEventRow
+	q := r.bdb.NewSelect().Model(&rows).Where("at >= ?", stamp(since)).Order("id")
+	if machineID != "" {
+		q = q.Where("machine_id = ?", machineID)
+	}
+	if err := q.Scan(ctx); err != nil {
+		return nil, fmt.Errorf("fleet: audit events: %w", err)
+	}
+	out := make([]AuditRecord, len(rows))
+	for i := range rows {
+		row := &rows[i]
+		out[i] = AuditRecord{At: row.At.UTC(), Actor: row.Actor, Action: row.Action, MachineID: row.MachineID, Detail: row.Detail}
+	}
+	return out, nil
+}
+
 // HoldCoalesced reports whether RecordBoot would fold a hold for reason at at
 // into the machine's last boot event instead of storing it: whether that event
 // is a hold for the same reason within the hour. A machine with no boot events

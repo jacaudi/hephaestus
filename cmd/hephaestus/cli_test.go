@@ -20,6 +20,8 @@ import (
 
 	"go.jacaudi.dev/hephaestus/internal/boot"
 	"go.jacaudi.dev/hephaestus/internal/catalog"
+	"go.jacaudi.dev/hephaestus/internal/clusters"
+	"go.jacaudi.dev/hephaestus/internal/datakey"
 	"go.jacaudi.dev/hephaestus/internal/db"
 	"go.jacaudi.dev/hephaestus/internal/fleet"
 	"go.jacaudi.dev/hephaestus/internal/secret"
@@ -36,7 +38,9 @@ type cliTest struct {
 	dir  string
 	d    *db.DB
 	repo *fleet.Repository
-	deps cliDeps
+	// clusters is the clusters repository on the same file, sealing with the data key the CLI loads.
+	clusters *clusters.Repository
+	deps     cliDeps
 	// now is what the CLI's clock reads; onNow, when set, runs on each read.
 	now   time.Time
 	onNow func()
@@ -68,7 +72,11 @@ func newCLITest(t *testing.T) *cliTest {
 		t.Fatalf("Migrate: %v", err)
 	}
 
-	c := &cliTest{dir: dir, d: d, repo: fleet.NewRepository(d), now: cliT0}
+	key, err := datakey.Parse(secret.Secret(testDataKey))
+	if err != nil {
+		t.Fatalf("parse the fixture data key: %v", err)
+	}
+	c := &cliTest{dir: dir, d: d, repo: fleet.NewRepository(d), clusters: clusters.NewRepository(d, key), now: cliT0}
 	cat := testCatalog(t)
 	c.deps = cliDeps{
 		addrsOf: testInterfaces,
@@ -252,11 +260,13 @@ func wantKeys(t *testing.T, obj map[string]any, keys ...string) {
 	}
 }
 
-// storeAbsent fails when the CLI left a content store in the data dir.
+// storeAbsent fails when the CLI left a content store or a git store in the data dir.
 func (c *cliTest) storeAbsent(t *testing.T) {
 	t.Helper()
-	if _, err := os.Stat(filepath.Join(c.dir, "store")); !errors.Is(err, fs.ErrNotExist) {
-		t.Errorf("stat <data>/store = %v, want it not to exist: the CLI never opens the store", err)
+	for _, name := range []string{"store", "git"} {
+		if _, err := os.Stat(filepath.Join(c.dir, name)); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("stat <data>/%s = %v, want it not to exist: the CLI never opens the content store or the git store", name, err)
+		}
 	}
 }
 

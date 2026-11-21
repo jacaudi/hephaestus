@@ -16,6 +16,7 @@ require (
 	github.com/opencontainers/image-spec v1.1.1
 	github.com/oras-project/oras-go/v3 v3.0.0
 	github.com/pin/tftp/v3 v3.2.0
+	github.com/pmezard/go-difflib v1.0.0
 	github.com/pressly/goose/v3 v3.30.1
 	github.com/prometheus/client_golang v1.25.0
 	github.com/siderolabs/gen v0.8.8

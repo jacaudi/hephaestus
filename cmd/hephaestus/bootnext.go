@@ -110,8 +110,8 @@ broken or stale_pin. A failed or broken utility is re-armed, and the error it ha
   hephaestus boot-next set 4c4c4544-0042-3510-8052-b4c04f4e4d32 memtest86plus --json`,
 		Args: exactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return withCLI(cmd, deps, func(repo *fleet.Repository, cat *catalog.Catalog) error {
-				m, err := resolveMachine(cmd, repo, args[0])
+			return withCLI(cmd, deps, func(s cliStores) error {
+				m, err := resolveMachine(cmd, s.Fleet, args[0])
 				if err != nil {
 					return err
 				}
@@ -119,11 +119,11 @@ broken or stale_pin. A failed or broken utility is re-armed, and the error it ha
 				if err != nil {
 					return err
 				}
-				e, err := entryFor(cat, args[1], m.Arch)
+				e, err := entryFor(s.Catalog, args[1], m.Arch)
 				if err != nil {
 					return err
 				}
-				res, err := repo.SetBootNext(cmd.Context(), fleet.SetBootNextRequest{MachineID: m.ID, Entry: e.Entry, Pin: e.Pin.ID, BoundMAC: bound, At: deps.now()})
+				res, err := s.Fleet.SetBootNext(cmd.Context(), fleet.SetBootNextRequest{MachineID: m.ID, Entry: e.Entry, Pin: e.Pin.ID, BoundMAC: bound, At: deps.now()})
 				if err != nil {
 					return err
 				}
@@ -159,8 +159,8 @@ machine has no flag or the flag changed while the command ran.`,
   hephaestus boot-next clear 52:54:00:12:34:56 --json`,
 		Args: exactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return withCLI(cmd, deps, func(repo *fleet.Repository, _ *catalog.Catalog) error {
-				m, err := resolveMachine(cmd, repo, args[0])
+			return withCLI(cmd, deps, func(s cliStores) error {
+				m, err := resolveMachine(cmd, s.Fleet, args[0])
 				if err != nil {
 					return err
 				}
@@ -169,9 +169,9 @@ machine has no flag or the flag changed while the command ran.`,
 				if m.BootNext != "" {
 					req := fleet.ClearBootNextRequest{
 						MachineID: m.ID, Entry: m.BootNext, SetAt: m.BootNextSetAt,
-						Reason: fleet.ClearCLI, Actor: cliActor, At: deps.now(),
+						Reason: fleet.ClearCLI, Actor: fleet.ActorCLI, At: deps.now(),
 					}
-					if out.Cleared, err = repo.ClearBootNext(cmd.Context(), req); err != nil {
+					if out.Cleared, err = s.Fleet.ClearBootNext(cmd.Context(), req); err != nil {
 						return err
 					}
 					text = "boot-next changed meanwhile; nothing cleared\n"
@@ -203,12 +203,12 @@ utility's state (not_requested, wanted, fetching, ready, failed or broken).`, bo
   hephaestus boot-next list --json`,
 		Args: noArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return withCLI(cmd, deps, func(repo *fleet.Repository, cat *catalog.Catalog) error {
-				machines, err := repo.ListBootNext(cmd.Context())
+			return withCLI(cmd, deps, func(s cliStores) error {
+				machines, err := s.Fleet.ListBootNext(cmd.Context())
 				if err != nil {
 					return err
 				}
-				cached, err := cacheRows(cmd, repo)
+				cached, err := cacheRows(cmd, s.Fleet)
 				if err != nil {
 					return err
 				}
@@ -219,7 +219,7 @@ utility's state (not_requested, wanted, fetching, ready, failed or broken).`, bo
 					rows = append(rows, bootNextRow{
 						MachineID: m.ID, MACs: m.MACs, Entry: m.BootNext, Arch: string(m.Arch),
 						SetAt: formatTime(m.BootNextSetAt), AgeSeconds: int64(now.Sub(m.BootNextSetAt) / time.Second),
-						Status: bootNextStatus(m, now, cat, cached), BoundMAC: m.BootNextMAC,
+						Status: bootNextStatus(m, now, s.Catalog, cached), BoundMAC: m.BootNextMAC,
 					})
 				}
 				if asJSON {

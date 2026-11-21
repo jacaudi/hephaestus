@@ -76,24 +76,24 @@ names. A failed or broken fetch is re-armed, and the error it had is shown.`,
 		Args: exactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			entry := args[0]
-			return withCLI(cmd, deps, func(repo *fleet.Repository, cat *catalog.Catalog) error {
-				if !cat.Has(entry) {
-					return unknownUtility(cat, entry)
+			return withCLI(cmd, deps, func(s cliStores) error {
+				if !s.Catalog.Has(entry) {
+					return unknownUtility(s.Catalog, entry)
 				}
-				arches := cat.Arches(entry)
+				arches := s.Catalog.Arches(entry)
 				if arch != "" {
 					arches = []string{arch}
 				}
 				entries := make([]catalog.Entry, 0, len(arches))
 				for _, a := range arches {
-					e, err := entryFor(cat, entry, fleet.Arch(a))
+					e, err := entryFor(s.Catalog, entry, fleet.Arch(a))
 					if err != nil {
 						return err
 					}
 					entries = append(entries, e)
 				}
 				// Rows requested before a failure are still printed, so the admin knows what stuck.
-				rows, reqErr := requestFetches(cmd.Context(), repo, entries, deps.now)
+				rows, reqErr := requestFetches(cmd.Context(), s.Fleet, entries, deps.now)
 				if len(rows) == 0 {
 					return reqErr
 				}
@@ -159,12 +159,12 @@ row is for an older pin than the catalog's.`,
   hephaestus utility list --json`,
 		Args: noArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return withCLI(cmd, deps, func(repo *fleet.Repository, cat *catalog.Catalog) error {
-				cached, err := cacheRows(cmd, repo)
+			return withCLI(cmd, deps, func(s cliStores) error {
+				cached, err := cacheRows(cmd, s.Fleet)
 				if err != nil {
 					return err
 				}
-				entries := cat.Entries()
+				entries := s.Catalog.Entries()
 				rows := make([]utilityRow, 0, len(entries)) // JSON must print [], not null
 				for i := range entries {
 					rows = append(rows, utilityRowOf(&entries[i], cached))

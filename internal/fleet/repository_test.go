@@ -820,6 +820,50 @@ func runRepositorySuite(t *testing.T, open func(testing.TB) *db.DB) {
 			}
 		}
 	})
+
+	t.Run("AuditEvents", func(t *testing.T) {
+		r := NewRepository(open(t))
+		for _, ev := range []AuditEvent{
+			{At: t0, Actor: ActorCLI, Action: "a.first", Detail: map[string]string{}},
+			{At: t0.Add(time.Minute), Actor: ActorSystem, Action: "a.second", MachineID: "M", Detail: map[string]string{"k": "v"}},
+			{At: t0.Add(2 * time.Minute), Actor: ActorCLI, Action: "a.third", Detail: map[string]string{}},
+		} {
+			if err := r.Audit(t.Context(), ev); err != nil {
+				t.Fatalf("Audit(%s): %v", ev.Action, err)
+			}
+		}
+		actions := func(since time.Time, machineID string) []string {
+			t.Helper()
+			recs, err := r.AuditEvents(t.Context(), since, machineID)
+			if err != nil {
+				t.Fatalf("AuditEvents(%v, %q): %v", since, machineID, err)
+			}
+			var got []string
+			for _, rec := range recs {
+				got = append(got, rec.Action)
+			}
+			return got
+		}
+		if got, want := actions(t0.Add(time.Minute), ""), []string{"a.second", "a.third"}; !slices.Equal(got, want) {
+			t.Errorf("since t0+1m, every machine = %v, want %v (at >= since, oldest first)", got, want)
+		}
+		if got, want := actions(t0, "M"), []string{"a.second"}; !slices.Equal(got, want) {
+			t.Errorf("since t0, machine M = %v, want %v", got, want)
+		}
+		recs, err := r.AuditEvents(t.Context(), t0.Add(time.Minute), "M")
+		if err != nil || len(recs) != 1 {
+			t.Fatalf("AuditEvents(t0+1m, M) = %+v, %v; want the one record", recs, err)
+		}
+		want := AuditRecord{At: t0.Add(time.Minute), Actor: ActorSystem, Action: "a.second", MachineID: "M", Detail: `{"k":"v"}`}
+		got := recs[0]
+		if !got.At.Equal(want.At) {
+			t.Errorf("record at = %v, want %v", got.At, want.At)
+		}
+		got.At = want.At
+		if got != want {
+			t.Errorf("record = %+v, want %+v", got, want)
+		}
+	})
 }
 
 // TestRecordBoot_Refused covers the RecordBoot refusals that need no stored data.
