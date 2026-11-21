@@ -326,6 +326,38 @@ func TestGit_MoveAsideKeepsNewest(t *testing.T) {
 	}
 }
 
+// TestGit_MoveAsideIgnoresStrayNames: a sibling whose name only starts like a moved-aside store is not one, so it
+// neither blocks a move-aside nor is taken for the newest store and left in place of a real one.
+func TestGit_MoveAsideIgnoresStrayNames(t *testing.T) {
+	srv := gittest.NewServer(t, gittest.Options{})
+	srv.Commit(t, labFiles("1"), nil)
+	g := newTestStore(t, srv)
+	if _, err := g.fetch(t.Context(), gitCluster, labSource(srv, gitLab)); err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	older := g.dir + ".corrupt-20261119T100000Z"
+	strays := []string{g.dir + ".corrupt-leftover", g.dir + ".corrupt-"}
+	for _, dir := range append([]string{older}, strays...) {
+		if err := os.Mkdir(dir, 0o750); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+
+	moved, ok, err := g.moveAside(gitT0)
+
+	if err != nil || !ok {
+		t.Fatalf("moveAside = %q, %v, %v; want it to move", moved, ok, err)
+	}
+	for _, dir := range strays {
+		if _, err := os.Stat(dir); err != nil {
+			t.Errorf("stray %s: %v; want it left alone", dir, err)
+		}
+	}
+	if _, err := os.Stat(older); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("the older moved-aside store: %v; want it pruned", err)
+	}
+}
+
 func TestGit_MoveAsideHourHoldsAcrossRestart(t *testing.T) {
 	srv := gittest.NewServer(t, gittest.Options{})
 	srv.Commit(t, labFiles("1"), nil)

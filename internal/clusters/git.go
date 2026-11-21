@@ -248,11 +248,19 @@ func (g *gitStore) movedAsideAt() (time.Time, error) {
 	if err != nil || len(dirs) == 0 {
 		return time.Time{}, err
 	}
-	at, err := time.Parse(moveAsideStamp, strings.TrimPrefix(filepath.Base(dirs[len(dirs)-1]), filepath.Base(g.dir)+movedAsideInfix))
-	if err != nil {
-		return time.Time{}, fmt.Errorf("clusters: the time of the newest moved-aside git store: %w", err)
-	}
+	at, _ := g.movedAsideTime(filepath.Base(dirs[len(dirs)-1])) // movedAside lists only names that carry a time
 	return at, nil
+}
+
+// movedAsideTime is the time in name, which is a moved-aside store's when ok: a name that only starts like one is
+// somebody else's, and is neither listed nor pruned.
+func (g *gitStore) movedAsideTime(name string) (at time.Time, ok bool) {
+	suffix, found := strings.CutPrefix(name, filepath.Base(g.dir)+movedAsideInfix)
+	if !found {
+		return time.Time{}, false
+	}
+	at, err := time.Parse(moveAsideStamp, suffix)
+	return at, err == nil
 }
 
 // pruneMovedAside removes every moved-aside directory but the newest.
@@ -275,7 +283,7 @@ func (g *gitStore) pruneMovedAside() error {
 // movedAside returns the store's moved-aside directories, oldest first: os.ReadDir sorts by name, and the suffix sorts
 // as time does. A parent directory that does not exist holds none.
 func (g *gitStore) movedAside() ([]string, error) {
-	parent, prefix := filepath.Dir(g.dir), filepath.Base(g.dir)+movedAsideInfix
+	parent := filepath.Dir(g.dir)
 	entries, err := os.ReadDir(parent)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, nil
@@ -285,7 +293,7 @@ func (g *gitStore) movedAside() ([]string, error) {
 	}
 	var dirs []string
 	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), prefix) {
+		if _, ok := g.movedAsideTime(e.Name()); ok {
 			dirs = append(dirs, filepath.Join(parent, e.Name()))
 		}
 	}
