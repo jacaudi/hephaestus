@@ -433,8 +433,8 @@ func TestReconcile_CreatesSpoolDir(t *testing.T) {
 }
 
 // TestSweepSpool_KeepsTalosSpools pins that the sweep keeps the spool files and
-// ETag sidecars of every Talos row a fetch may still resume (wanted, fetching,
-// failed) and removes those of a ready or broken row with the unknown files.
+// ETag sidecars of every Talos row that is not ready, a broken row included
+// (design section 5.7), and removes those of a ready row with the unknown files.
 func TestSweepSpool_KeepsTalosSpools(t *testing.T) {
 	e := newReconcileEnv(t)
 	wanted, fetching, failed := talosKeyAt("v1.12.11"), talosKeyAt("v1.12.10"), talosKeyAt("v1.12.9")
@@ -448,15 +448,15 @@ func TestSweepSpool_KeepsTalosSpools(t *testing.T) {
 	for n := range 3 {
 		kept = append(kept, TalosSpoolName(wanted, n), TalosSpoolName(wanted, n)+".etag")
 	}
-	kept = append(kept, TalosSpoolName(fetching, 0), TalosSpoolName(failed, 1), TalosSpoolName(failed, 1)+".etag")
-	for _, name := range append([]string{TalosSpoolName(ready, 0), TalosSpoolName(broken, 2), "unknown"}, kept...) {
+	kept = append(kept, TalosSpoolName(fetching, 0), TalosSpoolName(failed, 1), TalosSpoolName(failed, 1)+".etag", TalosSpoolName(broken, 2))
+	for _, name := range append([]string{TalosSpoolName(ready, 0), "unknown"}, kept...) {
 		e.spoolFile(name)
 	}
 
 	removed, err := sweepSpool(t.Context(), ReconcileConfig{Repo: e.repo, Store: e.st, Catalog: e.fx.Catalog, SpoolDir: e.spool, At: fetchT0()})
 
-	if err != nil || removed != 3 {
-		t.Errorf("sweepSpool = %d, %v; want 3, nil", removed, err)
+	if err != nil || removed != 2 {
+		t.Errorf("sweepSpool = %d, %v; want 2, nil", removed, err)
 	}
 	if got, want := e.spoolNames(), slices.Sorted(slices.Values(kept)); !slices.Equal(got, want) {
 		t.Errorf("spool = %v, want %v", got, want)

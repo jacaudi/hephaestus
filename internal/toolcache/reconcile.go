@@ -144,11 +144,11 @@ func reconcileRow(ctx context.Context, cfg ReconcileConfig, row fleet.CacheRow, 
 
 // sweepSpool removes every entry of the spool directory that is not the spool
 // file or ETag sidecar of some current pin's object or of a part of a Talos row
-// still to fetch: wanted, fetching or failed. It runs before ReconcileTalos, so
-// a fetching row keeps its spool for when ReconcileTalos makes it wanted again.
-// A ready or broken row's is removed. Without the Talos rows it does not know
-// what to keep, so it removes nothing and returns their error. It removes what
-// it can and joins the failures. It returns how many entries it removed.
+// that is not ready (design section 5.7), a broken row included. It runs before
+// ReconcileTalos, so a fetching row keeps its spool for when ReconcileTalos makes
+// it wanted again. A ready row's is removed. Without the Talos rows it does not
+// know what to keep, so it removes nothing and returns their error. It removes
+// what it can and joins the failures. It returns how many entries it removed.
 func sweepSpool(ctx context.Context, cfg ReconcileConfig) (removed int, err error) {
 	rows, err := cfg.Repo.TalosRows(ctx)
 	if err != nil {
@@ -165,14 +165,13 @@ func sweepSpool(ctx context.Context, cfg ReconcileConfig) (removed int, err erro
 	}
 	parts := fleet.TalosParts()
 	for i := range rows {
-		switch rows[i].State {
-		case fleet.CacheWanted, fleet.CacheFetching, fleet.CacheFailed:
-			for n := range parts[:] {
-				o := object{SpoolName: TalosSpoolName(rows[i].Key(), n)}
-				keep[o.SpoolName] = true
-				keep[o.etagName()] = true
-			}
-		case fleet.CacheReady, fleet.CacheBroken:
+		if rows[i].State == fleet.CacheReady {
+			continue
+		}
+		for n := range parts[:] {
+			o := object{SpoolName: TalosSpoolName(rows[i].Key(), n)}
+			keep[o.SpoolName] = true
+			keep[o.etagName()] = true
 		}
 	}
 	root, err := os.OpenRoot(cfg.SpoolDir)
