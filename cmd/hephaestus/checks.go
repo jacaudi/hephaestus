@@ -14,9 +14,12 @@ const (
 	// configPendingAfter is how long a ticket may go unfetched before config:pending warns: the likeliest
 	// first-install failure (DNS, the node's clock, TLS trust) shows as a ticket nobody asks for.
 	configPendingAfter = 30 * time.Minute
-	// configPendingRunbook is what frees a machine whose config was recorded but never received, by its state.
-	configPendingRunbook = "if its config was recorded but not received: installing: machine abort, then reboot; " +
-		"install-unconfirmed: topf reset, machine reinstall --topf-reset-full-done, then reboot"
+	// runbookInstalling and runbookUnconfirmed are the two branches of the runbook for a config recorded but never
+	// received, by the state the machine is in.
+	runbookInstalling  = "installing: machine abort, then reboot"
+	runbookUnconfirmed = "install-unconfirmed: topf reset, machine reinstall --topf-reset-full-done, then reboot"
+	// configPendingRunbook is what frees a machine whose config was recorded but never received.
+	configPendingRunbook = "if its config was recorded but not received: " + runbookInstalling + "; " + runbookUnconfirmed
 )
 
 // talosCacheCheck warns while any talos_cache row is broken, naming each row's schematic, version and arch: a

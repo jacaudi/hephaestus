@@ -100,7 +100,8 @@ Run "hephaestus version" to print the build version.`,
 	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error {
 		return usageError{err}
 	})
-	root.AddCommand(newVersionCmd(), newServeCmd(), newBootNextCmd(deps), newUtilityCmd(deps), newClusterCmd(deps), newAuditCmd(deps))
+	root.AddCommand(newVersionCmd(), newServeCmd(), newBootNextCmd(deps), newUtilityCmd(deps), newClusterCmd(deps), newAuditCmd(deps),
+		newMachineCmd(deps), newUnknownActionCmd(deps))
 	return root
 }
 

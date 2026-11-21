@@ -14,9 +14,6 @@ import (
 var checkT0 = time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
 
 const (
-	// runbookInstalling and runbookUnconfirmed are the two branches of the "recorded but not received" runbook.
-	runbookInstalling  = "installing: machine abort, then reboot"
-	runbookUnconfirmed = "install-unconfirmed: topf reset, machine reinstall --topf-reset-full-done, then reboot"
 	// plainSchematic is the schematic id of a plain Talos image.
 	plainSchematic = "376567988ad370138ad8b2698212367b8edcb69b5fd68c80be1f2ec7d603b4ba"
 )
