@@ -643,6 +643,35 @@ func TestService_HeadWholeCallBacksOff(t *testing.T) {
 	}
 }
 
+func TestService_WholeCallCauseStoredSealed(t *testing.T) {
+	const cause = "lookup my.1password.com: no such host"
+	srv := gittest.NewServer(t, gittest.Options{})
+	h := newSvcHarness(t, srv, "")
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	defer srv.Close()
+	srv.Commit(t, svcFiles(t), nil)
+	h.fake.set(func(f *fakeResolver) { f.whole = &secrets.WholeCallError{Err: errors.New(cause)} })
+	s := h.service(h.fake)
+
+	h.poll(s)
+
+	if got := h.errors().LastCall; !strings.Contains(got, "1Password call failed") || !strings.Contains(got, cause) {
+		t.Errorf("last call error = %q, want the failure and its cause %q", got, cause)
+	}
+	var sealed []byte
+	if err := h.d.Bun().NewSelect().TableExpr("clusters").Column("last_call_error_sealed").Where("id = ?", h.id).Scan(t.Context(), &sealed); err != nil {
+		t.Fatalf("read the sealed column: %v", err)
+	}
+	if bytes.Contains(sealed, []byte(cause)) {
+		t.Error("the cause is stored in plaintext")
+	}
+	for _, line := range h.reported() {
+		if strings.Contains(line, cause) {
+			t.Errorf("reported %q, which quotes the cause", line)
+		}
+	}
+}
+
 func TestService_HeadRateLimitedWaitsForDaily(t *testing.T) {
 	srv := gittest.NewServer(t, gittest.Options{})
 	h := newSvcHarness(t, srv, "")

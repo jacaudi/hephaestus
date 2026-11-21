@@ -829,11 +829,16 @@ func (s *Service) recordRefresh(ctx context.Context, w work, incomplete bool) bo
 	return recorded
 }
 
-// wholeCallFailure is the record of callErr, a whole-call failure of w.
+// wholeCallFailure is the record of callErr, a whole-call failure of w. Its text carries the third party's cause,
+// which the repository stores sealed and the service never logs.
 func wholeCallFailure(w work, callErr error) WholeCallFailure {
+	text := callErr.Error()
+	if whole, ok := errors.AsType[*secrets.WholeCallError](callErr); ok && whole.Err != nil {
+		text += ": " + whole.Err.Error()
+	}
 	return WholeCallFailure{
 		ClusterID: w.c.ID, Tree: w.tree, Trigger: w.trigger, RateLimited: errors.Is(callErr, secrets.ErrRateLimited),
-		NextDaily: nextDaily(w.c, w.at), Error: callErr.Error(), At: w.at,
+		NextDaily: nextDaily(w.c, w.at), Error: text, At: w.at,
 	}
 }
 
