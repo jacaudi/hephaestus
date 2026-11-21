@@ -398,6 +398,26 @@ func TestService_LoadRefusalStoredFailed(t *testing.T) {
 	}
 }
 
+func TestService_UnparsableBundleRefusedBeforeResolving(t *testing.T) {
+	srv := gittest.NewServer(t, gittest.Options{})
+	h := newSvcHarness(t, srv, "")
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	defer srv.Close()
+	files := svcFiles(t)
+	files["lab/secrets.yaml"] += "\n---\nbroken: [\n"
+	srv.Commit(t, files, nil)
+	s := h.service(h.fake)
+
+	h.poll(s)
+
+	if got := h.errors().Failed; !strings.Contains(got, "secrets bundle unparsable") {
+		t.Errorf("failed error = %q, want it to hold %q", got, "secrets bundle unparsable")
+	}
+	if n := len(h.fake.seen()); n != 0 {
+		t.Errorf("resolver called %d times for a tree whose bundle does not parse, want 0", n)
+	}
+}
+
 func TestService_FailedTreeErrorIsSealed(t *testing.T) {
 	srv := gittest.NewServer(t, gittest.Options{})
 	h := newSvcHarness(t, srv, "")

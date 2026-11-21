@@ -1,9 +1,11 @@
 package render
 
 import (
+	"bytes"
 	"cmp"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"maps"
 	"path"
@@ -128,6 +130,7 @@ func Load(fsys fs.FS) (*Cluster, error) {
 		func() error { return checkSchematics(fsys, cfg) },
 		func() error { return checkData(cfg) },
 		func() error { return checkSecretsExist(fsys, def.secretsPath) },
+		func() error { return checkSecretsParse(fsys, def.secretsPath) },
 	} {
 		if err := check(); err != nil {
 			return nil, err
@@ -590,6 +593,29 @@ func checkSecretsExist(fsys fs.FS, name string) error {
 		return refuse(name, ruleSecretsMissing)
 	default:
 		return nil
+	}
+}
+
+// checkSecretsParse applies rule 10's second half: every document of the secrets bundle is YAML, so a bundle that
+// cannot decode is refused before any of its references is resolved. An empty file has no document and passes;
+// whether the values make a valid bundle is for the render, which has them.
+func checkSecretsParse(fsys fs.FS, name string) error {
+	raw, err := fs.ReadFile(fsys, name)
+	if err != nil {
+		return fmt.Errorf("render: read %s: %w", name, err)
+	}
+
+	dec := yaml.NewDecoder(bytes.NewReader(raw))
+
+	for {
+		var doc any
+
+		switch err := dec.Decode(&doc); {
+		case errors.Is(err, io.EOF):
+			return nil
+		case err != nil:
+			return refuse(name, ruleSecretsUnparsable)
+		}
 	}
 }
 

@@ -431,6 +431,17 @@ func TestLoad_Refusals(t *testing.T) {
 			file:  "secrets.yaml", rule: secretsGone,
 		},
 
+		{
+			name:  "secrets bundle not yaml",
+			edits: []edit{writeFile("secrets.yaml", "a: [\n")},
+			file:  "secrets.yaml", rule: "secrets bundle unparsable",
+		},
+		{
+			name:  "secrets bundle with a yaml error after its references",
+			edits: []edit{writeFile("secrets.yaml", "token: ref+op://v/i/f\n---\nb: [\n")},
+			file:  "secrets.yaml", rule: "secrets bundle unparsable",
+		},
+
 		// 11. links in the tree and SOPS
 		{
 			name:  "link out of the tree",
