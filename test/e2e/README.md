@@ -51,7 +51,8 @@ the same time on one daemon conflict (the second removes the first's containers)
 
    It is configured only by `UPSTREAMS_ADDR`, `UPSTREAMS_{FACTORY,ASSETS,GIT}_{CERT,KEY}_FILE`, `UPSTREAMS_FIXTURE_DIR` and
    `UPSTREAMS_WORK_DIR` (a tmpfs), all required, and writes one JSON `request` line per request (host, protocol, method, path without
-   the query, status) to stdout. Its unit tests (`upstreams/main_test.go`) run in `task ci`.
+   the query, status) to stdout. Its `validate-events` subcommand checks the run's event record (see Output and cleanup). Its
+   unit tests (`upstreams/main_test.go`) run in `task ci`.
 3. Copies the tracked tree to `build/e2e/run/tree` (not a `mktemp` directory: the pin container bind-mounts it), copies
    `overlay/catalog.go.in` over its `internal/catalog/catalog.go` and overlays `internal/boot/ipxe/bin/` with the test-CA binaries
    and `roots.pem`. The overlay (four specs, all version `1`, trust on first use) names `e2e-shell` (a zip holding the UEFI Shell,
@@ -133,12 +134,15 @@ and action `install` over TLS from the VM; `GET /t/<schematic>/v1.12.11/amd64/ke
 plain HTTP; `machine show --json` reports the machine `assigned` to `lab/cp-01`, its Talos row `ready` and a live ticket whose
 config was not asked for yet. Then, for the harness's own fetch: the install script carries a `talos.config` URL with a ticket;
 `/config` with it serves a control-plane machine config and the same ticket again gets 404; hephaestus logged exactly one
-`/config` 200 `served` and one 404 `refused_*`; the ticket appears nowhere in its log; `machine show` reports `installing` with
-no live ticket and the audit log holds one `config.served` event. In the upstreams log: `lab.git` was fetched over smart HTTP; each
-of `kernel-amd64`, `initramfs-amd64.xz` and `cmdline-metal-amd64` was answered 302 on `factory.e2e.test`; and
-`assets.factory.e2e.test` served at least three assets, so hephaestus followed the cross-host redirects. No value from
-`fixture-cluster/values.json` appears in the hephaestus or the upstreams log. Each upstreams name completes a TLS 1.3 handshake
-that verifies for that name against the test CA, and TLS 1.2 gets a protocol-version alert.
+`/config` 200 `served` and one 404 `refused_*`; the ticket appears nowhere in its log, in `events.jsonl` or in `run.log` so far;
+`machine show` reports `installing` with no live ticket and the audit log holds one `config.served` event. In the upstreams log:
+`lab.git` was fetched over smart HTTP; each of `kernel-amd64`, `initramfs-amd64.xz` and `cmdline-metal-amd64` was answered 302 on
+`factory.e2e.test`; and `assets.factory.e2e.test` served at least three assets, so hephaestus followed the cross-host redirects.
+No value from `fixture-cluster/values.json` appears in the hephaestus or the upstreams log, in `events.jsonl` or in `run.log` so
+far. Each upstreams name completes a TLS 1.3 handshake that verifies for that name against the test CA, and TLS 1.2 gets a
+protocol-version alert.
+
+Cleanup: `events.jsonl` matches `events.schema.json` (see Output and cleanup).
 
 Run-level: `openssl s_client -tls1_2` gets a protocol-version alert; a TLS 1.3 handshake verifies against the test CA and no
 session ticket arrives (iPXE `9261ebe` fails the handshake on a ticket sent early); `--cap-drop ALL` without the cap-add fails to
@@ -159,12 +163,100 @@ does not isolate the file capability. TrueNAS defaults stay lab work (design §1
 ## Output and cleanup
 
 Everything lands in `build/e2e/<UTC timestamp>/` (git-ignored): every container log, every serial log, the TLS probes, the SQLite
-dump, the pin report and the generated `catalog_pins.go`, saved as `catalog_pins.go.txt` so that lint does not typecheck it. It
-prints a `PASS` or `FAIL` line per boot and per check and exits non-zero on any failure. A trap on exit, SIGINT and SIGTERM
-removes every `heph-e2e-*` container, the network, the volume, `build/e2e/run/tree`, `build/e2e/run/upstream` and the
-certificates, and the test-CA build output under `build/ipxe/out` only if this run created it (it never deletes files that were
-already there). If a run was killed with SIGKILL, the next run removes the containers, network, volume, tree and upstream
-directory it left; the git-ignored files it left under `build/ipxe/out` are overwritten by the next run.
+dump, the pin report and the generated `catalog_pins.go`, saved as `catalog_pins.go.txt` so that lint does not typecheck it, and
+three files that record the run:
+
+- `events.jsonl`, the run's record: one JSON object per line, in the order emitted. Each has `schema`
+  (`hephaestus.e2e.event/v1`), `ts` (RFC 3339, UTC, seconds), `seq` (from 1) and `type`. A run is `run_start` (`run_id`,
+  `out_dir`, `git_commit`, `mode`), then per phase a `phase_start` (`phase`, a stable id; `title`; `labels`), a `check` per
+  check (`phase`, `name`, `result` `pass`, `fail` or `note`, an optional `detail` with what was got, `evidence` naming the
+  captured files it read, relative to the run directory, and `elapsed_s`) and a `phase_end` (its counts and `duration_s`),
+  then `run_end` (`result`, the totals, `duration_s`, `failures` as `{phase, name}`, `exit_code`). `events.schema.json` (JSON
+  Schema 2020-12) defines every field. At the end of every run the cleanup phase validates the record against it with the
+  upstreams program's `validate-events`, in the golang container, and a mismatch is a `FAIL`; the schema and the emitter
+  (`lib/events.sh`, driven by `lib/events_test.sh`) have unit tests in `upstreams/main_test.go`, which run in `task ci`.
+  No secret, ticket, rendered config or fixture value goes into an event, and the install phase checks that neither the
+  ticket nor any value of `fixture-cluster/values.json` appears in `events.jsonl` or `run.log`.
+- `run.log`: everything the run printed to stdout and stderr, every docker build and pull included, as the console showed
+  it, without colour codes. `run.sh` runs itself again under a capture that copies the stream with `tee` and hands the run's
+  exit status back to the wrapper, which a plain `| tee` would lose (POSIX `sh` has no `pipefail`).
+- `manifest.json`: every other file in the directory with its `path`, `size` and `sha256`, and `run_id` and `git_commit`,
+  written once `run.log` is complete, in the toolbox container (the host is not assumed to have a sha256 tool). A run
+  whose manifest cannot be written exits non-zero.
+
+The phases, in order: `leftovers`, `toolbox`, `certs`, `ipxe`, `network`, `upstream`, `upstreams`, `tree`, `pin`, `image`,
+`start-file`, `run-level-file`, `boot-ovmf`, `boot-seabios`, `boot-aarch64`, `utility-fetch`, `utility-case-1`,
+`utility-shell-ovmf`, `utility-shell-aarch64`, `utility-case-2`, `utility-live-ovmf`, `utility-live-seabios`,
+`utility-live-aarch64`, `utility-case-3`, `utility-unsupported-seabios`, `install`, `install-boot`, `config-fetch`,
+`upstreams-log`, `proxy`, `boot-ovmf-proxy`, `sqlite`, `cleanup`. A setup phase (`toolbox`, `ipxe`, …) has no checks; a
+phase the run stopped in ends where the cleanup starts.
+
+A run's failures, with what each got and where to look:
+
+```sh
+jq -c 'select(.type == "check" and .result == "fail") | {phase, name, detail, evidence}' build/e2e/<UTC timestamp>/events.jsonl
+```
+
+The run exits non-zero on any failure and zero only when every check passed. A trap on exit, SIGINT and SIGTERM removes every
+`heph-e2e-*` container, the network, the volume, `build/e2e/run/tree`, `build/e2e/run/upstream` and the certificates, and the
+test-CA build output under `build/ipxe/out` only if this run created it (it never deletes files that were already there). On
+Ctrl-C the capture ignores the signal and waits for that trap, so the cleanup and the summary still reach the terminal and
+`run.log`, and the manifest is still written. If a run was killed with SIGKILL, the next run removes the containers, network,
+volume, tree and upstream directory it left; the git-ignored files it left under `build/ipxe/out` are overwritten by the next
+run.
+
+## Console
+
+The console shows the same events as `events.jsonl`, written by the same calls (`lib/events.sh`), so the two cannot
+disagree. A shortened run with two failures:
+
+```text
+━━ hephaestus e2e · run 20261121T040506Z · file+proxy mode ━━━━━━━━━━━━━
+
+▸ Boot ovmf  amd64 · UEFI · file mode
+  PASS  held within 120s (after 18s)
+  PASS  dnsmasq leased an address to 52:54:00:e2:e0:03 (10.99.0.131)
+  PASS  proxyDHCP offered snp.efi to 52:54:00:e2:e0:03
+  PASS  /boot 200 row 7 hold (tls:true at hephaestus)
+  ── 4 passed · 0 failed · 21s
+
+▸ Boot seabios  amd64 · BIOS · file mode
+  PASS  held within 120s (after 11s)
+  NOTE  serial not asserted (SeaBIOS writes to VGA only); the server log above is the evidence
+  ── 1 passed · 0 failed · 1 note · 14s
+
+▸ Config fetch install-ovmf (the harness in Talos's place)  52:54:00:e2:e0:03
+  PASS  GET /config with the ticket is served a control-plane machine config
+  FAIL  the same ticket again gets 404
+        got:      200
+  FAIL  hephaestus logged exactly one /config 404 refusal
+        got:      0
+        evidence: install-ovmf.hephaestus.log
+  ── 1 passed · 2 failed · 7s
+
+━━ Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  phase         pass  fail    time
+  boot-ovmf        4     0     21s
+  boot-seabios     1     0     14s
+  config-fetch     1     2      7s
+
+  RESULT  FAIL   6 passed · 2 failed · 1 note · 42s
+  FAIL  config-fetch · the same ticket again gets 404
+  FAIL  config-fetch · hephaestus logged exactly one /config 404 refusal
+
+  record:       build/e2e/20261121T040506Z/events.jsonl
+  full output:  build/e2e/20261121T040506Z/run.log
+  manifest:     build/e2e/20261121T040506Z/manifest.json
+```
+
+A header names the run. Each phase starts after a blank line with `▸` and its title, its labels dimmed beside it; each check is
+indented with `PASS`, `FAIL` or `NOTE` in a fixed column (a pass or note shows its detail in parentheses); a failure shows what
+it got and its evidence files under it; and a `──` subtotal closes the phase. A failed boot also prints the tail of its serial
+console (`serial|`) under the failure, and a step that stops the run, such as a failed image build, prints its build log's
+tail; when no check failed but the run stopped, the summary says so. The summary has a row per phase, the result with the
+totals and the run's duration, every failure again, and where the record, the full output and the manifest are. Durations read
+`14s`, `5m12s` or `1h02m`. Colour is used only when stdout is a terminal and `NO_COLOR` is unset (https://no-color.org), and
+the words `PASS` and `FAIL` stay, so `grep FAIL build/e2e/<UTC timestamp>/run.log` works.
 
 ## Pins
 

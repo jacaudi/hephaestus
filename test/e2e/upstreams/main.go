@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +18,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/santhosh-tekuri/jsonschema/v6"
 
 	"go.jacaudi.dev/hephaestus/internal/clusters/gittest"
 	"go.jacaudi.dev/hephaestus/internal/factory/factorytest"
@@ -237,8 +241,16 @@ func (w *statusWriter) WriteHeader(code int) {
 // Unwrap returns the wrapped writer, for http.ResponseController.
 func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
-// cli runs the program for the environment getenv reads and returns its exit code.
-func cli(ctx context.Context, getenv func(string) string, stdout, stderr io.Writer) int {
+// cli runs the program for args and the environment getenv reads, and returns its exit code. With no arguments it
+// serves; validate-events checks an e2e event record instead.
+func cli(ctx context.Context, args []string, getenv func(string) string, stdout, stderr io.Writer) int {
+	if len(args) > 0 {
+		if args[0] != "validate-events" {
+			report(stderr, fmt.Errorf("unknown subcommand %q; the only one is validate-events", args[0]))
+			return exitUsage
+		}
+		return validateEventsCLI(args[1:], stdout, stderr)
+	}
 	cfg, err := loadConfig(getenv)
 	if err != nil {
 		report(stderr, err)
@@ -252,6 +264,86 @@ func cli(ctx context.Context, getenv func(string) string, stdout, stderr io.Writ
 	return 0
 }
 
+// validateEventsCLI runs validate-events <schema> <events.jsonl>: it prints one line and exits 0 when the record is
+// valid, and prints every problem and exits 1 when it is not.
+func validateEventsCLI(args []string, stdout, stderr io.Writer) int {
+	if len(args) != 2 {
+		report(stderr, errors.New("usage: upstreams validate-events <schema> <events.jsonl>"))
+		return exitUsage
+	}
+	n, err := validateEvents(args[0], args[1])
+	if err != nil {
+		report(stderr, err)
+		return exitError
+	}
+	if _, err := fmt.Fprintf(stdout, "%s matches %s (%d events)\n", args[1], args[0], n); err != nil {
+		return exitError
+	}
+	return 0
+}
+
+// validateEvents checks the JSON Lines record at eventsPath: every line validates against the JSON Schema at
+// schemaPath, and its seq is its line number, so the events count from 1 with none lost or repeated. It returns how
+// many events the record holds, or every problem it found.
+func validateEvents(schemaPath, eventsPath string) (int, error) {
+	sch, err := compileSchema(schemaPath)
+	if err != nil {
+		return 0, err
+	}
+	data, err := os.ReadFile(eventsPath) //nolint:gosec // G304: reading the file the caller names is the point
+	if err != nil {
+		return 0, fmt.Errorf("read the record: %w", err)
+	}
+	var problems []error
+	n := 0
+	for line := range bytes.Lines(data) {
+		n++
+		if err := validateEvent(sch, n, bytes.TrimSuffix(line, []byte("\n"))); err != nil {
+			problems = append(problems, fmt.Errorf("%s line %d: %w", eventsPath, n, err))
+		}
+	}
+	if n == 0 {
+		return 0, fmt.Errorf("%s: no events", eventsPath)
+	}
+	if err := errors.Join(problems...); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// validateEvent checks one line of a record, the seq-th.
+func validateEvent(sch *jsonschema.Schema, seq int, line []byte) error {
+	inst, err := jsonschema.UnmarshalJSON(bytes.NewReader(line))
+	if err != nil {
+		return fmt.Errorf("decode: %w", err)
+	}
+	if err := sch.Validate(inst); err != nil {
+		return fmt.Errorf("schema: %w", err)
+	}
+	var ev struct {
+		Seq int `json:"seq"`
+	}
+	if err := json.Unmarshal(line, &ev); err != nil {
+		return fmt.Errorf("decode seq: %w", err)
+	}
+	if ev.Seq != seq {
+		return fmt.Errorf("seq %d, want %d", ev.Seq, seq)
+	}
+	return nil
+}
+
+// compileSchema compiles the JSON Schema at path. Format is asserted too: draft 2020-12 treats it as an annotation
+// unless the validator is told otherwise.
+func compileSchema(path string) (*jsonschema.Schema, error) {
+	c := jsonschema.NewCompiler()
+	c.AssertFormat()
+	sch, err := c.Compile(path)
+	if err != nil {
+		return nil, fmt.Errorf("compile the schema: %w", err)
+	}
+	return sch, nil
+}
+
 // report prints err to w.
 func report(w io.Writer, err error) {
 	if _, werr := fmt.Fprintf(w, "upstreams: %v\n", err); werr != nil {
@@ -263,7 +355,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	// After the first signal, restore default handling so a second one kills a stalled drain.
 	context.AfterFunc(ctx, stop)
-	code := cli(ctx, os.Getenv, os.Stdout, os.Stderr)
+	code := cli(ctx, os.Args[1:], os.Getenv, os.Stdout, os.Stderr)
 	stop()
 	os.Exit(code)
 }

@@ -16,4 +16,8 @@
 //
 // Exit codes: 0 after a signal stopped it, 1 when it cannot serve, 2 when a variable is missing. test/e2e/run.sh runs
 // it; it is never part of hephaestus.
+//
+// upstreams validate-events <schema> <events.jsonl> instead checks the harness's event record: every line validates
+// against the JSON Schema (format asserted too) and its seq is its line number. It exits 0 when the record is valid, 1
+// when it is not, printing every problem, and 2 on a usage error. run.sh runs it at the end of every run.
 package main

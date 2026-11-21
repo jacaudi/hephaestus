@@ -19,6 +19,7 @@ require (
 	github.com/pmezard/go-difflib v1.0.0
 	github.com/pressly/goose/v3 v3.30.1
 	github.com/prometheus/client_golang v1.25.0
+	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3
 	github.com/siderolabs/gen v0.8.8
 	github.com/siderolabs/talos/pkg/machinery v1.14.4
 	github.com/spf13/cobra v1.10.2

@@ -1,0 +1,140 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://go.jacaudi.dev/hephaestus/test/e2e/events.schema.json",
+  "title": "hephaestus e2e event",
+  "description": "One line of build/e2e/<run>/events.jsonl, the record test/e2e/run.sh writes through test/e2e/lib/events.sh. The upstreams program's validate-events also requires seq to count the lines from 1.",
+  "type": "object",
+  "required": ["schema", "ts", "seq", "type"],
+  "oneOf": [
+    { "$ref": "#/$defs/run_start" },
+    { "$ref": "#/$defs/phase_start" },
+    { "$ref": "#/$defs/check" },
+    { "$ref": "#/$defs/phase_end" },
+    { "$ref": "#/$defs/run_end" }
+  ],
+  "$defs": {
+    "schema": { "const": "hephaestus.e2e.event/v1" },
+    "ts": {
+      "description": "RFC 3339, UTC, seconds precision.",
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "seq": { "type": "integer", "minimum": 1 },
+    "phase": {
+      "description": "A stable machine id, such as boot-ovmf.",
+      "type": "string",
+      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$"
+    },
+    "count": { "type": "integer", "minimum": 0 },
+    "result": { "enum": ["pass", "fail"] },
+
+    "run_start": {
+      "type": "object",
+      "properties": {
+        "schema": { "$ref": "#/$defs/schema" },
+        "ts": { "$ref": "#/$defs/ts" },
+        "seq": { "$ref": "#/$defs/seq" },
+        "type": { "const": "run_start" },
+        "run_id": { "description": "The run directory's name.", "type": "string", "pattern": "^[0-9]{8}T[0-9]{6}Z$" },
+        "out_dir": { "description": "The run directory, relative to the repository root.", "type": "string", "minLength": 1 },
+        "git_commit": { "type": "string", "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$" },
+        "mode": { "description": "The hephaestus TLS modes the run covers.", "type": "string", "minLength": 1 }
+      },
+      "required": ["schema", "ts", "seq", "type", "run_id", "out_dir", "git_commit", "mode"],
+      "additionalProperties": false
+    },
+
+    "phase_start": {
+      "type": "object",
+      "properties": {
+        "schema": { "$ref": "#/$defs/schema" },
+        "ts": { "$ref": "#/$defs/ts" },
+        "seq": { "$ref": "#/$defs/seq" },
+        "type": { "const": "phase_start" },
+        "phase": { "$ref": "#/$defs/phase" },
+        "title": { "type": "string", "minLength": 1 },
+        "labels": {
+          "type": "object",
+          "propertyNames": { "pattern": "^[a-z][a-z_]*$" },
+          "additionalProperties": { "type": "string" }
+        }
+      },
+      "required": ["schema", "ts", "seq", "type", "phase", "title", "labels"],
+      "additionalProperties": false
+    },
+
+    "check": {
+      "type": "object",
+      "properties": {
+        "schema": { "$ref": "#/$defs/schema" },
+        "ts": { "$ref": "#/$defs/ts" },
+        "seq": { "$ref": "#/$defs/seq" },
+        "type": { "const": "check" },
+        "phase": { "$ref": "#/$defs/phase" },
+        "name": { "type": "string", "minLength": 1 },
+        "result": { "enum": ["pass", "fail", "note"] },
+        "detail": { "description": "Optional: what was got, or why it failed.", "type": "string" },
+        "evidence": {
+          "description": "Captured files, relative to the run directory.",
+          "type": "array",
+          "items": { "type": "string", "pattern": "^[^/]" }
+        },
+        "elapsed_s": { "description": "Seconds since the run started.", "$ref": "#/$defs/count" }
+      },
+      "required": ["schema", "ts", "seq", "type", "phase", "name", "result", "evidence", "elapsed_s"],
+      "additionalProperties": false
+    },
+
+    "phase_end": {
+      "type": "object",
+      "properties": {
+        "schema": { "$ref": "#/$defs/schema" },
+        "ts": { "$ref": "#/$defs/ts" },
+        "seq": { "$ref": "#/$defs/seq" },
+        "type": { "const": "phase_end" },
+        "phase": { "$ref": "#/$defs/phase" },
+        "passed": { "$ref": "#/$defs/count" },
+        "failed": { "$ref": "#/$defs/count" },
+        "notes": { "$ref": "#/$defs/count" },
+        "duration_s": { "$ref": "#/$defs/count" }
+      },
+      "required": ["schema", "ts", "seq", "type", "phase", "passed", "failed", "notes", "duration_s"],
+      "additionalProperties": false
+    },
+
+    "run_end": {
+      "description": "A run passes only when it exits 0, and it exits 0 only when no check failed.",
+      "type": "object",
+      "properties": {
+        "schema": { "$ref": "#/$defs/schema" },
+        "ts": { "$ref": "#/$defs/ts" },
+        "seq": { "$ref": "#/$defs/seq" },
+        "type": { "const": "run_end" },
+        "result": { "$ref": "#/$defs/result" },
+        "passed": { "$ref": "#/$defs/count" },
+        "failed": { "$ref": "#/$defs/count" },
+        "notes": { "$ref": "#/$defs/count" },
+        "duration_s": { "$ref": "#/$defs/count" },
+        "failures": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "phase": { "$ref": "#/$defs/phase" },
+              "name": { "type": "string", "minLength": 1 }
+            },
+            "required": ["phase", "name"],
+            "additionalProperties": false
+          }
+        },
+        "exit_code": { "type": "integer", "minimum": 0, "maximum": 255 }
+      },
+      "required": ["schema", "ts", "seq", "type", "result", "passed", "failed", "notes", "duration_s", "failures", "exit_code"],
+      "additionalProperties": false,
+      "if": { "properties": { "result": { "const": "pass" } } },
+      "then": { "properties": { "exit_code": { "const": 0 }, "failed": { "const": 0 } } },
+      "else": { "properties": { "exit_code": { "minimum": 1 } } }
+    }
+  }
+}
