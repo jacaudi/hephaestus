@@ -431,3 +431,58 @@ func TestReconcile_CreatesSpoolDir(t *testing.T) {
 		t.Errorf("spool dir mode = %#o, want 0700", got)
 	}
 }
+
+// TestSweepSpool_KeepsTalosSpools pins that the sweep keeps the spool files and
+// ETag sidecars of every Talos row a fetch may still resume (wanted, fetching,
+// failed) and removes those of a ready or broken row with the unknown files.
+func TestSweepSpool_KeepsTalosSpools(t *testing.T) {
+	e := newReconcileEnv(t)
+	wanted, fetching, failed := talosKeyAt("v1.12.11"), talosKeyAt("v1.12.10"), talosKeyAt("v1.12.9")
+	ready, broken := talosKeyAt("v1.12.8"), talosKeyAt("v1.12.7")
+	e.insertTalos(wanted, fleet.CacheWanted, nil)
+	e.insertTalos(fetching, fleet.CacheFetching, nil)
+	e.insertTalos(failed, fleet.CacheFailed, nil)
+	e.insertTalos(ready, fleet.CacheReady, talosAssetsOf(talosContent("one")))
+	e.insertTalos(broken, fleet.CacheBroken, nil)
+	var kept []string
+	for n := range 3 {
+		kept = append(kept, TalosSpoolName(wanted, n), TalosSpoolName(wanted, n)+".etag")
+	}
+	kept = append(kept, TalosSpoolName(fetching, 0), TalosSpoolName(failed, 1), TalosSpoolName(failed, 1)+".etag")
+	for _, name := range append([]string{TalosSpoolName(ready, 0), TalosSpoolName(broken, 2), "unknown"}, kept...) {
+		e.spoolFile(name)
+	}
+
+	removed, err := sweepSpool(t.Context(), ReconcileConfig{Repo: e.repo, Store: e.st, Catalog: e.fx.Catalog, SpoolDir: e.spool, At: fetchT0()})
+
+	if err != nil || removed != 3 {
+		t.Errorf("sweepSpool = %d, %v; want 3, nil", removed, err)
+	}
+	if got, want := e.spoolNames(), slices.Sorted(slices.Values(kept)); !slices.Equal(got, want) {
+		t.Errorf("spool = %v, want %v", got, want)
+	}
+}
+
+// TestSweepSpool_TalosRowsErrorRemovesNothing pins that a sweep that cannot
+// read the Talos rows does not know what to keep, so it removes nothing.
+func TestSweepSpool_TalosRowsErrorRemovesNothing(t *testing.T) {
+	e := newReconcileEnv(t)
+	wanted := talosKeyAt(talosTestVersion)
+	e.insertTalos(wanted, fleet.CacheWanted, nil)
+	names := []string{TalosSpoolName(wanted, 0), TalosSpoolName(wanted, 0) + ".etag", SpoolName(e.pin(tliveAMD64()), 0), "unknown"}
+	for _, name := range names {
+		e.spoolFile(name)
+	}
+	if err := e.d.Close(); err != nil {
+		t.Fatalf("close database: %v", err)
+	}
+
+	removed, err := sweepSpool(t.Context(), ReconcileConfig{Repo: e.repo, Store: e.st, Catalog: e.fx.Catalog, SpoolDir: e.spool, At: fetchT0()})
+
+	if err == nil || removed != 0 {
+		t.Errorf("sweepSpool = %d, %v; want 0 and the database error", removed, err)
+	}
+	if got, want := e.spoolNames(), slices.Sorted(slices.Values(names)); !slices.Equal(got, want) {
+		t.Errorf("spool = %v, want every file kept: %v", got, want)
+	}
+}

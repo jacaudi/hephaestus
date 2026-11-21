@@ -13,10 +13,10 @@ import (
 	"go.jacaudi.dev/hephaestus/internal/store"
 )
 
-// ReconcileConfig is what Reconcile brings into agreement. Every field is
-// required.
+// ReconcileConfig is what Reconcile and ReconcileTalos bring into agreement.
+// Every field is required.
 type ReconcileConfig struct {
-	// Repo holds the utility_cache rows.
+	// Repo holds the utility_cache and talos_cache rows.
 	Repo *fleet.Repository
 	// Store holds the fetched content.
 	Store *store.Store
@@ -53,11 +53,12 @@ type ReconcileReport struct {
 // or architecture the catalog lacks is deleted; a row at another pin is
 // repinned; a ready row whose tag or layers the store lacks is requeued; a
 // wanted or failed row whose content is complete in the store becomes ready;
-// and every spool file that is not a current pin's is removed. It runs before
-// the fetcher starts. It stops at the first repository error, which a done ctx
-// causes, and at the first store error that is not lost content (see
-// store.ContentLost), such as a permission failure. A spool that cannot be
-// swept is not one of those stops: the report carries the failure in SpoolErr.
+// and every spool file that is neither a current pin's nor a Talos row's still
+// to fetch is removed. It runs before the fetcher starts. It stops at the first
+// repository error, which a done ctx causes, and at the first store error that
+// is not lost content (see store.ContentLost), such as a permission failure. A
+// spool that cannot be swept is not one of those stops: the report carries the
+// failure in SpoolErr.
 func Reconcile(ctx context.Context, cfg ReconcileConfig) (ReconcileReport, error) {
 	var rep ReconcileReport
 	if err := os.MkdirAll(cfg.SpoolDir, spoolDirMode); err != nil {
@@ -98,7 +99,7 @@ func Reconcile(ctx context.Context, cfg ReconcileConfig) (ReconcileReport, error
 		}
 	}
 
-	rep.SpoolRemoved, rep.SpoolErr = sweepSpool(cfg)
+	rep.SpoolRemoved, rep.SpoolErr = sweepSpool(ctx, cfg)
 	return rep, nil
 }
 
@@ -142,9 +143,17 @@ func reconcileRow(ctx context.Context, cfg ReconcileConfig, row fleet.CacheRow, 
 }
 
 // sweepSpool removes every entry of the spool directory that is not the spool
-// file or ETag sidecar of some current pin's object. It removes what it can and
-// joins the failures. It returns how many entries it removed.
-func sweepSpool(cfg ReconcileConfig) (removed int, err error) {
+// file or ETag sidecar of some current pin's object or of a part of a Talos row
+// still to fetch: wanted, fetching or failed. It runs before ReconcileTalos, so
+// a fetching row keeps its spool for when ReconcileTalos makes it wanted again.
+// A ready or broken row's is removed. Without the Talos rows it does not know
+// what to keep, so it removes nothing and returns their error. It removes what
+// it can and joins the failures. It returns how many entries it removed.
+func sweepSpool(ctx context.Context, cfg ReconcileConfig) (removed int, err error) {
+	rows, err := cfg.Repo.TalosRows(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("toolcache: list the Talos rows to keep their spools: %w", err)
+	}
 	keep := map[string]bool{}
 	current := cfg.Catalog.Entries()
 	for i := range current {
@@ -152,6 +161,18 @@ func sweepSpool(cfg ReconcileConfig) (removed int, err error) {
 		for n := range pin.Objects {
 			keep[SpoolName(pin.ID, n)] = true
 			keep[ETagName(pin.ID, n)] = true
+		}
+	}
+	parts := fleet.TalosParts()
+	for i := range rows {
+		switch rows[i].State {
+		case fleet.CacheWanted, fleet.CacheFetching, fleet.CacheFailed:
+			for n := range parts[:] {
+				o := object{SpoolName: TalosSpoolName(rows[i].Key(), n)}
+				keep[o.SpoolName] = true
+				keep[o.etagName()] = true
+			}
+		case fleet.CacheReady, fleet.CacheBroken:
 		}
 	}
 	root, err := os.OpenRoot(cfg.SpoolDir)

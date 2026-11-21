@@ -138,6 +138,24 @@ func (r *Repository) ClaimTalos(ctx context.Context, class TalosClass, at time.T
 	return TalosRow{}, false, nil
 }
 
+// ClaimTalosRow moves the wanted or failed row at key to fetching, one claim on
+// in its ClaimGen, whatever its next attempt time, and returns it. It reports
+// false when the row is absent or in another state. Startup reconciliation
+// claims a row it found whole in the store this way, so its MarkTalosReady lands
+// only while nothing else has moved the row.
+func (r *Repository) ClaimTalosRow(ctx context.Context, key TalosKey, at time.Time) (TalosRow, bool, error) {
+	var claimed TalosRow
+	err := updateTalos(r.bdb, key).Where("state IN (?)", bun.List([]CacheState{CacheWanted, CacheFailed})).
+		Set("state = ?", CacheFetching).Set("claim_gen = claim_gen + 1").Set("updated_at = ?", stamp(at)).Returning("*").Scan(ctx, &claimed)
+	if errors.Is(err, sql.ErrNoRows) {
+		return TalosRow{}, false, nil
+	}
+	if err != nil {
+		return TalosRow{}, false, fmt.Errorf("fleet: claim Talos row %s: %w", key.Tag(), err)
+	}
+	return claimed.utc(), true, nil
+}
+
 // RecordTalosProgress stores how much of the asset being fetched is downloaded.
 // It touches only the row fetching under c. It is not a state change, so it is
 // not audited and leaves updated_at alone.

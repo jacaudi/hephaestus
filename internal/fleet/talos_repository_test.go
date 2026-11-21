@@ -281,6 +281,46 @@ func runTalosSuite(t *testing.T, open func(testing.TB) *db.DB, pair func(testing
 		}
 	})
 
+	// ClaimTalosRow claims the one row it names, a failed row in its backoff
+	// included, and nothing that is not wanted or failed.
+	t.Run("ClaimTalosRow", func(t *testing.T) {
+		d := open(t)
+		r := NewRepository(d)
+		failed := talosRowIn(k, CacheFailed, t0)
+		failed.Attempts, failed.NextAttemptAt, failed.LastError, failed.Assets = 2, t0.Add(time.Hour), talosCause, talosAssets()
+		wanted := talosRowIn(talosKeyAt("v1.12.10"), CacheWanted, t0)
+		ready := talosRowIn(talosKeyAt("v1.12.9"), CacheReady, t0)
+		broken := talosRowIn(talosKeyAt("v1.12.8"), CacheBroken, t0)
+		for _, row := range []*TalosRow{&failed, &wanted, &ready, &broken} {
+			seedTalos(t, d, *row)
+		}
+
+		at := t0.Add(time.Minute)
+		for _, seed := range []*TalosRow{&failed, &wanted} {
+			got, ok, err := r.ClaimTalosRow(t.Context(), seed.Key(), at)
+			want := *seed
+			want.State, want.UpdatedAt, want.ClaimGen = CacheFetching, at, 1
+			if err != nil || !ok || !sameTalosRow(got, want) {
+				t.Fatalf("ClaimTalosRow(%s) = %+v, %v, %v; want %+v", seed.State, got, ok, err, want)
+			}
+			wantTalos(t, r, seed.Key(), want)
+		}
+
+		for _, seed := range []*TalosRow{&ready, &broken} {
+			got, ok, err := r.ClaimTalosRow(t.Context(), seed.Key(), at)
+			if err != nil || ok {
+				t.Fatalf("ClaimTalosRow(%s) = %+v, %v, %v; want none", seed.State, got, ok, err)
+			}
+			wantTalos(t, r, seed.Key(), *seed)
+		}
+		if got, ok, err := r.ClaimTalosRow(t.Context(), k, at); err != nil || ok {
+			t.Fatalf("ClaimTalosRow(fetching) = %+v, %v, %v; want none", got, ok, err)
+		}
+		if got, ok, err := r.ClaimTalosRow(t.Context(), talosKeyAt("v1.11.0"), at); err != nil || ok {
+			t.Fatalf("ClaimTalosRow(absent) = %+v, %v, %v; want none", got, ok, err)
+		}
+	})
+
 	t.Run("ConcurrentClaim", func(t *testing.T) {
 		serveDB, cliDB := pair(t)
 		defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
