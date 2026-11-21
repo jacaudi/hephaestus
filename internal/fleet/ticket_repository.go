@@ -30,11 +30,19 @@ type configServedDetail struct {
 	PairID   string `json:"pair_id"`
 }
 
+// ErrMachineChanged is returned by MintTicket when the machine is no longer
+// assigned, not junk and bound to the request's host with its Talos image: it
+// changed after the caller decided to install it.
+var ErrMachineChanged = errors.New("fleet: the machine changed since the install was decided")
+
 // MintTicket mints a ticket for req.MachineID: in one transaction it locks the
-// machine, revokes the machine's live tickets (expired or not) and stores the
-// new one. It returns the token, which is shown once and never stored, and the
-// stored ticket. A concurrent mint the unique index refuses is retried once with
-// a fresh token. ErrNotFound means no machine has the ID.
+// machine, checks that it is still the machine req was decided on, revokes the
+// machine's live tickets (expired or not) and stores the new one. It returns
+// the token, which is shown once and never stored, and the stored ticket. A
+// concurrent mint the unique index refuses is retried once with a fresh token.
+// ErrNotFound means no machine has the ID; ErrMachineChanged that the machine
+// is no longer assigned and not junk, bound to req's host, with req's Talos
+// tuple and arch, and nothing was written.
 func (r *Repository) MintTicket(ctx context.Context, req MintRequest) (string, Ticket, error) {
 	var (
 		token string
@@ -52,8 +60,16 @@ func (r *Repository) MintTicket(ctx context.Context, req MintRequest) (string, T
 }
 
 func mintTicket(ctx context.Context, tx bun.IDB, req MintRequest) (string, Ticket, error) {
-	if _, err := lockMachine(ctx, tx, req.MachineID); err != nil {
+	m, err := lockMachine(ctx, tx, req.MachineID)
+	if err != nil {
 		return "", Ticket{}, err
+	}
+	// A cluster approval changes the tuple and revokes tickets under this lock, so
+	// a ticket minted past this check cannot outlive a tuple change.
+	if m.State != StateAssigned || m.Junk || m.Arch != req.Arch ||
+		orEmpty(m.ClusterID) != req.ClusterID || orEmpty(m.HostName) != req.HostName ||
+		orEmpty(m.TalosSchematic) != req.TalosSchematic || orEmpty(m.TalosVersion) != req.TalosVersion {
+		return "", Ticket{}, fmt.Errorf("mint for %s: %w", req.MachineID, ErrMachineChanged)
 	}
 	if _, err := RevokeMachineTicketsTx(ctx, tx, req.MachineID, req.At); err != nil {
 		return "", Ticket{}, err
@@ -284,6 +300,14 @@ func (r *Repository) LiveTicket(ctx context.Context, machineID string) (Ticket, 
 		return Ticket{}, false, fmt.Errorf("fleet: live ticket of %s: %w", machineID, err)
 	}
 	return t, ok, nil
+}
+
+// orEmpty is *s, or "" when s is nil.
+func orEmpty(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }
 
 // hashToken is what the tickets table stores for token: the lowercase hex of its SHA-256.

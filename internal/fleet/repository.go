@@ -188,6 +188,18 @@ func (r *Repository) Audit(ctx context.Context, ev AuditEvent) error {
 	return nil
 }
 
+// HoldCoalesced reports whether RecordBoot would fold a hold for reason at at
+// into the machine's last boot event instead of storing it: whether that event
+// is a hold for the same reason within the hour. A machine with no boot events
+// has none to fold into.
+func (r *Repository) HoldCoalesced(ctx context.Context, machineID, reason string, at time.Time) (bool, error) {
+	folded, err := holdCoalesced(ctx, r.bdb, machineID, reason, at)
+	if err != nil {
+		return false, fmt.Errorf("fleet: hold coalesced: %w", err)
+	}
+	return folded, nil
+}
+
 // RecordBoot stores one observed boot in a single transaction and returns the
 // machine as stored. With no MachineID it creates the machine (Trigger must be
 // TriggerFirstContact); otherwise it records the boot against that machine. A
@@ -791,13 +803,9 @@ func upsertMAC(ctx context.Context, q bun.IDB, machineID, mac string, at time.Ti
 // holdCoalesceWindow of it, is not stored: a held machine re-chains every 30 s.
 func insertBootEvent(ctx context.Context, q bun.IDB, row bootEventRow) error {
 	if row.Action == actionHold {
-		var last bootEventRow
-		err := q.NewSelect().Model(&last).Where("machine_id = ?", row.MachineID).Order("id DESC").Limit(1).Scan(ctx)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("load last boot event: %w", err)
-		}
-		if err == nil && last.Action == actionHold && last.Reason == row.Reason && last.At.After(row.At.Add(-holdCoalesceWindow)) {
-			return nil
+		folded, err := holdCoalesced(ctx, q, row.MachineID, row.Reason, row.At)
+		if err != nil || folded {
+			return err
 		}
 	}
 
@@ -812,6 +820,21 @@ func insertBootEvent(ctx context.Context, q bun.IDB, row bootEventRow) error {
 		return fmt.Errorf("trim boot events: %w", err)
 	}
 	return nil
+}
+
+// holdCoalesced reports whether a hold for reason at at is folded into the
+// machine's last boot event: that event is a hold for the same reason, less than
+// holdCoalesceWindow before at.
+func holdCoalesced(ctx context.Context, q bun.IDB, machineID, reason string, at time.Time) (bool, error) {
+	var last bootEventRow
+	err := q.NewSelect().Model(&last).Where("machine_id = ?", machineID).Order("id DESC").Limit(1).Scan(ctx)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("load last boot event: %w", err)
+	}
+	return last.Action == actionHold && last.Reason == reason && last.At.After(at.UTC().Add(-holdCoalesceWindow)), nil
 }
 
 // TransitionTx applies req.Trigger to the machine inside the caller's

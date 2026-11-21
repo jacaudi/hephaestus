@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -25,9 +26,13 @@ func hexSHA256(s string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// mintReq asks for a ticket of cluster lab for host, pair pair-1 and version ver-1.
+// mintReq asks for a ticket of cluster lab for host, pair pair-1 and version
+// ver-1, for an amd64 machine decided on with the fixture Talos tuple.
 func mintReq(machineID, host string, at time.Time) MintRequest {
-	return MintRequest{MachineID: machineID, ClusterID: labCluster, HostName: host, PairID: "pair-1", SecretVersionID: "ver-1", At: at}
+	return MintRequest{
+		MachineID: machineID, ClusterID: labCluster, HostName: host, PairID: "pair-1", SecretVersionID: "ver-1",
+		TalosSchematic: plainSchematic, TalosVersion: talosVersion, Arch: ArchAMD64, At: at,
+	}
 }
 
 func mustMint(t *testing.T, r *Repository, req MintRequest) (string, Ticket) {
@@ -37,6 +42,22 @@ func mustMint(t *testing.T, r *Repository, req MintRequest) (string, Ticket) {
 		t.Fatalf("MintTicket(%+v): %v", req, err)
 	}
 	return token, tk
+}
+
+// insertTicket stores a live ticket of req as a row, without MintTicket's check
+// of the machine: a ticket minted while the machine was still as req says,
+// which has since changed.
+func insertTicket(t *testing.T, d *db.DB, req MintRequest) Ticket {
+	t.Helper()
+	tk := Ticket{
+		ID: rand.Text(), MachineID: req.MachineID, TokenSHA256: hexSHA256(rand.Text()),
+		ClusterID: req.ClusterID, HostName: req.HostName, PairID: req.PairID, SecretVersionID: req.SecretVersionID,
+		MintedAt: req.At, ExpiresAt: req.At.Add(TicketTTL),
+	}
+	if _, err := d.Bun().NewInsert().Model(&tk).Exec(t.Context()); err != nil {
+		t.Fatalf("insert ticket %+v: %v", req, err)
+	}
+	return tk
 }
 
 // assignedMachine is machine n, discovered and then approved into host of cluster lab.
@@ -201,6 +222,49 @@ func runTicketSuite(t *testing.T, open func(testing.TB) *db.DB, pair func(testin
 		}
 	})
 
+	t.Run("MintRefusesChangedMachine", func(t *testing.T) {
+		cases := []struct {
+			name   string
+			req    func(*MintRequest)
+			update string
+		}{
+			{name: "other host", req: func(r *MintRequest) { r.HostName = "wrk-01" }},
+			{name: "other cluster", req: func(r *MintRequest) { r.ClusterID = "other" }},
+			{name: "other schematic", req: func(r *MintRequest) { r.TalosSchematic = strings.Repeat("ab", 32) }},
+			{name: "other Talos version", req: func(r *MintRequest) { r.TalosVersion = "v1.13.0" }},
+			{name: "other arch", req: func(r *MintRequest) { r.Arch = ArchARM64 }},
+			{name: "no longer assigned", update: "UPDATE machines SET state = 'installing' WHERE id = ?"},
+			{name: "marked junk", update: "UPDATE machines SET junk = TRUE WHERE id = ?"},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				d := open(t)
+				r := NewRepository(d)
+				m := assignedMachine(t, r, 1, labHost, t0)
+				_, live := mustMint(t, r, mintReq(m.ID, labHost, t0))
+				req := mintReq(m.ID, labHost, t0.Add(time.Minute))
+				if tc.req != nil {
+					tc.req(&req)
+				}
+				if tc.update != "" {
+					if err := execRaw(t, d, tc.update, m.ID); err != nil {
+						t.Fatalf("%s: %v", tc.update, err)
+					}
+				}
+
+				_, _, err := r.MintTicket(t.Context(), req)
+
+				if !errors.Is(err, ErrMachineChanged) {
+					t.Fatalf("MintTicket error = %v, want ErrMachineChanged", err)
+				}
+				if n := len(readTickets(t, d)); n != 1 {
+					t.Fatalf("tickets = %d, want only the earlier one", n)
+				}
+				wantLive(t, d, live.ID)
+			})
+		}
+	})
+
 	t.Run("MintRevokesPrevious", func(t *testing.T) {
 		d := open(t)
 		r := NewRepository(d)
@@ -297,7 +361,7 @@ func runTicketSuite(t *testing.T, open func(testing.TB) *db.DB, pair func(testin
 		_, tb := mustMint(t, r, mintReq(b.ID, "wrk-01", t0))
 		otherReq := mintReq(c.ID, labHost, t0)
 		otherReq.ClusterID = "other"
-		_, tc := mustMint(t, r, otherReq)
+		tc := insertTicket(t, d, otherReq)
 		at := t0.Add(time.Minute)
 		n := revokedBy(t, d, func(ctx context.Context, q bun.IDB) (int, error) {
 			return RevokeClusterTicketsTx(ctx, q, labCluster, at)
@@ -325,8 +389,8 @@ func runTicketSuite(t *testing.T, open func(testing.TB) *db.DB, pair func(testin
 		if !b.Junk {
 			t.Fatalf("clone %s is not junk, want junk", b.ID)
 		}
-		_, ofA := mustMint(t, r, mintReq(a.ID, labHost, t0.Add(30*time.Second)))
-		_, ofB := mustMint(t, r, mintReq(b.ID, labHost, t0.Add(30*time.Second)))
+		ofA := insertTicket(t, d, mintReq(a.ID, labHost, t0.Add(30*time.Second)))
+		ofB := insertTicket(t, d, mintReq(b.ID, labHost, t0.Add(30*time.Second)))
 		conflictBoot(t, r, a.ID, true, t0.Add(40*time.Second))
 		wantRevokedAt(t, d, ofA.ID, t0.Add(40*time.Second))
 		wantRevokedAt(t, d, ofB.ID, t0.Add(40*time.Second))

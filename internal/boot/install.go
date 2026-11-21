@@ -55,6 +55,7 @@ const (
 	ticketChars = 43
 
 	reasonCmdlineTooLong = "kernel command line too long"
+	reasonMachineChanged = "machine changed while deciding"
 	alertKindCmdline     = "cmdline_too_long"
 	actionCmdlineAlert   = "alert.cmdline_too_long"
 )
@@ -199,27 +200,38 @@ func (h *Handlers) installRequest(m fleet.Machine, cmdline, token string) Instal
 	}
 }
 
-// installScript mints a ticket for the machine out decided on, bound to its
-// host and its cluster's approved pair, and returns the install script that
-// carries it.
-func (h *Handlers) installScript(ctx context.Context, out bootOutcome) (string, error) {
-	m := out.in.Machine
+// approvedPair returns the approved pair of m's cluster, the pair an install's
+// ticket binds.
+func (h *Handlers) approvedPair(ctx context.Context, m fleet.Machine) (clusters.Pair, error) {
 	if m.ClusterID == nil || m.HostName == nil {
-		return "", fmt.Errorf("boot: install of %s: the machine is not bound to a host", m.ID)
+		return clusters.Pair{}, fmt.Errorf("boot: install of %s: the machine is not bound to a host", m.ID)
 	}
 	pair, err := h.configs.Approved(ctx, *m.ClusterID)
 	if err != nil {
-		return "", fmt.Errorf("boot: install of %s: %w", m.ID, err)
+		return clusters.Pair{}, fmt.Errorf("boot: install of %s: %w", m.ID, err)
 	}
+	return pair, nil
+}
+
+// installScript mints a ticket for the machine out decided on, bound to its
+// host and the approved pair read when deciding, and returns the install script
+// that carries it. The mint is refused with fleet.ErrMachineChanged when the
+// machine's state, binding or Talos tuple changed since the decision, as a
+// cluster approval landing in between does.
+func (h *Handlers) installScript(ctx context.Context, out bootOutcome) (string, error) {
+	m := out.in.Machine
+	req := h.installRequest(m, out.cmdline, "")
 	token, _, err := h.repo.MintTicket(ctx, fleet.MintRequest{
 		MachineID: m.ID, ClusterID: *m.ClusterID, HostName: *m.HostName,
-		PairID: pair.ID, SecretVersionID: pair.SecretVersionID, At: out.in.Now,
+		PairID: out.pair.ID, SecretVersionID: out.pair.SecretVersionID,
+		TalosSchematic: req.Schematic, TalosVersion: req.Version, Arch: req.Arch, At: out.in.Now,
 	})
 	if err != nil {
 		return "", fmt.Errorf("boot: install of %s: %w", m.ID, err)
 	}
 	h.minted.Add(ctx, 1)
-	return InstallScript(h.installRequest(m, out.cmdline, token))
+	req.Token = token
+	return InstallScript(req)
 }
 
 // ensureAssets asks for the row the machine installs from to exist, as row 8

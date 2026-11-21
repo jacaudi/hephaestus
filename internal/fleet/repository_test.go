@@ -563,6 +563,33 @@ func runRepositorySuite(t *testing.T, open func(testing.TB) *db.DB) {
 		}
 	})
 
+	t.Run("HoldCoalesced", func(t *testing.T) {
+		r := NewRepository(open(t))
+		m := firstContact(t, r, originalIdentity(), t0) // its last boot event: a hold, "awaiting approval", at t0
+		cases := []struct {
+			name, id, reason string
+			at               time.Time
+			want             bool
+		}{
+			{"same hold within the hour", m.ID, "awaiting approval", t0.Add(59 * time.Minute), true},
+			{"same hold an hour later", m.ID, "awaiting approval", t0.Add(time.Hour), false},
+			{"another reason", m.ID, "machine is rejected", t0.Add(time.Minute), false},
+			{"no boot events", "no-such-machine", "awaiting approval", t0, false},
+		}
+		for _, tc := range cases {
+			got, err := r.HoldCoalesced(t.Context(), tc.id, tc.reason, tc.at)
+			if err != nil || got != tc.want {
+				t.Errorf("%s: HoldCoalesced = %t, %v; want %t", tc.name, got, err, tc.want)
+			}
+		}
+		if _, err := r.RecordBoot(t.Context(), bootOf(m, 6, "exit", t0.Add(time.Minute))); err != nil {
+			t.Fatalf("RecordBoot exit: %v", err)
+		}
+		if got, err := r.HoldCoalesced(t.Context(), m.ID, "awaiting approval", t0.Add(2*time.Minute)); err != nil || got {
+			t.Errorf("after an exit: HoldCoalesced = %t, %v; want false", got, err)
+		}
+	})
+
 	t.Run("GetNotFound", func(t *testing.T) {
 		r := NewRepository(open(t))
 		if _, err := r.Get(t.Context(), "nope"); !errors.Is(err, ErrNotFound) {

@@ -206,8 +206,13 @@ func (e *approveEnv) setDrift(pairID, host string, drift DriftRender) bool {
 // mint mints a ticket of m on host of the pair.
 func (e *approveEnv) mint(m fleet.Machine, host string, p Pair) {
 	e.t.Helper()
-	_, _, err := e.f.MintTicket(e.t.Context(), fleet.MintRequest{
-		MachineID: m.ID, ClusterID: e.c.ID, HostName: host, PairID: p.ID, SecretVersionID: p.SecretVersionID, At: e.tick(),
+	cur, err := e.f.Get(e.t.Context(), m.ID)
+	if err != nil {
+		e.t.Fatalf("Get(%s): %v", m.ID, err)
+	}
+	_, _, err = e.f.MintTicket(e.t.Context(), fleet.MintRequest{
+		MachineID: m.ID, ClusterID: e.c.ID, HostName: host, PairID: p.ID, SecretVersionID: p.SecretVersionID,
+		TalosSchematic: *cur.TalosSchematic, TalosVersion: *cur.TalosVersion, Arch: cur.Arch, At: e.tick(),
 	})
 	if err != nil {
 		e.t.Fatalf("MintTicket(%s): %v", m.ID, err)

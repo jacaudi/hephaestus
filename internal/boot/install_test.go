@@ -132,6 +132,8 @@ type fakeConfigs struct {
 	pair      clusters.Pair
 	ensureErr error
 	ensured   []string
+	// onApproved, when set, runs at the start of each Approved call.
+	onApproved func()
 }
 
 func newFakeConfigs() *fakeConfigs {
@@ -146,6 +148,9 @@ func (f *fakeConfigs) EnsureAssets(_ context.Context, m fleet.Machine, _ time.Ti
 }
 
 func (f *fakeConfigs) Approved(_ context.Context, clusterID string) (clusters.Pair, error) {
+	if f.onApproved != nil {
+		f.onApproved()
+	}
 	if clusterID != f.pair.ClusterID {
 		return clusters.Pair{}, fmt.Errorf("approved pair of %s: %w", clusterID, clusters.ErrNotFound)
 	}
@@ -181,6 +186,12 @@ func talosContent(cmdline string) map[fleet.TalosPart][]byte {
 // under the fixture key, as a finished fetch does, and returns what they are.
 func (g *rig) pushTalos(cmdline string) fleet.TalosAssets {
 	g.t.Helper()
+	return g.pushTalosAt(fixtureTalosKey(), cmdline)
+}
+
+// pushTalosAt is pushTalos under key.
+func (g *rig) pushTalosAt(key fleet.TalosKey, cmdline string) fleet.TalosAssets {
+	g.t.Helper()
 	content := talosContent(cmdline)
 	assets := fleet.TalosAssets{}
 	var layers []ocispec.Descriptor
@@ -198,7 +209,7 @@ func (g *rig) pushTalos(cmdline string) fleet.TalosAssets {
 		layers = append(layers, l)
 		assets[p] = a
 	}
-	if _, err := g.st.TagArtifact(g.t.Context(), fixtureTalosKey().Tag(), "application/vnd.hephaestus.talos.v1", layers); err != nil {
+	if _, err := g.st.TagArtifact(g.t.Context(), key.Tag(), "application/vnd.hephaestus.talos.v1", layers); err != nil {
 		g.t.Fatalf("TagArtifact: %v", err)
 	}
 	return assets
@@ -207,11 +218,17 @@ func (g *rig) pushTalos(cmdline string) fleet.TalosAssets {
 // readyTalos makes the fixture key's row ready with assets recorded.
 func (g *rig) readyTalos(assets fleet.TalosAssets) {
 	g.t.Helper()
+	g.readyTalosAt(fixtureTalosKey(), assets)
+}
+
+// readyTalosAt is readyTalos for the row at key.
+func (g *rig) readyTalosAt(key fleet.TalosKey, assets fleet.TalosAssets) {
+	g.t.Helper()
 	ctx := g.t.Context()
-	if _, err := fleet.WantTalosTx(ctx, g.d.Bun(), fleet.TalosWant{Key: fixtureTalosKey()}, testNow()); err != nil {
+	if _, err := fleet.WantTalosTx(ctx, g.d.Bun(), fleet.TalosWant{Key: key}, testNow()); err != nil {
 		g.t.Fatalf("WantTalosTx: %v", err)
 	}
-	row, ok, err := g.repo.ClaimTalosRow(ctx, fixtureTalosKey(), testNow())
+	row, ok, err := g.repo.ClaimTalosRow(ctx, key, testNow())
 	if err != nil || !ok {
 		g.t.Fatalf("ClaimTalosRow = %v, %v; want the wanted row claimed", ok, err)
 	}
@@ -489,5 +506,74 @@ func TestBoot_ReadyRowUnreadableNotReady(t *testing.T) {
 	}
 	if len(g.errs) != 1 || errors.Is(g.errs[0], errTalosMissing) {
 		t.Errorf("reported errors = %v, want one that is not errTalosMissing", g.errs)
+	}
+}
+
+// TestBoot_ApprovalBetweenDecisionAndMintHolds pins that a cluster approval
+// landing after /boot decided to install, and changing the machine's Talos
+// tuple, mints no ticket: the boot holds, and the next one installs the new
+// tuple with a ticket for the new pair.
+func TestBoot_ApprovalBetweenDecisionAndMintHolds(t *testing.T) {
+	const newVersion = "v1.13.0"
+	src := newFakeConfigs()
+	g := newInstallRig(t, src)
+	g.assign()
+	g.stockTalos(fixtureCmdline)
+	newKey := fleet.TalosKey{Schematic: plainSchematic, Version: newVersion, Arch: fleet.ArchAMD64}
+	g.readyTalosAt(newKey, g.pushTalosAt(newKey, fixtureCmdline))
+	src.onApproved = func() {
+		// cluster approve commits pair-2, which moves the host to the new version.
+		src.onApproved = nil
+		g.exec("UPDATE machines SET talos_version = ? WHERE smbios_uuid = ?", newVersion, bootUUID)
+		src.pair = clusters.Pair{ID: "pair-2", ClusterID: testCluster, SecretVersionID: "version-2", TalosVersion: newVersion}
+	}
+
+	wantHold(t, g.boot(bootQ), "machine changed while deciding")
+
+	if n := g.count("SELECT count(*) FROM tickets"); n != 0 {
+		t.Fatalf("tickets = %d, want 0 for the stale tuple", n)
+	}
+
+	body := g.boot(bootQ)
+
+	if !strings.Contains(body, "/t/"+plainSchematic+"/"+newVersion+"/amd64/kernel ") {
+		t.Errorf("body = %q, want the install script of %s", body, newVersion)
+	}
+	if n := g.count("SELECT count(*) FROM tickets WHERE pair_id = 'pair-2' AND secret_version_id = 'version-2' AND revoked_at IS NULL"); n != 1 {
+		t.Errorf("live tickets for pair-2 = %d, want 1", n)
+	}
+	if n := g.count("SELECT count(*) FROM tickets"); n != 1 {
+		t.Errorf("tickets = %d, want 1", n)
+	}
+}
+
+// TestBoot_CmdlineTooLongAlertsOncePerHour pins that a machine held for a line
+// that cannot fit raises the alert once per hour of holding, as its hold is
+// stored once per hour, not on every re-chain.
+func TestBoot_CmdlineTooLongAlertsOncePerHour(t *testing.T) {
+	metrics := newMetrics(t)
+	now := testNow()
+	g := newInstallRig(t, newFakeConfigs(), WithMeter(metrics.Meter()), WithClock(func() time.Time { return now }))
+	g.assign()
+	g.stockTalos(strings.Repeat("a", MaxCommandLine-countedLength("", testFQDN)+1))
+	alerts := func() (int, string) {
+		t.Helper()
+		v, _ := metricLine(scrapeMetrics(t, metrics), `hephaestus_alerts_total{kind="cmdline_too_long"`)
+		return g.count("SELECT count(*) FROM audit_events WHERE action = 'alert.cmdline_too_long'"), v
+	}
+
+	g.boot(bootQ)
+	now = now.Add(30 * time.Second)
+	g.boot(bootQ)
+
+	if rows, v := alerts(); rows != 1 || v != "1" {
+		t.Errorf("after two boots 30 s apart: audit rows %d, counter %q; want 1 and 1", rows, v)
+	}
+
+	now = testNow().Add(time.Hour)
+	wantHold(t, g.boot(bootQ), "kernel command line too long")
+
+	if rows, v := alerts(); rows != 2 || v != "2" {
+		t.Errorf("after a boot an hour later: audit rows %d, counter %q; want 2 and 2", rows, v)
 	}
 }

@@ -42,9 +42,14 @@ func (t Ticket) Live() bool { return t.ConsumedAt.IsZero() && t.RevokedAt.IsZero
 func (t Ticket) Valid(at time.Time) bool { return t.Live() && at.Before(t.ExpiresAt) }
 
 // MintRequest is a ticket to mint for MachineID, bound to a host, the approved
-// pair and the pair's secret version.
+// pair and the pair's secret version. TalosSchematic, TalosVersion and Arch are
+// the Talos image the caller decided to install: the machine must still have
+// them, as well as the binding to ClusterID and HostName, when the ticket is
+// minted.
 type MintRequest struct {
 	MachineID, ClusterID, HostName, PairID, SecretVersionID string
+	TalosSchematic, TalosVersion                            string
+	Arch                                                    Arch
 	At                                                      time.Time
 }
 

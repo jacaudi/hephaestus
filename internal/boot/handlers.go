@@ -18,6 +18,7 @@ import (
 
 	"go.jacaudi.dev/hephaestus/internal/boot/ipxe"
 	"go.jacaudi.dev/hephaestus/internal/catalog"
+	"go.jacaudi.dev/hephaestus/internal/clusters"
 	"go.jacaudi.dev/hephaestus/internal/fleet"
 	"go.jacaudi.dev/hephaestus/internal/store"
 	"go.jacaudi.dev/hephaestus/internal/telemetry"
@@ -287,14 +288,19 @@ func (h *Handlers) boot(w http.ResponseWriter, r *http.Request) {
 	if out.d.Alert {
 		h.countAlert(ctx, alertKindUUIDConflict)
 	}
-	if out.tooLong > 0 {
-		h.alertCmdline(ctx, out.in.Machine, out.tooLong, out.in.Now)
+	if out.alertLength > 0 {
+		h.alertCmdline(ctx, out.in.Machine, out.alertLength, out.in.Now)
 	}
 	if out.d.Row == 8 && h.configs != nil {
 		h.ensureAssets(ctx, out.in.Machine, out.in.Now)
 	}
 	if out.d.NeedsTicket {
-		if out.script, err = h.installScript(ctx, out); err != nil {
+		out.script, err = h.installScript(ctx, out)
+		switch {
+		case errors.Is(err, fleet.ErrMachineChanged):
+			// The next boot decides afresh, on the machine as it is now.
+			out.d = Decision{Row: 10, Action: ActionHold, Reason: reasonMachineChanged}
+		case err != nil:
 			h.internalError(w, r, err)
 			return
 		}
@@ -317,15 +323,18 @@ type bootState struct {
 // bootOutcome is the decision /boot stored: the input of the last attempt, the
 // decision and the utility entry for the machine's architecture, when one was
 // read. cmdline is the cached kernel command line of an assigned machine whose
-// assets are ready, tooLong the length of a composed command line that did not
-// fit (0 when none), and script the install script once a ticket is minted.
+// assets are ready and pair its cluster's approved pair, read for an install.
+// alertLength is the length of a composed command line that did not fit, when
+// its alert is due (0 otherwise), and script the install script once a ticket
+// is minted.
 type bootOutcome struct {
-	in      Input
-	d       Decision
-	entry   catalog.Entry
-	cmdline string
-	tooLong int
-	script  string
+	in          Input
+	d           Decision
+	entry       catalog.Entry
+	cmdline     string
+	pair        clusters.Pair
+	alertLength int
+	script      string
 }
 
 // decideAndRecord decides the request and stores the boot. The boot-next
@@ -375,7 +384,9 @@ func (h *Handlers) decideAndRecord(ctx context.Context, id fleet.Identity, req R
 
 // decide decides the request for the machine in s at now. attempt counts the
 // boot-next changes seen so far: the last attempt leaves the flag out. An
-// install whose kernel command line cannot fit becomes a row 10 hold.
+// install whose kernel command line cannot fit becomes a row 10 hold, and its
+// alert is due unless the hold would be folded into the machine's last one; an
+// install reads its cluster's approved pair.
 func (h *Handlers) decide(ctx context.Context, req Request, s bootState, attempt int, now time.Time) (bootOutcome, error) {
 	var out bootOutcome
 	out.in = Input{TLS: true, Known: s.found, Machine: s.m, Request: req, UnknownAction: s.unknown, Now: now}
@@ -394,7 +405,21 @@ func (h *Handlers) decide(ctx context.Context, req Request, s bootState, attempt
 		}
 	}
 	out.d = Decide(out.in)
-	out.tooLong = h.installCheck(&out.d, s.m, out.cmdline)
+	if n := h.installCheck(&out.d, s.m, out.cmdline); n > 0 {
+		folded, err := h.repo.HoldCoalesced(ctx, s.m.ID, reasonCmdlineTooLong, now)
+		if err != nil {
+			return bootOutcome{}, err
+		}
+		if !folded {
+			out.alertLength = n
+		}
+	}
+	if out.d.NeedsTicket {
+		var err error
+		if out.pair, err = h.approvedPair(ctx, s.m); err != nil {
+			return bootOutcome{}, err
+		}
+	}
 	return out, nil
 }
 
