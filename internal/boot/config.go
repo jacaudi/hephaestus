@@ -50,7 +50,9 @@ const (
 type refusal string
 
 const (
-	refusedOffSubnet     refusal = "off_subnet"
+	refusedOffSubnet refusal = "off_subnet"
+	// refusedMethod is a request other than GET: only a GET puts the config in front of the machine.
+	refusedMethod        refusal = "method"
 	refusedBadQuery      refusal = "bad_query"
 	refusedUnknownTicket refusal = "unknown_ticket"
 	// refusedInvalidTicket is a ticket that is consumed, revoked or expired.
@@ -115,6 +117,10 @@ func (h *Handlers) Config() http.Handler {
 func (h *Handlers) config(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	now := h.now()
+	if r.Method != http.MethodGet {
+		h.refuse(w, r, refusedMethod, fleet.Ticket{}, now)
+		return
+	}
 	t, m, why, err := h.configTicket(ctx, r.URL.Query(), now)
 	if err == nil && why == "" {
 		why, err = h.pairRefusal(ctx, t)

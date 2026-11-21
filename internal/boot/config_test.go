@@ -242,6 +242,13 @@ func TestConfig_Refusals(t *testing.T) {
 			c.h.TLS().ServeHTTP(rec, req)
 			return rec
 		}},
+		{name: "HEAD with a valid ticket", reason: "method", do: func(c *configRig) *httptest.ResponseRecorder {
+			req := newRequest(c.t, configQ(bootUUID, c.token), true)
+			req.Method = http.MethodHead
+			rec := httptest.NewRecorder()
+			c.h.TLS().ServeHTTP(rec, req)
+			return rec
+		}},
 		{name: "missing t", reason: "bad_query", do: func(c *configRig) *httptest.ResponseRecorder {
 			return c.config("/config?u=" + bootUUID)
 		}},
