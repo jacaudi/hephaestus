@@ -135,12 +135,12 @@ ledger).
 
 | Package | M3 holds |
 |---|---|
-| `clusters` (new) | Imported cluster definitions: the go-git poller, tree-hash revisions under `<data>/git`, pending pairs, approval, per-host renders and hashes, drift; the operations that join a cluster to a machine (machine approve, adopt, rebind; cluster approve); a bound host's drift flag and the `/config` render (§5.8) |
+| `clusters` (new) | Imported cluster definitions: the go-git poller, tree-hash revisions under `<data>/git`, pending pairs, approval, per-host renders and hashes, drift; the sealed secret versions, credentials and error texts (the repository seals them with `datakey`) and the refresh that fills them (the service); the operations that join a cluster to a machine (machine approve, adopt, rebind; cluster approve); a bound host's drift flag and the `/config` render (§5.8) |
 | `render` (new) | The render entry point over the vendored Topf path: sandbox `fs.FS`, the template function allow-list, the `op://`-only reference hook, the load rules, redaction (§5.5) |
-| `secrets` (new) | The `op://` resolver over the 1Password SDK, the sealed value cache with approved and pending versions, refresh, the request counter (§5.4). Read side only; the writer is M4 |
-| `factory` (new) | The small image-factory HTTP client (core §3): `POST /schematics` and the `/image/` URLs |
+| `secrets` (new) | The `op://` resolver over the 1Password SDK, its error classes (a failure of one reference, a failure of the whole call) and the request counter (§5.4). Read side only; the writer is M4. It stores nothing: `clusters` seals and keeps the versions |
+| `factory` (new) | The small image-factory HTTP client (core §3): `POST /schematics` and the `/image/` URLs; it imports `fleet` for the arch and the Talos parts |
 | `internal/third_party/topf` (new) | The vendor-copied Topf render path at `70cdbc8` (MIT), with `LICENSE` and `VENDORED.md` recording the source commit and each change, including every removal of §5.5 |
-| `internal/third_party/imagefactory` (new) | The copied schematic-ID computation from image-factory (MPL-2.0), with its licence, file headers kept and changes marked, as the provider code was |
+| `internal/third_party/imagefactory` (new) | The copied schematic-ID computation from image-factory (MPL-2.0), with its licence, file headers kept and changes marked, as the provider code was; the vendored Topf render path imports it, `render` does not |
 | `toolcache` | The fetcher pool gains a source seam with two sources: utility (today's job, moved) and Talos (§5.7) |
 | `store` | Durable layers, manifests and config blobs (§5.10) |
 | `fleet` | Bindings, create-on-adopt, tickets, the `talos_cache` repository (rows carry everything the fetch needs, §5.2), identity observation |
@@ -149,8 +149,8 @@ ledger).
 | `cmd/hephaestus` | `cluster …`, `machine …` and `unknown-action set` (§5.9); `serve` starts the poller, the refresher and the Talos source, and sets up the default transport (§5.11) |
 
 **Direction** (SOLID D; acyclic): `cmd → boot, clusters, toolcache`; `boot → clusters, fleet, store`;
-`clusters → render, secrets, fleet, datakey`; `secrets → datakey`; `render → third_party/topf,
-third_party/imagefactory`; `toolcache → fleet, store, factory`. `fleet` imports none of the new packages, and
+`clusters → render, secrets, fleet, datakey`; `secrets` imports no `datakey`; `render → third_party/topf`;
+`third_party/topf → third_party/imagefactory`; `toolcache → fleet, store, factory`; `factory → fleet`. `fleet` imports none of the new packages, and
 `clusters` does not import `boot` or `toolcache`. Every operation that changes both cluster and machine rows runs in
 one transaction that `clusters` opens; it calls transaction-scoped `fleet` functions (taking a `bun.IDB`) for the
 machine side. Plain machine transitions (cordon, abort, …) stay in `fleet`. Everything the fetcher and row 8 need
@@ -236,6 +236,9 @@ requeues the row (`store.ContentLost`).
   fields and refresh requests. A new or changed cluster is fetched at once; after that each ref is fetched every
   5 minutes (my call: a constant; no consumer needs a setting). go-git over https through the default transport, with
   its TLS 1.3 floor and timeouts (§5.11) and a 5-minute deadline per fetch.
+- **Tree bounds**: a tree is read into memory before any load rule has judged it, so `readTree` stops at 20,000 paths or
+  128 MiB (each path counts, so a subtree many paths reach counts for all of them); a new head tree beyond either is stored
+  as a failed tree with a text that holds no content, like a tree a load rule refuses, and so is not read again.
 - **Git concurrency**: one mutex in `serve` serialises every use of the git object store (fetches, and tree reads for
   new trees, refreshes and startup); go-git's filesystem storage keeps unguarded maps
   (`storage/filesystem/object.go:32,36`).
@@ -290,8 +293,9 @@ requeues the row (`store.ContentLost`).
   (for example in 1Password). M3 has no in-product recovery for a lost key; restoring it is the recovery. M4's backup
   and `admin recover` work is where one belongs if it is ever needed.
 - **1Password token**: `HEPHAESTUS_OP_TOKEN` or `HEPHAESTUS_OP_TOKEN_FILE`, optional (my call). Without it `serve`
-  still serves approved configs from the cache; a new tree, a refresh and a first credential resolution are refused
-  with an error that names the variable, and `secrets:token` warns while any cluster exists.
+  still serves approved configs from the cache; a new tree and a first credential resolution are refused with an error
+  that names the variable. A due refresh is skipped, with nothing recorded: its trigger stays pending until a token is set
+  (plan ruling, Task 15). `secrets:token` warns while any cluster exists.
 - **SDK client**: created lazily by the refresher goroutine on first need, never at startup and never on the boot
   path (its 9.5 MB WASM core is compiled then), and reused for every later call. A creation failure is a refresh
   failure, never fatal to `serve` (core §5.5: `serve` starts without 1Password). A panic in an extism host function
@@ -353,7 +357,7 @@ requeues the row (`store.ContentLost`).
   48-80`); hephaestus refuses instead.
 - duplicate `nodes[].host` entries, compared case-insensitively (Topf does not de-duplicate, and bindings key on the
   host name), and a host that is not a DNS name: labels of letters, digits and `-`, each 1–63 characters, joined by
-  dots, at most 253 characters, no trailing dot; stored lowercase;
+  dots, at most 253 characters, no trailing dot; an upper-case letter is refused, not lowercased (§11.8);
 - any decoded value in `topf.yaml`'s `data` or in any `nodes[].data` that is not plain (a string, number, bool, null,
   list or map): go.yaml.in/yaml/v4 turns an unquoted timestamp, or a quoted one tagged `!!timestamp`, into a
   `time.Time` whose time-zone methods templates could reach (Fable review S8); such values must be plain strings;
@@ -379,7 +383,7 @@ randomness, map iteration order, the host or its time zone. Gate passes 2 and 3 
 `values` (Go map order, `dict.go:40-48, 128-135`), `genPrivateKey`, `genCA`, `genCAWithKey`, `genSelfSignedCert`,
 `genSelfSignedCertWithKey`, `genSignedCert`, `genSignedCertWithKey`, `bcrypt`, `htpasswd` and `encryptAES`; none of
 them is allowed. The plan writes both the allowed list and the denied list in full, deciding every function of the
-map (path functions such as `osBase` are allowed: the container is always Linux; `unixEpoch` and `dateModify` are
+map (path functions such as `osBase` are allowed: the container is always Linux; `unixEpoch`, `mustDateModify` and `must_date_modify` (sprig has no `dateModify`) are
 denied with the time functions, since no time value can reach a template otherwise); a test fails if sprig's map
 gains a function neither list names, so an upgrade fails closed. Such a function would render differently each time, set
 drift on every `/config` and hold the host forever.
@@ -485,7 +489,11 @@ fixtures through a fixture cache. The outputs must be byte-identical (core §7.5
 - **Claim order** across sources, by class then oldest `updated_at` (my call):
   1. utility rows armed by a boot-next (today's priority 1);
   2. Talos rows whose `(schematic, version, arch)` equals the Talos tuple and arch of a machine in `assigned`;
-  3. everything else.
+  3. the other utility rows (priority 0);
+  4. the other Talos rows.
+
+  Within a class, oldest `updated_at` first. The cross-table order is deterministic, and a starved row waits behind the
+  classes above it (plan ruling, claim order; the ledger's Tasks 22 and 23 keep the utility priorities in classes 1 and 3).
   `talos_cache` has no priority column; its class is derived at claim time by a `fleet` query over `machines`, which
   carries each machine's tuple (§5.2).
 - **Talos job**, for one `(schematic, version, arch)`:
@@ -508,15 +516,21 @@ fixtures through a fixture cache. The outputs must be byte-identical (core §7.5
      authority afterwards (core §5.6); a later mismatch is an integrity error. The factory's asset path is not the
      content hash (checked twice). `cmdline-metal-<arch>` is also validated: printable ASCII, no `$`, no newline, no
      token starting with `#`, no `;`, `&&` or `||` (iPXE treats them as a comment or a command separator,
-     `src/core/exec.c:184-211`, which would drop the halt flag and the config URL), at most 2047 bytes; otherwise it
+     `src/core/exec.c:184-211`, which would drop the halt flag and the config URL), at most 2046 bytes; otherwise it
      is an integrity error. Whether the composed line fits is checked once, by `boot` (§5.8).
   6. **Push and tag**: each asset is one blob; the three are tagged `talos/<schematic>-<arch>:<version>` (illustrative).
   7. **Store shortcut**: like the utility job, a row whose tag already passes the layer check becomes `ready` without
      a download, but only when the row has recorded hashes and the tag's layer digests equal them. A row without them
      (first fetch, or after `--reset-hash`) always downloads, records and re-tags.
-- **Spool**: Talos downloads use their own spool names (illustrative `talos-<schematic12>-<version>-<arch>-<n>`). The
-  startup sweep keeps the spool files of every `talos_cache` row that is not `ready`, as it keeps every current utility
+- **Spool**: Talos downloads use their own spool names (illustrative `talos-<schematic>-<version>-<arch>-<n>`, the whole
+  schematic id, so rows of different keys never share a file). The startup sweep keeps the spool files of every `talos_cache` row that is not `ready`, as it keeps every current utility
   pin.
+- **One job per key, one claim per write** (ledger Ruling, Task 22): at most one job touches a Talos key's spool files and
+  store writes at a time (`Fetcher.holdTalos`): a job whose key is held waits for the holder to end, and the holder's
+  discard runs before the key is released, so a `--reset-hash` re-claim waits for the earlier job's spool and tag. Every
+  writer of a claimed row is fenced by a claim token: `talos_cache.claim_gen` is raised by each claim, and a write matches
+  on `state = fetching` and the generation, so a job that lost its claim (a reset, from any state) cannot re-pin its old
+  hashes over it.
 - **Creating and re-arming rows** (Fable review S5): every want of a row also sets the schematic body when the row
   has none and the approved `host_renders` row has one, so a definition that moves from a literal ID to a file gets
   registered.
@@ -562,8 +576,8 @@ fixtures through a fixture cache. The outputs must be byte-identical (core §7.5
   command line is the cached `cmdline-metal-<arch>` as the factory serves it (it is what the factory's own `/pxe`
   script uses, verified; extra kernel arguments, such as a serial console, come from the schematic's
   `extraKernelArgs`), then `talos.halt_if_installed=1` and `talos.config=https://<fqdn>/config?u=${uuid}&t=<ticket>`.
-  The composed line must be at most 2047 bytes, the kernel's `COMMAND_LINE_SIZE` of 2048 on x86 and arm64 less the
-  terminator, because truncation would drop exactly the config URL. On EFI, iPXE passes `"<image name> <cmdline>"`
+  The composed line must be at most 2046 bytes on every platform (iPXE's BIOS `bzimage.c:314` is the tightest bound; the
+  kernel's `COMMAND_LINE_SIZE` is 2048 on x86 and arm64), because truncation would drop exactly the config URL (§11.8). On EFI, iPXE passes `"<image name> <cmdline>"`
   and the EFI stub truncates that whole string (iPXE `9261ebe` `src/image/efi_image.c:160-171`), which is why the
   kernel is named `k`: the count includes those 2 bytes (Fable review S7). `boot` checks it, in the one place that
   composes the line, with a 36-character UUID and the 43-character ticket; a line that cannot fit holds the machine at row 10
@@ -620,15 +634,17 @@ fixtures through a fixture cache. The outputs must be byte-identical (core §7.5
   delivery.
 - **A config never fetched**: a ticket minted and neither consumed nor revoked after 30 minutes is the likeliest
   first-install failure (DNS, the node's clock, TLS trust). `machine show` gives the ticket's minted time and
-  whether `/config` was ever requested for it, and the check `config:pending` warns with the machine.
+  whether `/config` was ever requested for it, and the check `config:pending` warns with the machine: for a ticket nobody asked for, the node's DNS, clock and trust of the boot certificate; for one that was asked for and is still live, a refusal (the `config.refused` audit event holds the reason) or a delivery that was not recorded, with that runbook.
 
 ### 5.9 CLI (`docker exec hephaestus /hephaestus …`, all with `--json`)
 
 - **Clusters**: `cluster import`, `cluster set <name> [--repo … --ref … --path … --username … --credential …]`,
-  `cluster remove <name>` (refused while any machine is bound to it), `cluster list`, `cluster diff <name>` (each
-  host's redacted diff for the pending pair, and "secret values changed" when only `config_hash` moved),
+  `cluster remove <name>` (refused while any machine is bound to it), `cluster list` (whether each stored error exists; `--errors` prints the texts, which can quote a fragment of a
+  secret value), `cluster diff <name>` (each
+  host's redacted diff for the pending pair, "secret values changed" when only `config_hash` moved, and the references the
+  pair resolved and those the approved pair did not, so the approver sees which items fill the redacted values),
   `cluster diff <name> --host <host>` (drift), `cluster approve <name> <pair id>`,
-  `cluster approve <name> --host <host> --hash <config_hash>` (drift), `cluster refresh <name>`.
+  `cluster approve <name> --host <host> --hash <config_hash>` (drift), `cluster refresh <name>` (audited as `cluster.refresh_requested`).
 - **Machines**: `machine list`, `machine show <mac|uuid>`, `machine fetch <mac|uuid> [--reset-hash]`, and one command
   per admin trigger: `approve`, `adopt` (with `--uuid` and `--arch` for create-on-adopt), `mark-installed`, `abort`,
   `reinstall --topf-reset-full-done`, `unassign`, `unbind`, `rebind <cluster>/<host>`, `cordon`, `uncordon`,
@@ -691,11 +707,14 @@ utility pins are unchanged.
   `secrets:token` (warn: clusters exist and no token), `secrets:budget` (warn at 50%), `git:fetch` (warn: a cluster's
   last fetch failed or is older than 30 minutes, or it has a failed tree), `render:approved` (critical: an approved
   render cannot be produced, §5.6), `talos:cache` (warn: any `broken` row), `secrets:client` (warn: 3 or more
-  consecutive whole-call 1Password failures, §5.4), `config:pending` (warn: a ticket unfetched for 30 minutes, §5.8).
+  consecutive whole-call 1Password failures, §5.4), `config:pending` (warn: a ticket neither consumed nor revoked 30 minutes after its mint, whether or not `/config` was asked for it; each text names the likely cause of its case, §5.8).
 - **Metrics**: configs served and refused (`{reason}`), tickets minted, 1Password requests, git fetches and failures,
   the Talos fetch instruments (§5.7).
-- **Alerts** (audit event and counter; the UI is M4): drift set, a refresh marked `incomplete`, a Talos row `broken`,
-  "config delivered but not recorded" (§5.8).
+- **Alerts** (audit event and counter `hephaestus.alerts{kind}`; the UI is M4; plan ruling): `drift`, `refresh_incomplete`, `talos_broken`,
+  `config_unrecorded` ("config delivered but not recorded", §5.8), `git_store_moved_aside` (audit `cluster.store_moved_aside`:
+  the corrupt store was moved aside, at most once an hour, the hour carried across restarts by the newest moved-aside
+  name, ledger Ruling Task 16) and `cmdline_too_long` (audit `alert.cmdline_too_long`: the row-10 hold of §5.8, folded to
+  one per machine per hour).
 - **Logs**: the `t=` query parameter is redacted with the rest of the query string (core §5.9), and `docs/` tells
   proxy-mode operators to redact query strings in the proxy's own logs (RFC 6750 §5.3 advises against bearer tokens
   in URLs; Talos's `talos.config` URL is the only channel it offers); render errors are logged by stage, file and
@@ -724,7 +743,7 @@ utility pins are unchanged.
     unknown schematic or version, a registration that returns a different ID, a recorded-hash mismatch, a command
     line too long to fit;
   - the 206-ETag check for the utility source too; the Talos spool keep-set;
-  - command-line composition at the 2047-byte limit, and the row-10 hold when it cannot fit;
+  - command-line composition at the 2046-byte limit, and the row-10 hold when it cannot fit;
   - `keys` and `values` refused; a timestamp in `data` refused; an FQDN host accepted and a host with `/` refused;
   - `machine fetch --reset-hash` on a `ready` row; the schematic body copied from `host_renders` into a new
     `talos_cache` row by a CLI transaction; an expired, unconsumed ticket revoked by the next mint;
@@ -750,17 +769,28 @@ utility pins are unchanged.
   - the default transport: a test proves the TLS 1.3 floor reaches both `http.DefaultClient` and go-git's default
     client, and that the counter sees 1Password-host requests.
 - **Git**: integration tests serve a real repository over smart HTTP in-process; go-git has no dumb-HTTP support.
-- **CI**: the parity test, the machinery assertion, the `os/exec` check (§5.5), and an SDK smoke test in the built
-  image that loads `core.wasm` and expects a clean authentication error from a dummy token, because e2e overlays the
-  resolver and would otherwise leave the SDK and wazero path untested (12-Factor X; Fable review).
+- **CI**: the parity test, the machinery assertion, the `os/exec` check (§5.5), and an SDK smoke test, `TestOnePassword_SmokeDummyToken` (build tag `sdksmoke`, task `go:sdk-smoke` inside `go:ci`, `CGO_ENABLED=0`),
+  that builds the real client with a dummy token and requires `ResolveAll` to return a whole-call failure that is not a
+  panic within 60 s, because e2e overlays the resolver and would otherwise leave the SDK and wazero path untested
+  (12-Factor X; Fable review; plan ruling §11.6, revised). It runs on the CI host, not in an image: it proves the WASM core
+  loads without cgo and that a failure is classified, not the network.
 - **`task e2e`**: approval, the install script and the kernel and initramfs fetch (core §7.6). The harness serves a
-  fixture Topf repository over smart HTTP behind its Caddy with the test CA (TLS 1.3), so the real git path runs; a
+  fixture Topf repository over smart HTTP from `test/e2e/upstreams`, a Go program on its own TLS 1.3 listener with the test CA
+  (the fake image factory and its assets host share it, one certificate per host name picked by SNI; plan ruling), so the
+  real git path runs, while Caddy fronts hephaestus only in the proxy-mode phase; a
   new cluster is fetched at once (§5.3), so no 5-minute wait. The e2e build overlays two files, as
   `overlay/catalog.go.in` overlays the catalog today: the secrets resolver (fixture values; the harness sets
   `HEPHAESTUS_OP_TOKEN` to a dummy value so §5.4's token rule passes, and the fixture resolver ignores it) and the
   factory base URL (a constant, not a production setting), which points at the local fake factory. One VM per firmware is approved into
   the fixture cluster; the evidence is the install script on `/boot` and the kernel and initramfs requests in the
   server log. Talos's HTTPS `/config` fetch cannot trust the test CA, so it stays lab test 3.
+- **The e2e run record** (owner request 2026-11-20; ledger Ruling, Task 30): every run writes `events.jsonl` (one event per
+  phase start and end, check, and run start and end, validated against `test/e2e/events.schema.json` by `upstreams
+  validate-events`), `run.log` (everything the run printed) and `manifest.json` (each file's size and sha256), under
+  `build/e2e/<UTC timestamp>/`. The console shows the same events through `test/e2e/lib/events.sh` (tested by
+  `events_test.sh`): a header per phase, a PASS, FAIL or NOTE per check, a subtotal per phase that has checks, and a
+  summary. The run captures itself through a FIFO to a background `tee`, so SIGINT and SIGTERM reach its own traps and the
+  cleanup writes the manifest.
 
 ## 6. Left to the builder (decided in the plan)
 
@@ -825,7 +855,7 @@ implementation; the template-function allow-list itself (written from §5.5's ru
   `--arch` and starts unobserved, and row 2 skips an unobserved record; `rebind` refuses a junk machine and may
   return a machine to its own former host (the core table says "another unbound host"); reinstall
   requires a full reset, with a runbook order; the install script drops the per-arch console arguments in favour of
-  the factory's command line and the schematic's `extraKernelArgs`, starts with `imgfree`, and is capped at 2047 bytes;
+  the factory's command line and the schematic's `extraKernelArgs`, starts with `imgfree`, and is capped at 2046 bytes;
   `assets_ready` is derived, not a stored per-machine flag; `/config` records a delivery even when the ticket was
   revoked meanwhile.
 - **§5.4**: definitions naming `nodesProvider`, `secretsProvider` or `configDir`, lacking a secrets bundle, or naming
