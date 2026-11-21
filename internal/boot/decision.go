@@ -87,8 +87,9 @@ type Input struct {
 	// Utility is what BootNext is in the catalog and the store; it is read only
 	// when BootNext is set.
 	Utility UtilityFacts
-	// AssetsReady and Drift are owned by M3: whether the machine's boot assets
-	// are cached, and whether the machine's rendered configuration has drifted.
+	// AssetsReady and Drift are read only for an assigned machine: whether its
+	// Talos row is ready and its content intact in the store, and whether the
+	// approved render of its host has drifted.
 	AssetsReady, Drift bool
 }
 
@@ -125,7 +126,9 @@ func Decide(in Input) Decision {
 	switch {
 	case !in.TLS:
 		return Decision{Row: 1, Action: ActionChainTLS}
-	case in.Known && (m.Serial != in.Request.Serial || m.Product != in.Request.Product):
+	case in.Known && m.IdentityObserved && (m.Serial != in.Request.Serial || m.Product != in.Request.Product):
+		// A machine whose identity was never observed (one adopted by its UUID)
+		// takes the request's serial and product as its first report instead.
 		// A repeat on an already-junk record holds without a second alert.
 		return Decision{Row: 2, Action: ActionHold, Reason: reasonConflict, MarkJunk: !m.Junk, Alert: !m.Junk}
 	case in.Known && in.BootNext != "":

@@ -285,7 +285,7 @@ func (h *Handlers) admit(w http.ResponseWriter, r *http.Request, rep report) (fl
 		return obs, true
 	case errors.Is(err, fleet.ErrIdentityConflict):
 		if obs.Alerted {
-			h.countAlert(ctx)
+			h.countAlert(ctx, alertKindUUIDConflict)
 		}
 		h.discoverReply(w, r, outcomeConflict, http.StatusConflict, err)
 	case errors.Is(err, fleet.ErrFleetFull):

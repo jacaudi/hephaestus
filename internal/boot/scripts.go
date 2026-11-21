@@ -8,7 +8,7 @@ import (
 
 // ErrUnsupportedAction is returned by Render for utility and install: the
 // handlers build the utility script from the catalog entry, and the install
-// script needs a config ticket.
+// script with InstallScript once a config ticket is minted.
 var ErrUnsupportedAction = errors.New("boot: Render does not render this action")
 
 // ErrUnknownAction is returned by Render for an action that is not one of the

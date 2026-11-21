@@ -166,10 +166,17 @@ type rig struct {
 
 func newRig(t *testing.T, opts ...Option) *rig {
 	t.Helper()
+	return newRigWith(t, func(*Config) {}, opts...)
+}
+
+// newRigWith is newRig with mod applied to the handlers' Config.
+func newRigWith(t *testing.T, mod func(*Config), opts ...Option) *rig {
+	t.Helper()
 	d := dbtest.SQLite(t)
 	repo := fleet.NewRepository(d)
 	root := t.TempDir()
 	cfg, fix := testConfig(t, repo, root)
+	mod(&cfg)
 	g := &rig{t: t, d: d, repo: repo, st: cfg.Store, storeRoot: root, fix: fix}
 	opts = append([]Option{WithClock(testNow), WithErrorHandler(func(_ context.Context, err error) {
 		g.errs = append(g.errs, err)
@@ -468,13 +475,110 @@ func TestBoot_JunkPatternUUIDNeverMatchesValidUUIDMachine(t *testing.T) {
 	}
 }
 
-func TestBoot_AssignedHoldsOnAssets(t *testing.T) {
+// TestBoot_NoConfigSourceHolds pins M2's behaviour without a config source: an
+// assigned machine holds at row 8 even when its assets are ready.
+func TestBoot_NoConfigSourceHolds(t *testing.T) {
 	g := newRig(t)
-	g.boot(bootQ)
-	g.setState(fleet.StateAssigned)
+	g.assign()
+	g.stockTalos(fixtureCmdline)
 
-	if body := g.boot(bootQ); !strings.Contains(body, "holding: boot assets not ready") {
-		t.Errorf("body = %q, want it to hold on boot assets", body)
+	wantHold(t, g.boot(bootQ), "boot assets not ready")
+
+	if n := g.count("SELECT count(*) FROM tickets"); n != 0 {
+		t.Errorf("tickets = %d, want 0", n)
+	}
+}
+
+// adoptByUUID creates the fixture machine as machine adopt --uuid does:
+// installed and bound, with no MACs and its identity not yet observed.
+func (g *rig) adoptByUUID() fleet.Machine {
+	g.t.Helper()
+	m, err := fleet.AdoptByUUIDTx(g.t.Context(), g.d.Bun(), fleet.AdoptByUUIDRequest{
+		UUID: bootUUID, Arch: fleet.ArchAMD64,
+		Bind:  fleet.Binding{ClusterID: testCluster, Host: testHost, TalosSchematic: plainSchematic, TalosVersion: talosVersion},
+		Guard: fleet.Guard{HostExists: true, HostUnbound: true},
+		Actor: fleet.ActorCLI, At: testNow(),
+	})
+	if err != nil {
+		g.t.Fatalf("AdoptByUUIDTx: %v", err)
+	}
+	return m
+}
+
+// get is the stored machine with id, which must exist.
+func (g *rig) get(id string) fleet.Machine {
+	g.t.Helper()
+	m, err := g.repo.Get(g.t.Context(), id)
+	if err != nil {
+		g.t.Fatalf("Get %s: %v", id, err)
+	}
+	return m
+}
+
+// TestBoot_AdoptedFirstBootObservesIdentity pins that the first boot of an
+// adopted machine stores its serial and product instead of meeting row 2: it
+// is not marked junk and row 6 answers it.
+func TestBoot_AdoptedFirstBootObservesIdentity(t *testing.T) {
+	g := newRig(t)
+	adopted := g.adoptByUUID()
+
+	if got, want := g.boot(bootQ), "#!ipxe\nexit\n"; got != want {
+		t.Errorf("body = %q, want %q", got, want)
+	}
+
+	m := g.get(adopted.ID)
+	if m.Junk || !m.IdentityObserved || m.Serial != "S1" || m.Product != "P1" {
+		t.Errorf("machine = junk %t, observed %t, serial %q, product %q; want not junk, observed S1/P1", m.Junk, m.IdentityObserved, m.Serial, m.Product)
+	}
+	if n := g.count("SELECT count(*) FROM audit_events WHERE action = 'alert.uuid_conflict'"); n != 0 {
+		t.Errorf("alert rows = %d, want 0", n)
+	}
+}
+
+// TestBoot_IdentityRaceRedecidesRow2 pins that a boot that loses the first
+// report of an adopted machine's identity to a /discover is decided again from
+// the fresh row: the serials differ, so row 2 holds and marks the UUID junk.
+func TestBoot_IdentityRaceRedecidesRow2(t *testing.T) {
+	metrics := newMetrics(t)
+	clock := testNow
+	g := newRig(t, WithMeter(metrics.Meter()), WithClock(func() time.Time { return clock() }))
+	adopted := g.adoptByUUID()
+	other := fleet.NewRepository(g.d)
+	observed := false
+	clock = func() time.Time {
+		// The /boot handler has looked the machine up; a /discover reports it first.
+		if !observed {
+			observed = true
+			id := fleet.Identity{UUID: bootUUID, Serial: "S1", Product: "P1"}
+			if _, err := other.Observe(t.Context(), id, fleet.ArchAMD64, testNow()); err != nil {
+				t.Fatalf("Observe: %v", err)
+			}
+		}
+		return testNow()
+	}
+
+	body := g.boot(queryWith("S2", "P1"))
+
+	if !strings.Contains(body, holdingConflict) {
+		t.Errorf("body = %q, want it to contain %q", body, holdingConflict)
+	}
+	if n := g.count("SELECT count(*) FROM boot_events"); n != 1 {
+		t.Errorf("boot events = %d, want 1", n)
+	}
+	if n := g.count("SELECT count(*) FROM boot_events WHERE decision_row = 2"); n != 1 {
+		t.Errorf("row 2 events = %d, want 1", n)
+	}
+	if m := g.get(adopted.ID); !m.Junk || m.Serial != "S1" {
+		t.Errorf("machine = junk %t, serial %q; want junk with the reported S1", m.Junk, m.Serial)
+	}
+	if n := g.count("SELECT count(*) FROM audit_events WHERE action = 'alert.uuid_conflict'"); n != 1 {
+		t.Errorf("alert rows = %d, want 1", n)
+	}
+	if v, ok := metricLine(scrapeMetrics(t, metrics), `hephaestus_alerts_total{kind="uuid_conflict"`); !ok || v != "1" {
+		t.Errorf(`hephaestus_alerts_total{kind="uuid_conflict"} = %q (found %t), want 1`, v, ok)
+	}
+	if len(g.errs) != 0 {
+		t.Errorf("reported errors = %v, want none (no ErrBootNextRace)", g.errs)
 	}
 }
 
@@ -655,29 +759,6 @@ func TestBoot_AlertCountedOnce(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("metrics lack hephaestus_alerts_total{kind=\"uuid_conflict\"}:\n%s", body)
-	}
-}
-
-func TestFallback(t *testing.T) {
-	served := Decision{Row: 3, Action: ActionUtility, Utility: "tshell", BootNextClear: fleet.ClearServed}
-	cases := []struct {
-		name string
-		in   Decision
-		want Decision
-	}{
-		{"install holds on the ticket", Decision{Row: 10, Action: ActionInstall, NeedsTicket: true},
-			Decision{Row: 10, Action: ActionHold, NeedsTicket: true, Reason: "ticket minting not available (M3)"}},
-		{"install keeps the row 3 fields", Decision{Row: 10, Action: ActionInstall, NeedsTicket: true, BootNextClear: fleet.ClearExpired, WantUtility: true},
-			Decision{Row: 10, Action: ActionHold, NeedsTicket: true, Reason: "ticket minting not available (M3)", BootNextClear: fleet.ClearExpired, WantUtility: true}},
-		{"utility passes through", served, served},
-		{"exit unchanged", Decision{Row: 6, Action: ActionExit}, Decision{Row: 6, Action: ActionExit}},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := fallback(tc.in); got != tc.want {
-				t.Errorf("fallback(%+v) = %+v, want %+v", tc.in, got, tc.want)
-			}
-		})
 	}
 }
 

@@ -36,9 +36,6 @@ const (
 	contentTypeScript = "text/plain; charset=utf-8"
 	contentTypeBinary = "application/octet-stream"
 
-	// Config tickets are not minted yet; a machine that would install holds instead.
-	reasonNoTicket = "ticket minting not available (M3)"
-
 	alertKindUUIDConflict = "uuid_conflict"
 )
 
@@ -72,6 +69,10 @@ type Config struct {
 	// Files holds the iPXE binaries by the names /tftp serves them under, such as
 	// "amd64/snp.efi".
 	Files map[string][]byte
+	// Configs answers rows 8 to 10 for an assigned machine: drift, the creation
+	// of its Talos row and the approved pair a ticket binds. When nil, an assigned
+	// machine holds at row 8.
+	Configs ConfigSource
 }
 
 // Handlers serves the boot routes: the iPXE chain scripts over plain HTTP, the
@@ -84,6 +85,7 @@ type Handlers struct {
 	address netip.Addr
 	subnet  netip.Prefix
 	files   map[string][]byte
+	configs ConfigSource
 	now     func() time.Time
 	meter   metric.Meter
 	onError func(context.Context, error)
@@ -92,6 +94,7 @@ type Handlers struct {
 	limiter           *windowLimiter
 	decisions, alerts metric.Int64Counter
 	reports, boots    metric.Int64Counter
+	minted            metric.Int64Counter
 }
 
 // limiterConfig is what WithLimiter sets and NewHandlers builds the limiter from.
@@ -139,7 +142,7 @@ func WithErrorHandler(fn func(context.Context, error)) Option {
 func NewHandlers(cfg Config, opts ...Option) (*Handlers, error) {
 	h := &Handlers{
 		repo: cfg.Repo, content: cfg.Store, catalog: cfg.Catalog,
-		fqdn: cfg.FQDN, address: cfg.Address, subnet: cfg.Subnet, files: cfg.Files,
+		fqdn: cfg.FQDN, address: cfg.Address, subnet: cfg.Subnet, files: cfg.Files, configs: cfg.Configs,
 		now: time.Now, meter: noop.NewMeterProvider().Meter(""),
 		onError: func(context.Context, error) {},
 		limit:   limiterConfig{limit: discoverPerSource, window: discoverWindow, capacity: limiterCapacity},
@@ -172,6 +175,11 @@ func NewHandlers(cfg Config, opts ...Option) (*Handlers, error) {
 	if err != nil {
 		return nil, fmt.Errorf("boot: utility boots counter: %w", err)
 	}
+	h.minted, err = h.meter.Int64Counter("hephaestus.tickets.minted",
+		metric.WithDescription("Config tickets minted for Talos installs."))
+	if err != nil {
+		return nil, fmt.Errorf("boot: tickets minted counter: %w", err)
+	}
 	return h, nil
 }
 
@@ -195,27 +203,33 @@ func (h *Handlers) validate() error {
 }
 
 // PlainHTTP returns the handler for the plain-HTTP listener: /start, /boot
-// (which only chains to TLS), /tftp and the utility artifacts under /u/,
-// behind the subnet guard.
+// (which only chains to TLS), /tftp, the utility artifacts under /u/ and the
+// Talos artifacts under /t/, behind the subnet guard.
 func (h *Handlers) PlainHTTP() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /start", h.start)
 	mux.HandleFunc("GET /boot", h.chain)
 	mux.HandleFunc("GET /tftp/{arch}/snp.efi", h.tftp)
 	mux.HandleFunc("GET /u/{entry}/{arch}/{version}/{path...}", h.artifact)
+	mux.HandleFunc(talosRoute, h.talosArtifact)
 	return RequireSubnet(h.subnet, mux)
 }
 
-// TLS returns the handler for the TLS listener: /boot, /discover and the iPXE
-// binaries, behind the subnet guard. Which listener a request came in on, not
-// the request, says it is a TLS one: serving it is what makes /boot decide.
+// TLS returns the handler for the TLS listener: /boot, /discover, the iPXE
+// binaries and the Talos artifacts, behind the subnet guard. Which listener a
+// request came in on, not the request, says it is a TLS one: serving it is what
+// makes /boot decide.
 func (h *Handlers) TLS() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /boot", h.boot)
 	mux.HandleFunc("POST /discover", h.discover)
 	mux.HandleFunc("GET /tftp/{arch}/snp.efi", h.tftp)
+	mux.HandleFunc(talosRoute, h.talosArtifact)
 	return RequireSubnet(h.subnet, mux)
 }
+
+// talosRoute is the pattern of the Talos artifact route, on both listeners.
+const talosRoute = "GET /t/{schematic}/{version}/{arch}/{asset}"
 
 // Proxied returns the handler for the listener a TLS-terminating reverse proxy
 // forwards to: the TLS routes, for clients named by X-Forwarded-For from a peer
@@ -233,7 +247,7 @@ func (h *Handlers) start(w http.ResponseWriter, r *http.Request) {
 // chain answers /boot on the plain-HTTP listener: it only chains to TLS,
 // without parsing the query or touching the database.
 func (h *Handlers) chain(w http.ResponseWriter, r *http.Request) {
-	h.serve(w, r, Decide(Input{}), catalog.Entry{})
+	h.serve(w, r, bootOutcome{d: Decide(Input{})})
 }
 
 // boot answers /boot on a TLS listener: it decides, records and renders.
@@ -271,9 +285,21 @@ func (h *Handlers) boot(w http.ResponseWriter, r *http.Request) {
 		telemetry.AddAttrs(ctx, slog.String("boot_next_clear", string(out.d.BootNextClear)))
 	}
 	if out.d.Alert {
-		h.countAlert(ctx)
+		h.countAlert(ctx, alertKindUUIDConflict)
 	}
-	h.serve(w, r, out.d, out.entry)
+	if out.tooLong > 0 {
+		h.alertCmdline(ctx, out.in.Machine, out.tooLong, out.in.Now)
+	}
+	if out.d.Row == 8 && h.configs != nil {
+		h.ensureAssets(ctx, out.in.Machine, out.in.Now)
+	}
+	if out.d.NeedsTicket {
+		if out.script, err = h.installScript(ctx, out); err != nil {
+			h.internalError(w, r, err)
+			return
+		}
+	}
+	h.serve(w, r, out)
 }
 
 // bootAttempts is how many times /boot decides a request whose machine's
@@ -290,65 +316,103 @@ type bootState struct {
 
 // bootOutcome is the decision /boot stored: the input of the last attempt, the
 // decision and the utility entry for the machine's architecture, when one was
-// read.
+// read. cmdline is the cached kernel command line of an assigned machine whose
+// assets are ready, tooLong the length of a composed command line that did not
+// fit (0 when none), and script the install script once a ticket is minted.
 type bootOutcome struct {
-	in    Input
-	d     Decision
-	entry catalog.Entry
+	in      Input
+	d       Decision
+	entry   catalog.Entry
+	cmdline string
+	tooLong int
+	script  string
 }
 
 // decideAndRecord decides the request and stores the boot. The boot-next
 // compare-and-clear is part of the stored boot, so when another process has
 // changed the flag since it was read the request is decided again from the
 // fresh machine, once; a second change is reported as ErrBootNextRace and the
-// third decision leaves the flag out.
+// third decision leaves the flag out. The first report of an adopted machine's
+// identity is part of the stored boot too: when another boot or /discover
+// reported it first, the request is decided again from the fresh machine, whose
+// identity is now observed, so it meets row 2 when its serial or product
+// differs. The identity is observed once, so that retry happens once.
 func (h *Handlers) decideAndRecord(ctx context.Context, id fleet.Identity, req Request, s bootState) (bootOutcome, error) {
-	for attempt := 0; ; attempt++ {
+	raced := false
+	for attempt := 0; ; {
 		now := h.now() // one read per attempt: the decision and the record agree on it
-		var out bootOutcome
-		out.in = Input{TLS: true, Known: s.found, Machine: s.m, Request: req, UnknownAction: s.unknown, Now: now}
-		if s.found && s.m.BootNext != "" && attempt < bootAttempts-1 && flagServesMAC(s.m, req.MAC) {
-			var err error
-			out.in.BootNext, out.in.BootNextSetAt, out.in.PlatformKnown = s.m.BootNext, s.m.BootNextSetAt, req.Platform != ""
-			out.in.Utility, out.entry, err = h.utilityFacts(ctx, s.m.BootNext, req.Arch, req.Platform, now)
-			if err != nil {
-				return bootOutcome{}, err
-			}
-		}
-		out.d = fallback(Decide(out.in))
-
-		rec := fleet.BootRecord{
-			Identity: id, Arch: req.Arch, MachineID: s.m.ID, Trigger: out.d.Trigger, Conflict: out.d.Row == 2, MarkJunk: out.d.MarkJunk,
-			Event: fleet.BootEvent{Row: out.d.Row, Action: string(out.d.Action), Reason: out.d.Reason}, At: now,
-		}
-		if out.d.BootNextClear != "" {
-			rec.ClearBootNext = &fleet.BootNextClear{Entry: s.m.BootNext, SetAt: s.m.BootNextSetAt, Reason: out.d.BootNextClear}
-		}
-		if out.d.WantUtility && out.entry.Entry != "" {
-			rec.WantFetch = &fleet.FetchWant{Key: fleet.CacheKey{Entry: s.m.BootNext, Arch: req.Arch}, Pin: out.entry.Pin.ID}
+		out, err := h.decide(ctx, req, s, attempt, now)
+		if err != nil {
+			return bootOutcome{}, err
 		}
 
-		stored, err := h.repo.RecordBoot(ctx, rec)
-		if errors.Is(err, fleet.ErrBootNextChanged) {
+		stored, err := h.repo.RecordBoot(ctx, bootRecord(id, req, s, out))
+		switch {
+		case errors.Is(err, fleet.ErrBootNextChanged):
 			if attempt == bootAttempts-2 {
 				h.onError(ctx, ErrBootNextRace)
 			}
-			if s.m, s.found, err = h.repo.Lookup(ctx, id); err != nil {
-				return bootOutcome{}, err
+			attempt++
+		case errors.Is(err, fleet.ErrIdentityRace) && !raced:
+			raced = true
+		default:
+			if err == nil {
+				s.m = stored
+				telemetry.AddAttrs(ctx, slog.String("state", string(s.m.State)))
 			}
-			continue
+			if s.m.ID != "" {
+				telemetry.AddAttrs(ctx, slog.String("machine_id", s.m.ID))
+			}
+			// A full fleet and an unidentifiable machine are not failures: the machine
+			// still gets its script, it just is not recorded.
+			return out, noteUnrecorded(ctx, err)
 		}
-		if err == nil {
-			s.m = stored
-			telemetry.AddAttrs(ctx, slog.String("state", string(s.m.State)))
+		if s.m, s.found, err = h.repo.Lookup(ctx, id); err != nil {
+			return bootOutcome{}, err
 		}
-		if s.m.ID != "" {
-			telemetry.AddAttrs(ctx, slog.String("machine_id", s.m.ID))
-		}
-		// A full fleet and an unidentifiable machine are not failures: the machine
-		// still gets its script, it just is not recorded.
-		return out, noteUnrecorded(ctx, err)
 	}
+}
+
+// decide decides the request for the machine in s at now. attempt counts the
+// boot-next changes seen so far: the last attempt leaves the flag out. An
+// install whose kernel command line cannot fit becomes a row 10 hold.
+func (h *Handlers) decide(ctx context.Context, req Request, s bootState, attempt int, now time.Time) (bootOutcome, error) {
+	var out bootOutcome
+	out.in = Input{TLS: true, Known: s.found, Machine: s.m, Request: req, UnknownAction: s.unknown, Now: now}
+	if s.found && s.m.BootNext != "" && attempt < bootAttempts-1 && flagServesMAC(s.m, req.MAC) {
+		var err error
+		out.in.BootNext, out.in.BootNextSetAt, out.in.PlatformKnown = s.m.BootNext, s.m.BootNextSetAt, req.Platform != ""
+		out.in.Utility, out.entry, err = h.utilityFacts(ctx, s.m.BootNext, req.Arch, req.Platform, now)
+		if err != nil {
+			return bootOutcome{}, err
+		}
+	}
+	if s.found {
+		var err error
+		if out.cmdline, err = h.assignedFacts(ctx, &out.in); err != nil {
+			return bootOutcome{}, err
+		}
+	}
+	out.d = Decide(out.in)
+	out.tooLong = h.installCheck(&out.d, s.m, out.cmdline)
+	return out, nil
+}
+
+// bootRecord is the boot to store for the decision out made on the machine in s.
+func bootRecord(id fleet.Identity, req Request, s bootState, out bootOutcome) fleet.BootRecord {
+	d := out.d
+	rec := fleet.BootRecord{
+		Identity: id, Arch: req.Arch, MachineID: s.m.ID, Trigger: d.Trigger, Conflict: d.Row == 2, MarkJunk: d.MarkJunk,
+		Event: fleet.BootEvent{Row: d.Row, Action: string(d.Action), Reason: d.Reason}, At: out.in.Now,
+		ObserveIdentity: s.found && !s.m.IdentityObserved,
+	}
+	if d.BootNextClear != "" {
+		rec.ClearBootNext = &fleet.BootNextClear{Entry: s.m.BootNext, SetAt: s.m.BootNextSetAt, Reason: d.BootNextClear}
+	}
+	if d.WantUtility && out.entry.Entry != "" {
+		rec.WantFetch = &fleet.FetchWant{Key: fleet.CacheKey{Entry: s.m.BootNext, Arch: req.Arch}, Pin: out.entry.Pin.ID}
+	}
+	return rec
 }
 
 // flagServesMAC reports whether m's boot-next is for a boot from mac. A junk
@@ -362,9 +426,9 @@ func flagServesMAC(m fleet.Machine, mac string) bool {
 	return !m.Junk || (m.BootNextMAC != "" && m.BootNextMAC == mac)
 }
 
-// countAlert counts one raised uuid_conflict alert.
-func (h *Handlers) countAlert(ctx context.Context) {
-	h.alerts.Add(ctx, 1, metric.WithAttributes(attribute.String("kind", alertKindUUIDConflict)))
+// countAlert counts one raised alert of kind.
+func (h *Handlers) countAlert(ctx context.Context, kind string) {
+	h.alerts.Add(ctx, 1, metric.WithAttributes(attribute.String("kind", kind)))
 }
 
 // noteUnrecorded notes on the request's wide event why RecordBoot stored
@@ -382,13 +446,15 @@ func noteUnrecorded(ctx context.Context, err error) error {
 	return err
 }
 
-// serve renders d, counts it and answers with the script. A utility decision
-// answers with the recipe of utility, the catalog entry it names.
-func (h *Handlers) serve(w http.ResponseWriter, r *http.Request, d Decision, utility catalog.Entry) {
-	var script string
+// serve renders out's decision, counts it and answers with the script. A
+// utility decision answers with the recipe of out's catalog entry, and an
+// install with out's install script.
+func (h *Handlers) serve(w http.ResponseWriter, r *http.Request, out bootOutcome) {
+	d := out.d
+	script := out.script
 	if d.Action == ActionUtility {
-		script = utility.Script(h.address)
-	} else {
+		script = out.entry.Script(h.address)
+	} else if d.Action != ActionInstall {
 		var err error
 		if script, err = Render(d, h.fqdn); err != nil {
 			h.internalError(w, r, err)
@@ -465,15 +531,6 @@ func (w idleWriter) Write(b []byte) (int, error) {
 
 // Unwrap lets http.ResponseController reach the connection.
 func (w idleWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
-
-// fallback turns the decision that cannot be carried out yet into a hold:
-// install needs a config ticket (M3). Every other field of d is kept.
-func fallback(d Decision) Decision {
-	if d.NeedsTicket {
-		d.Action, d.Reason = ActionHold, reasonNoTicket
-	}
-	return d
-}
 
 // parseBootQuery reads the /boot query into a Request. UUID and MAC are
 // normalized, and "" when malformed; Serial and Product are text with NUL bytes

@@ -17,12 +17,12 @@ const (
 var readyFacts = UtilityFacts{InCatalog: true, Supported: true, Ready: true}
 
 // known is a TLS request from a recorded machine in state s whose serial and
-// product match the request. UnknownAction is local.
+// product match the request and were observed. UnknownAction is local.
 func known(s fleet.State, mods ...func(*Input)) Input {
 	in := Input{
 		TLS:           true,
 		Known:         true,
-		Machine:       fleet.Machine{State: s, Serial: "S1", Product: "P1"},
+		Machine:       fleet.Machine{State: s, Serial: "S1", Product: "P1", IdentityObserved: true},
 		Request:       Request{Serial: "S1", Product: "P1"},
 		UnknownAction: fleet.UnknownActionLocal,
 	}
@@ -147,6 +147,30 @@ func TestDecide(t *testing.T) {
 			Decision{Row: 5, Action: ActionHold, Reason: "machine is cordoned"}})
 	}
 
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := Decide(tc.in); got != tc.want {
+				t.Errorf("Decide() = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDecide_UnobservedSkipsRow2 pins that a machine whose identity was never
+// observed, such as one created by adopting its UUID, is decided by rows 3 to
+// 10 whatever serial and product the request reports.
+func TestDecide_UnobservedSkipsRow2(t *testing.T) {
+	unobserved := func(in *Input) { in.Machine.IdentityObserved = false }
+	cases := []struct {
+		name string
+		in   Input
+		want Decision
+	}{
+		{"installed, other serial", known(fleet.StateInstalled, unobserved, withSerial("S2")), Decision{Row: 6, Action: ActionExit}},
+		{"installed, other product", known(fleet.StateInstalled, unobserved, withProduct("P2")), Decision{Row: 6, Action: ActionExit}},
+		{"assigned, empty stored serial", known(fleet.StateAssigned, unobserved, func(in *Input) { in.Machine.Serial, in.Machine.Product = "", "" }),
+			Decision{Row: 8, Action: ActionHold, Reason: "boot assets not ready"}},
+	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := Decide(tc.in); got != tc.want {
