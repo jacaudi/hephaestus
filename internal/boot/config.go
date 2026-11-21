@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"slices"
+	"strconv"
 	"sync"
 	"time"
 
@@ -31,6 +32,12 @@ const (
 	// recording that still fails is given up and alerted.
 	recordRetryBase = time.Second
 	recordGiveUp    = time.Hour
+	// recordFirstTry bounds the try to record a delivery made while the response
+	// is still open: its end reaches the client only when the handler returns,
+	// so a slow database becomes a retry instead of a response cut off by the
+	// write deadline (scriptDeadline). A try that commits as it times out is
+	// found consumed by the retry.
+	recordFirstTry = 2 * time.Second
 
 	outcomeServed          = "served"
 	actionConfigRefused    = "config.refused"
@@ -130,8 +137,11 @@ func (h *Handlers) config(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.countConfig(ctx, outcomeServed)
-	// The body has left: a client that goes away now must not stop the record.
-	h.recordServed(context.WithoutCancel(ctx), t, m.State, now)
+	// The body is flushed: a client that goes away now must not stop the record,
+	// but the response ends only when this returns, so the record is bounded.
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), recordFirstTry)
+	defer cancel()
+	h.recordServed(rctx, t, m.State, now)
 }
 
 // configTicket finds the ticket of the query's t and its machine, which must be
@@ -221,14 +231,17 @@ func (h *Handlers) renderConfig(ctx context.Context, t fleet.Ticket) ([]byte, re
 	return nil, refusedRenderError
 }
 
-// writeConfig answers 200 with body under a write deadline and flushes it: nil
-// means the whole body has left.
+// writeConfig answers 200 with body, its Content-Length set, under a write
+// deadline and flushes it: nil means every byte was handed to the connection.
+// The response ends for the client when the handler returns (for HTTP/1.1, at
+// the last byte, which Content-Length marks).
 func writeConfig(w http.ResponseWriter, body []byte) error {
 	if err := setWriteDeadline(w, scriptDeadline); err != nil {
 		return err
 	}
 	w.Header().Set("Content-Type", contentTypeYAML)
 	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	if _, err := w.Write(body); err != nil { //nolint:gosec // G705: the body is the server's own render of the approved pair, served as YAML; no request text reaches it
 		return fmt.Errorf("boot: write config: %w", err)
 	}

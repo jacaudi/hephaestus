@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -707,5 +708,83 @@ func TestConfig_RecordingRetryRecordsRevokedTicket(t *testing.T) {
 	}
 	if n := c.audits("alert.config_unrecorded"); n != 0 {
 		t.Errorf("alert audits = %d, want 0", n)
+	}
+}
+
+// TestConfig_SlowRecordDoesNotHoldResponse pins that the response ends with
+// the whole body well inside the write deadline when the first recording try
+// hangs, on HTTP/1.1 and h2, and that the retry records the delivery later.
+func TestConfig_SlowRecordDoesNotHoldResponse(t *testing.T) {
+	for _, h2 := range []bool{false, true} {
+		t.Run(fmt.Sprintf("h2=%t", h2), func(t *testing.T) {
+			c := newConfigRig(t)
+			defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+			c.h.retryBase = time.Millisecond
+			s := &scriptedRecord{answer: func(ctx context.Context, req fleet.RecordConfigRequest, n int) (fleet.RecordConfigResult, error) {
+				if n > 0 {
+					return c.repo.RecordConfigServed(ctx, req)
+				}
+				select { // a database that does not answer
+				case <-ctx.Done():
+					return fleet.RecordConfigResult{}, ctx.Err()
+				case <-time.After(scriptDeadline - 2*time.Second):
+					return fleet.RecordConfigResult{}, errDBDown
+				}
+			}}
+			c.h.record = s.record
+			tls := c.h.TLS()
+			srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				r.RemoteAddr = testClientAddr // the provisioning subnet
+				tls.ServeHTTP(w, r)
+			}))
+			srv.EnableHTTP2 = h2
+			srv.StartTLS()
+			defer srv.Close()
+			client := srv.Client()
+			transport, ok := client.Transport.(*http.Transport)
+			if !ok {
+				t.Fatalf("client transport is %T, want *http.Transport", client.Transport)
+			}
+			transport.DisableKeepAlives = true
+			defer client.CloseIdleConnections()
+
+			start := time.Now()
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL+configQ(bootUUID, c.token), http.NoBody)
+			if err != nil {
+				t.Fatalf("NewRequest: %v", err)
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatalf("GET /config: %v", err)
+			}
+			body, err := io.ReadAll(resp.Body)
+			elapsed := time.Since(start)
+			if cerr := resp.Body.Close(); cerr != nil {
+				t.Errorf("close body: %v", cerr)
+			}
+
+			if err != nil || string(body) != configYAML || resp.StatusCode != http.StatusOK {
+				t.Fatalf("GET /config = %d, %q, %v; want 200 with the whole render", resp.StatusCode, body, err)
+			}
+			if (resp.ProtoMajor == 2) != h2 {
+				t.Errorf("protocol %s, want h2 %t", resp.Proto, h2)
+			}
+			if resp.ContentLength != int64(len(configYAML)) {
+				t.Errorf("Content-Length = %d, want %d", resp.ContentLength, len(configYAML))
+			}
+			if limit := scriptDeadline / 2; elapsed >= limit {
+				t.Errorf("the response took %v, want under %v", elapsed.Round(time.Millisecond), limit)
+			}
+
+			// On HTTP/1.1 the client is done before the handler's first try ends.
+			eventually(t, "the first try to give way", func() bool { return c.pending() == 1 })
+			stop := c.runRecorder()
+			defer stop()
+			eventually(t, "the retry", func() bool { return c.pending() == 0 })
+			stop()
+			if !c.consumed() || c.machine().State != fleet.StateInstalling {
+				t.Errorf("consumed %t, state %s; want the delivery recorded by the retry", c.consumed(), c.machine().State)
+			}
+		})
 	}
 }
