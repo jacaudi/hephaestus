@@ -3,16 +3,20 @@ package clusters
 import (
 	"compress/zlib"
 	"context"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"math/rand/v2"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -295,6 +299,74 @@ func TestGit_CorruptPackMovesAside(t *testing.T) {
 	if moved, ok, err := fresh.moveAside(gitT0.Add(30 * time.Minute)); ok || err != nil {
 		t.Errorf("a second moveAside within the hour = %q, %v, %v; want ok false", moved, ok, err)
 	}
+}
+
+// credentialRecorder is an HTTP handler that records whether any request carried an Authorization header, and answers
+// 401 so a fetch that reaches it ends.
+type credentialRecorder struct {
+	mu      sync.Mutex
+	asked   int
+	carried int
+}
+
+func (c *credentialRecorder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.asked++
+	if r.Header.Get("Authorization") != "" {
+		c.carried++
+	}
+	w.WriteHeader(http.StatusUnauthorized)
+}
+
+// TestGit_FetchCredentialStaysOnTheConfiguredOrigin: a repository host that redirects the fetch to plain HTTP, or to
+// another origin, is not sent the cluster's credential.
+func TestGit_FetchCredentialStaysOnTheConfiguredOrigin(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	plain := &credentialRecorder{}
+	plainSrv := httptest.NewServer(plain)
+	defer plainSrv.Close()
+	other := &credentialRecorder{}
+	otherSrv := httptest.NewTLSServer(other)
+	defer otherSrv.Close()
+
+	tests := []struct {
+		name     string
+		location string
+		got      *credentialRecorder
+	}{
+		{"redirect to plain HTTP", plainSrv.URL, plain},
+		{"redirect to another origin", otherSrv.URL, other},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			redirecting := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Redirect(w, r, tt.location+r.URL.RequestURI(), http.StatusFound)
+			}))
+			defer redirecting.Close()
+			g := newGitStore(filepath.Join(t.TempDir(), "git"), func() time.Time { return gitT0 })
+			g.caBundle = slices.Concat(certPEM(redirecting), certPEM(otherSrv))
+
+			_, err := g.fetch(t.Context(), gitCluster, gitSource{
+				URL: redirecting.URL + "/r.git", Ref: gitBranch, Username: "deploy", Password: secret.Secret("dummy-token"),
+			})
+
+			if err == nil {
+				t.Fatal("fetch through a redirect succeeded")
+			}
+			tt.got.mu.Lock()
+			defer tt.got.mu.Unlock()
+			if tt.got.carried != 0 {
+				t.Errorf("the redirect target received the credential on %d of %d requests, want 0", tt.got.carried, tt.got.asked)
+			}
+		})
+	}
+}
+
+// certPEM is the PEM of the certificate srv serves, to trust it.
+func certPEM(srv *httptest.Server) []byte {
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})
 }
 
 // TestGit_ReadTreeBoundsWhatItReads: a tree with more paths or more bytes than the store's bounds is refused with a
