@@ -645,15 +645,15 @@ func runTicketSuite(t *testing.T, open func(testing.TB) *db.DB, pair func(testin
 		seedTicket(t, d, t0, Ticket{MachineID: ms[1].ID, ConsumedAt: t0.Add(time.Minute)})
 		seedTicket(t, d, t0, Ticket{MachineID: ms[2].ID, RevokedAt: t0.Add(time.Minute)})
 		seedTicket(t, d, t0, Ticket{MachineID: ms[3].ID, MintedAt: cutoff.Add(time.Minute)})
-		// Expired before the cutoff: it can no longer be fetched at all.
-		seedTicket(t, d, t0, Ticket{MachineID: ms[4].ID, MintedAt: t0.Add(-4 * time.Hour), ExpiresAt: t0.Add(-time.Hour)})
+		// Expired before the cutoff and never revoked: its machine is still waiting, so it is reported.
+		expired := seedTicket(t, d, t0, Ticket{MachineID: ms[4].ID, MintedAt: t0.Add(-4 * time.Hour), ExpiresAt: t0.Add(-time.Hour)})
 
 		got, err := r.PendingTickets(t.Context(), cutoff)
 		if err != nil {
 			t.Fatalf("PendingTickets: %v", err)
 		}
-		if len(got) != 1 || got[0].ID != pending.ID {
-			t.Fatalf("PendingTickets = %+v, want only %s (live, unexpired, unconsumed, minted before the cutoff)", got, pending.ID)
+		if len(got) != 2 || got[0].ID != expired.ID || got[1].ID != pending.ID {
+			t.Fatalf("PendingTickets = %+v, want %s then %s (unconsumed, unrevoked, minted before the cutoff, expired or not)", got, expired.ID, pending.ID)
 		}
 	})
 

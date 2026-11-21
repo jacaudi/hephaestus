@@ -19,15 +19,36 @@ const (
 )
 
 func TestConfigPendingCheck_Runbook(t *testing.T) {
+	const (
+		notAsked  = "has not asked for its config"
+		asked     = "asked for its config at"
+		unrecover = "machine unassign, then machine adopt"
+		// recordedNotReceived is the remedy of a machine that is installing, which no live ticket belongs to.
+		recordedNotReceived = "machine abort"
+	)
 	tests := []struct {
 		name      string
 		requested bool
 		at        time.Duration
 		want      admin.Status
+		wantText  []string
+		denyText  []string
 	}{
-		{name: "unrequested for 31 minutes", at: 31 * time.Minute, want: admin.StatusWarn},
-		{name: "unrequested for 29 minutes", at: 29 * time.Minute, want: admin.StatusPass},
-		{name: "requested", requested: true, at: 31 * time.Minute, want: admin.StatusPass},
+		{
+			name: "unrequested for 31 minutes", at: 31 * time.Minute, want: admin.StatusWarn,
+			wantText: []string{notAsked, "DNS"}, denyText: []string{asked, unrecover, recordedNotReceived},
+		},
+		{
+			name: "unrequested for 29 minutes", at: 29 * time.Minute, want: admin.StatusPass,
+		},
+		{
+			name: "unrequested after the ticket expired", at: fleet.TicketTTL + 30*time.Minute, want: admin.StatusWarn,
+			wantText: []string{notAsked}, denyText: []string{asked},
+		},
+		{
+			name: "requested and still live after 31 minutes", requested: true, at: 31 * time.Minute, want: admin.StatusWarn,
+			wantText: []string{asked, "config.refused", unrecover}, denyText: []string{notAsked, recordedNotReceived},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -64,14 +85,15 @@ func TestConfigPendingCheck_Runbook(t *testing.T) {
 			if tt.want != admin.StatusWarn {
 				return
 			}
-			// The runbook is spelled out here, not read from the production constants, so a changed branch fails.
-			for _, want := range []string{
-				m.ID,
-				"installing: machine abort, then reboot",
-				"install-unconfirmed: topf reset, machine reinstall --topf-reset-full-done, then reboot",
-			} {
+			// The remedies are spelled out here, not read from the production constants, so a changed one fails.
+			for _, want := range append([]string{m.ID}, tt.wantText...) {
 				if !strings.Contains(res.Output, want) {
 					t.Errorf("output %q lacks %q", res.Output, want)
+				}
+			}
+			for _, deny := range tt.denyText {
+				if strings.Contains(res.Output, deny) {
+					t.Errorf("output %q holds %q, the remedy of another state", res.Output, deny)
 				}
 			}
 		})

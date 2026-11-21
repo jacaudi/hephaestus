@@ -307,17 +307,16 @@ func (r *Repository) PruneTickets(ctx context.Context, before time.Time) (int, e
 	return int(n), nil
 }
 
-// PendingTickets returns the tickets that are live, neither consumed nor
-// expired, and were minted before mintedBefore: configs that should have been
-// fetched by now. A ticket is unexpired when it expires after mintedBefore,
-// which is the caller's now less its grace period. They are ordered by mint
-// time.
+// PendingTickets returns the tickets that are neither consumed nor revoked and
+// were minted before mintedBefore: configs that should have been delivered by
+// now. An expired ticket stays until the machine's next boot revokes it, since
+// its machine is still waiting. They are ordered by mint time.
 func (r *Repository) PendingTickets(ctx context.Context, mintedBefore time.Time) ([]Ticket, error) {
 	at := stamp(mintedBefore)
 	var out []Ticket
 	err := r.bdb.NewSelect().Model(&out).
 		Where("consumed_at IS NULL").Where("revoked_at IS NULL").
-		Where("minted_at < ?", at).Where("expires_at > ?", at).
+		Where("minted_at < ?", at).
 		Order("minted_at", "id").Scan(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("fleet: pending tickets: %w", err)
