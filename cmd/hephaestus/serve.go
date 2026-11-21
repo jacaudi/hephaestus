@@ -68,8 +68,9 @@ Configuration comes from the environment. Required:
                                      was not sealed with stops serve
 
 The 1Password service account token is HEPHAESTUS_OP_TOKEN, or a file holding it
-in HEPHAESTUS_OP_TOKEN_FILE: set at most one. Without it serve still starts, and
-every cluster fails closed until it is set.
+in HEPHAESTUS_OP_TOKEN_FILE: set at most one. Without it serve still starts and
+keeps serving approved configs; a new tree, a refresh and a first credential are
+refused until it is set.
 
 TLS comes from one of two sources, chosen by HEPHAESTUS_TLS_MODE:
   file (default)  HEPHAESTUS_TLS_CERT_FILE and HEPHAESTUS_TLS_KEY_FILE name a
@@ -91,6 +92,7 @@ The process stops on SIGINT or SIGTERM after draining in-flight requests.`,
   HEPHAESTUS_PROVISIONING_INTERFACE=vlan20 \
   HEPHAESTUS_PROVISIONING_ADDRESS=10.10.20.5 \
   HEPHAESTUS_PROVISIONING_SUBNET=10.10.20.0/24 \
+  HEPHAESTUS_DATA_KEY_FILE=/run/secrets/hephaestus-data-key \
   HEPHAESTUS_TLS_CERT_FILE=/certs/fullchain.pem \
   HEPHAESTUS_TLS_KEY_FILE=/certs/privkey.pem \
   hephaestus serve`,

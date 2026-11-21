@@ -1572,6 +1572,18 @@ func TestRunServe_ShutdownOrderClearsProcessing(t *testing.T) {
 	}
 }
 
+// TestServeHelp_ExampleStartsServe: the example sets every variable serve requires, the data key included, and the
+// help says what keeps working without the 1Password token.
+func TestServeHelp_ExampleStartsServe(t *testing.T) {
+	cmd := newServeCmd()
+	if !strings.Contains(cmd.Example, "HEPHAESTUS_DATA_KEY_FILE=") {
+		t.Errorf("serve's example does not set the data key:\n%s", cmd.Example)
+	}
+	if strings.Contains(cmd.Long, "fails closed") || !strings.Contains(cmd.Long, "approved configs") {
+		t.Errorf("serve's help does not say that approved configs keep serving without the token:\n%s", cmd.Long)
+	}
+}
+
 // TestServeHelp_ListsSecretVariables: serve's help names the data key and the
 // 1Password token variables loadConfig reads, with their _FILE forms.
 func TestServeHelp_ListsSecretVariables(t *testing.T) {
