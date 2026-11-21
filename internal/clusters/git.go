@@ -165,7 +165,7 @@ func (g *gitStore) readTree(ctx context.Context, clusterID, tree string) (fs.FS,
 	}
 
 	g.expected[tree] = struct{}{}
-	return memFS{files: files}, nil
+	return newMemFS(files), nil
 }
 
 // fileMode is the fs.FileMode of a file of a git tree.

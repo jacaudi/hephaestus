@@ -23,9 +23,53 @@ type memFile struct {
 // directories between them implied. It has the semantics testing/fstest.MapFS has, which the vendored loader relies
 // on: Open follows links that stay inside the tree, ReadDir reports a link with fs.ModeSymlink, and ReadLink and Lstat
 // do not follow the last link. Unlike MapFS, a path that needs more than maxLinks links (a cycle, for example) is
-// fs.ErrNotExist instead of a stack overflow. The zero value is an empty tree.
+// fs.ErrNotExist instead of a stack overflow. The zero value is an empty tree; newMemFS builds one from files.
 type memFS struct {
 	files map[string]memFile
+	// dirs holds each directory that has a file below it by its path, "." for the root, so listing one does not read
+	// every file of the tree.
+	dirs map[string]*memDir
+}
+
+// memDir is what one directory holds: the files directly in it, and the names of its subdirectories.
+type memDir struct {
+	files   map[string]memFile
+	subdirs map[string]struct{}
+}
+
+// newMemFS returns the file system of files, indexed by directory.
+func newMemFS(files map[string]memFile) memFS {
+	dirs := map[string]*memDir{}
+	dir := func(name string) *memDir {
+		d, ok := dirs[name]
+		if !ok {
+			d = &memDir{}
+			dirs[name] = d
+		}
+		return d
+	}
+	for name, file := range files {
+		parent := path.Dir(name)
+		d := dir(parent)
+		if d.files == nil {
+			d.files = map[string]memFile{}
+		}
+		d.files[path.Base(name)] = file
+
+		// Each ancestor learns of the subdirectory below it; one that already knows ends the climb.
+		for parent != "." && parent != "/" {
+			up := dir(path.Dir(parent))
+			if _, known := up.subdirs[path.Base(parent)]; known {
+				break
+			}
+			if up.subdirs == nil {
+				up.subdirs = map[string]struct{}{}
+			}
+			up.subdirs[path.Base(parent)] = struct{}{}
+			parent = path.Dir(parent)
+		}
+	}
+	return memFS{files: files, dirs: dirs}
 }
 
 var (
@@ -103,34 +147,20 @@ func (m memFS) lstat(name string) (memInfo, error) {
 // list returns the entries of the directory dir, sorted by name, and whether the directory exists: the root always
 // does, any other directory only when a file lies below it.
 func (m memFS) list(dir string) ([]fs.DirEntry, bool) {
-	prefix := ""
-	if dir != "." {
-		prefix = dir + "/"
-	}
-
-	children := map[string]memFile{}
-	subdirs := map[string]struct{}{}
-	for name, file := range m.files {
-		rest, ok := strings.CutPrefix(name, prefix)
-		if !ok {
-			continue
-		}
-		if elem, _, nested := strings.Cut(rest, "/"); nested {
-			subdirs[elem] = struct{}{}
-		} else {
-			children[elem] = file
-		}
-	}
-	if dir != "." && len(children) == 0 && len(subdirs) == 0 {
+	d, found := m.dirs[dir]
+	if !found && dir != "." {
 		return nil, false
 	}
+	if d == nil {
+		return nil, true
+	}
 
-	entries := make([]fs.DirEntry, 0, len(children)+len(subdirs))
-	for elem, file := range children {
+	entries := make([]fs.DirEntry, 0, len(d.files)+len(d.subdirs))
+	for elem, file := range d.files {
 		entries = append(entries, memInfo{name: elem, file: file})
 	}
-	for elem := range subdirs {
-		if _, isFile := children[elem]; !isFile {
+	for elem := range d.subdirs {
+		if _, isFile := d.files[elem]; !isFile {
 			entries = append(entries, memInfo{name: elem, file: memFile{mode: fs.ModeDir | 0o555}})
 		}
 	}

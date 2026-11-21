@@ -7,6 +7,7 @@ import (
 	"slices"
 	"testing"
 	"testing/fstest"
+	"time"
 
 	"go.jacaudi.dev/hephaestus/internal/render"
 )
@@ -31,17 +32,17 @@ func linkChain(n int) memFS {
 		}
 		files[fmt.Sprintf("l%d", i)] = link(target)
 	}
-	return memFS{files: files}
+	return newMemFS(files)
 }
 
 func TestMemFS_FSTest(t *testing.T) {
-	m := memFS{files: map[string]memFile{
+	m := newMemFS(map[string]memFile{
 		"a.txt":      regular("a"),
 		"dir/b.txt":  regular("b"),
 		"dir/c/d.go": regular("d"),
 		"link.txt":   link("a.txt"),
 		"dirlink":    link("dir"),
-	}}
+	})
 
 	if err := fstest.TestFS(m, "a.txt", "dir/b.txt", "dir/c/d.go", "link.txt"); err != nil {
 		t.Fatal(err)
@@ -49,14 +50,14 @@ func TestMemFS_FSTest(t *testing.T) {
 }
 
 func TestMemFS_Links(t *testing.T) {
-	m := memFS{files: map[string]memFile{
+	m := newMemFS(map[string]memFile{
 		"dir/b.txt": regular("b"),
 		"link.txt":  link("dir/b.txt"),
 		"dirlink":   link("dir"),
 		"up/in":     link("../dir/b.txt"),
 		"out":       link("../outside"),
 		"abs":       link("/etc/hostname"),
-	}}
+	})
 
 	if got, err := fs.ReadFile(m, "link.txt"); err != nil || string(got) != "b" {
 		t.Errorf("ReadFile(link.txt) = %q, %v; want b", got, err)
@@ -99,7 +100,7 @@ func TestMemFS_Links(t *testing.T) {
 }
 
 func TestMemFS_SymlinkCycleBounded(t *testing.T) {
-	cycle := memFS{files: map[string]memFile{"p": link("q"), "q": link("p"), "d": link("d")}}
+	cycle := newMemFS(map[string]memFile{"p": link("q"), "q": link("p"), "d": link("d")})
 
 	for _, name := range []string{"p", "q", "d", "d/x"} {
 		checks := map[string]func() error{
@@ -126,7 +127,7 @@ func TestMemFS_SymlinkCycleBounded(t *testing.T) {
 }
 
 func TestMemFS_LoadTopfInCycle(t *testing.T) {
-	m := memFS{files: map[string]memFile{"topf.yaml": link("a"), "a": link("topf.yaml")}}
+	m := newMemFS(map[string]memFile{"topf.yaml": link("a"), "a": link("topf.yaml")})
 
 	_, err := render.Load(m)
 	refusal, ok := errors.AsType[*render.RefusalError](err)
@@ -140,7 +141,7 @@ func TestMemFS_LoadTopfInCycle(t *testing.T) {
 }
 
 func FuzzMemFSPaths(f *testing.F) {
-	m := memFS{files: map[string]memFile{
+	m := newMemFS(map[string]memFile{
 		"a.txt":     regular("a"),
 		"dir/b.txt": regular("b"),
 		"link.txt":  link("dir/b.txt"),
@@ -149,7 +150,7 @@ func FuzzMemFSPaths(f *testing.F) {
 		"abs":       link("/etc/hostname"),
 		"p":         link("q"),
 		"q":         link("p"),
-	}}
+	})
 	known := map[string]bool{"a": true, "b": true}
 
 	for _, seed := range []string{"", ".", "..", "/", "/etc/hostname", "a.txt", "dir", "dir/b.txt", "dir/../a.txt", "dirlink/b.txt",
@@ -181,4 +182,30 @@ func FuzzMemFSPaths(f *testing.F) {
 			t.Errorf("ReadFile(%q) = %q, which is not tree content", name, data)
 		}
 	})
+}
+
+// TestMemFS_WalkOfManyDirectoriesIsLinear: listing every directory of a tree of many directories costs about one pass
+// over the files in all, not one pass per directory. A tree like this is a few kilobytes of git objects.
+func TestMemFS_WalkOfManyDirectoriesIsLinear(t *testing.T) {
+	const dirs = 30000
+	files := make(map[string]memFile, dirs)
+	for i := range dirs {
+		files[fmt.Sprintf("d%d/f.txt", i)] = regular("x")
+	}
+	m := newMemFS(files)
+
+	start := time.Now()
+	for i := range dirs {
+		entries, err := m.ReadDir(fmt.Sprintf("d%d", i))
+		if err != nil || len(entries) != 1 {
+			t.Fatalf("ReadDir(d%d) = %d entries, %v; want 1", i, len(entries), err)
+		}
+	}
+	root, err := m.ReadDir(".")
+	if err != nil || len(root) != dirs {
+		t.Fatalf("ReadDir(.) = %d entries, %v; want %d", len(root), err, dirs)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("listing %d directories took %v, want under 2s", dirs, elapsed)
+	}
 }
