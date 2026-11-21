@@ -154,6 +154,17 @@ func TestClusterImport_Duplicate(t *testing.T) {
 	}
 }
 
+// TestClusterRefHelp_NamesABranch: the fetch only follows a branch, so the help of both commands that take --ref says so.
+func TestClusterRefHelp_NamesABranch(t *testing.T) {
+	c := newCLITest(t)
+	for _, sub := range []string{"import", "set"} {
+		out := c.mustRun(t, "cluster", sub, "--help")
+		if !strings.Contains(out, "branch to follow") || strings.Contains(out, "tag") {
+			t.Errorf("cluster %s help does not describe --ref as a branch to follow:\n%s", sub, out)
+		}
+	}
+}
+
 func TestClusterSet_ChangedRef(t *testing.T) {
 	c := newCLITest(t)
 	c.importLab(t)

@@ -199,7 +199,7 @@ one ref+op:// reference to its password or token, which serve resolves.`,
 	}
 	cmd.Flags().BoolVar(&asJSON, "json", false, "print the result as JSON")
 	cmd.Flags().StringVar(&repoURL, "repo", "", "https URL of the git repository, without a user or password (required)")
-	cmd.Flags().StringVar(&ref, "ref", "", "branch or tag to follow (required)")
+	cmd.Flags().StringVar(&ref, "ref", "", "branch to follow (required)")
 	cmd.Flags().StringVar(&path, "path", "", "path of the cluster's directory in the repository (required)")
 	cmd.Flags().StringVar(&username, "username", "", "username for a private repository")
 	cmd.Flags().StringVar(&credentialID, "credential", "", "ref+op:// reference to the repository's password or token")
@@ -246,7 +246,7 @@ or a credential.`,
 	}
 	cmd.Flags().BoolVar(&asJSON, "json", false, "print the result as JSON")
 	cmd.Flags().StringVar(&repoURL, "repo", "", "https URL of the git repository, without a user or password")
-	cmd.Flags().StringVar(&ref, "ref", "", "branch or tag to follow")
+	cmd.Flags().StringVar(&ref, "ref", "", "branch to follow")
 	cmd.Flags().StringVar(&path, "path", "", "path of the cluster's directory in the repository")
 	cmd.Flags().StringVar(&username, "username", "", "username for a private repository")
 	cmd.Flags().StringVar(&credentialID, "credential", "", "ref+op:// reference to the repository's password or token")
