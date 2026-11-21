@@ -267,7 +267,7 @@ type TransitionRequest struct {
 // audits it, as TransitionTx does inside a caller's.
 func (r *Repository) Transition(ctx context.Context, req TransitionRequest) (Machine, error) {
 	var out Machine
-	err := r.bdb.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
+	err := db.RunInTxRetry(ctx, r.bdb, func(ctx context.Context, tx bun.Tx) error {
 		var err error
 		out, err = TransitionTx(ctx, tx, req)
 		return err
@@ -611,6 +611,20 @@ func loadMachine(ctx context.Context, q bun.IDB, id string) (Machine, error) {
 	return m, nil
 }
 
+// loadLockedMachine is loadMachine for a caller that goes on to write the
+// machine: it holds the row (lockMachine) until the caller's transaction ends,
+// so what it read is what the write replaces.
+func loadLockedMachine(ctx context.Context, q bun.IDB, id string) (Machine, error) {
+	m, err := lockMachine(ctx, q, id)
+	if err != nil {
+		return Machine{}, err
+	}
+	if err := hydrate(ctx, q, &m); err != nil {
+		return Machine{}, err
+	}
+	return m, nil
+}
+
 // hydrateAll is hydrate for every machine of ms.
 func hydrateAll(ctx context.Context, q bun.IDB, ms []Machine) error {
 	for i := range ms {
@@ -734,7 +748,7 @@ func createMachine(ctx context.Context, tx bun.IDB, rec BootRecord) (Machine, er
 // recordKnownBoot applies a boot of an existing machine and returns the state
 // it was in and the machine after.
 func recordKnownBoot(ctx context.Context, tx bun.IDB, rec BootRecord) (State, Machine, error) {
-	m, err := loadMachine(ctx, tx, rec.MachineID)
+	m, err := loadLockedMachine(ctx, tx, rec.MachineID)
 	if err != nil {
 		return StateNone, Machine{}, err
 	}
@@ -863,8 +877,9 @@ func holdCoalesced(ctx context.Context, q bun.IDB, machineID, reason string, at 
 }
 
 // TransitionTx applies req.Trigger to the machine inside the caller's
-// transaction q and audits it. A refused transition returns a *TransitionError
-// and writes nothing. The binding columns follow design section 5.2: approve,
+// transaction q and audits it. It reads the machine under its row lock (on
+// Postgres), so the state it applies the trigger to is the state it replaces. A refused transition returns a
+// *TransitionError and writes nothing. The binding columns follow design section 5.2: approve,
 // adopt and rebind set them from req.Bind, unassign and unbind clear them, and
 // every other trigger leaves them. A bind the unique index refuses is the
 // *TransitionError "host_bound". A trigger that ends in StateNone (forget)
@@ -873,7 +888,7 @@ func holdCoalesced(ctx context.Context, q bun.IDB, machineID, reason string, at 
 // tickets. A transition into assigned re-arms the failed or broken talos_cache
 // row of the machine's Talos tuple and arch, creating none.
 func TransitionTx(ctx context.Context, q bun.IDB, req TransitionRequest) (Machine, error) {
-	m, err := loadMachine(ctx, q, req.MachineID)
+	m, err := loadLockedMachine(ctx, q, req.MachineID)
 	if err != nil {
 		return Machine{}, err
 	}
