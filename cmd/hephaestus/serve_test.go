@@ -1458,7 +1458,7 @@ func TestRunServe_StartsWithoutOPToken(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Import: %v", err)
 	}
-	if err := clusterRepo.RequestRefresh(t.Context(), "lab", time.Now()); err != nil {
+	if err := clusterRepo.RequestRefresh(t.Context(), "lab", fleet.ActorCLI, time.Now()); err != nil {
 		t.Fatalf("RequestRefresh: %v", err)
 	}
 	deps = testDeps(t, root)

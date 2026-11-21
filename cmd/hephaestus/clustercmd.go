@@ -611,7 +611,7 @@ anything changed.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			name := args[0]
 			return withCLI(cmd, deps, func(s cliStores) error {
-				if err := s.Clusters.RequestRefresh(cmd.Context(), name, deps.now()); err != nil {
+				if err := s.Clusters.RequestRefresh(cmd.Context(), name, fleet.ActorCLI, deps.now()); err != nil {
 					return clusterErr(err, name)
 				}
 				if asJSON {

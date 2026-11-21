@@ -557,6 +557,9 @@ func TestClusterRefresh_SetsFlag(t *testing.T) {
 	if stored, err := c.clusters.Get(t.Context(), labName); err != nil || !stored.RefreshRequested {
 		t.Errorf("stored = %+v, %v; want the refresh flag set", stored, err)
 	}
+	if actor, detail := c.audit(t, "cluster.refresh_requested"); actor != fleet.ActorCLI || detail != `{"name":"lab"}` {
+		t.Errorf("audit actor = %q, detail = %s; want %q and the cluster's name", actor, detail, fleet.ActorCLI)
+	}
 	_, err := c.run(t, "cluster", "refresh", "nope")
 	if err == nil || !strings.Contains(err.Error(), "no cluster named nope") {
 		t.Errorf("unknown cluster: error = %v, want one saying no cluster is named nope", err)

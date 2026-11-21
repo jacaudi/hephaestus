@@ -747,7 +747,7 @@ func TestService_MistypedCredentialNotRetried(t *testing.T) {
 		t.Errorf("%d fetches ran without the credential, want 0", n)
 	}
 
-	if err := h.repo.RequestRefresh(t.Context(), labName, h.now); err != nil {
+	if err := h.repo.RequestRefresh(t.Context(), labName, fleet.ActorCLI, h.now); err != nil {
 		t.Fatalf("RequestRefresh: %v", err)
 	}
 	h.poll(s)
@@ -1018,7 +1018,7 @@ func svcRefs(t *testing.T) []string {
 // requestRefresh asks for a refresh of cluster lab, then moves the clock to the next poll.
 func (h *svcHarness) requestRefresh() {
 	h.t.Helper()
-	if err := h.repo.RequestRefresh(h.t.Context(), labName, h.now); err != nil {
+	if err := h.repo.RequestRefresh(h.t.Context(), labName, fleet.ActorCLI, h.now); err != nil {
 		h.t.Fatalf("RequestRefresh: %v", err)
 	}
 	h.now = h.now.Add(PollInterval)

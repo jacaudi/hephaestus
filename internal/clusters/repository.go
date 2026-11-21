@@ -33,9 +33,10 @@ var (
 )
 
 const (
-	actionImported = "cluster.imported"
-	actionSet      = "cluster.set"
-	actionRemoved  = "cluster.removed"
+	actionImported         = "cluster.imported"
+	actionSet              = "cluster.set"
+	actionRemoved          = "cluster.removed"
+	actionRefreshRequested = "cluster.refresh_requested"
 
 	tableClusters = "clusters"
 	tableVersions = "secret_versions"
@@ -159,7 +160,7 @@ type hostRenderRow struct {
 	DriftRedactedSealed []byte `bun:"drift_redacted_sealed,nullzero"`
 }
 
-// nameDetail is the detail of a cluster.imported and a cluster.removed audit event.
+// nameDetail is the detail of a cluster.imported, cluster.removed and cluster.refresh_requested audit event.
 type nameDetail struct {
 	Name string `json:"name"`
 }
@@ -379,12 +380,24 @@ func (r *Repository) List(ctx context.Context) ([]Cluster, error) {
 }
 
 // RequestRefresh asks for a refresh of the cluster: the request flag is set and the backoff and rate limit are
-// cleared, so serve acts at its next pick-up. An unknown name is ErrNotFound.
-func (r *Repository) RequestRefresh(ctx context.Context, name string, _ time.Time) error {
-	q := r.bdb.NewUpdate().Model((*Cluster)(nil)).
-		Set("refresh_requested = ?", true).Set("attempts = 0").Set("next_attempt_at = NULL").Set("rate_limited_until = NULL").
-		Where("name = ?", name)
-	if err := updateOne(ctx, q, ErrNotFound); err != nil {
+// cleared, so serve acts at its next pick-up, and the request is audited as cluster.refresh_requested by actor in
+// the same transaction. An unknown name is ErrNotFound.
+func (r *Repository) RequestRefresh(ctx context.Context, name, actor string, at time.Time) error {
+	at = stamp(at)
+	err := db.RunInTxRetry(ctx, r.bdb, func(ctx context.Context, tx bun.Tx) error {
+		c, err := findCluster(ctx, tx, columnName, name, true)
+		if err != nil {
+			return err
+		}
+		q := tx.NewUpdate().Model((*Cluster)(nil)).
+			Set("refresh_requested = ?", true).Set("attempts = 0").Set("next_attempt_at = NULL").Set("rate_limited_until = NULL").
+			Where("id = ?", c.ID)
+		if err := updateOne(ctx, q, ErrNotFound); err != nil {
+			return err
+		}
+		return fleet.InsertAudit(ctx, tx, fleet.AuditEvent{At: at, Actor: actor, Action: actionRefreshRequested, Detail: nameDetail{Name: name}})
+	})
+	if err != nil {
 		return fmt.Errorf("clusters: request refresh of %s: %w", name, err)
 	}
 	return nil

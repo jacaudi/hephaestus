@@ -463,22 +463,35 @@ func runRepositorySuite(t *testing.T, open func(testing.TB) *db.DB) {
 		r, d := testRepo(t, open)
 		c := mustImport(t, r, labImport(t0))
 		execRaw(t, d, "UPDATE clusters SET attempts = 3, next_attempt_at = ?, rate_limited_until = ? WHERE id = ?", t0.Add(time.Hour), t0.Add(24*time.Hour), c.ID)
-		if err := r.RequestRefresh(t.Context(), labName, t0.Add(time.Minute)); err != nil {
+		if err := r.RequestRefresh(t.Context(), labName, fleet.ActorCLI, t0.Add(time.Minute)); err != nil {
 			t.Fatalf("RequestRefresh: %v", err)
 		}
 		got := mustGet(t, r, labName)
 		if !got.RefreshRequested || got.Attempts != 0 || !got.NextAttemptAt.IsZero() || !got.RateLimitedUntil.IsZero() {
 			t.Fatalf("cluster = %+v, want the flag set and attempts, next attempt and rate limit cleared", got)
 		}
-		if err := r.RequestRefresh(t.Context(), "nope", t0); !errors.Is(err, ErrNotFound) {
+		wantOneAudit(t, d, "cluster.refresh_requested", fleet.ActorCLI, `{"name":"lab"}`)
+		var ev struct {
+			At time.Time `bun:"at"`
+		}
+		if err := d.Bun().NewSelect().TableExpr("audit_events").Column("at").Where("action = ?", "cluster.refresh_requested").Scan(t.Context(), &ev); err != nil {
+			t.Fatalf("read the audit time: %v", err)
+		}
+		if want := t0.Add(time.Minute); !ev.At.Equal(want) {
+			t.Fatalf("audit time = %v, want the request's time %v", ev.At, want)
+		}
+		if err := r.RequestRefresh(t.Context(), "nope", fleet.ActorCLI, t0); !errors.Is(err, ErrNotFound) {
 			t.Fatalf("RequestRefresh of an unknown cluster error = %v, want ErrNotFound", err)
+		}
+		if n := len(auditsOf(t, d, "cluster.refresh_requested")); n != 1 {
+			t.Fatalf("refresh audits = %d after a refused request, want 1", n)
 		}
 	})
 
 	t.Run("MarkConsumesRefresh", func(t *testing.T) {
 		r, _ := testRepo(t, open)
 		c := mustImport(t, r, labImport(t0))
-		if err := r.RequestRefresh(t.Context(), labName, t0); err != nil {
+		if err := r.RequestRefresh(t.Context(), labName, fleet.ActorCLI, t0); err != nil {
 			t.Fatalf("RequestRefresh: %v", err)
 		}
 		mustMark(t, r, c, "T1", TriggerRefresh, t0.Add(time.Minute))
@@ -491,7 +504,7 @@ func runRepositorySuite(t *testing.T, open func(testing.TB) *db.DB) {
 	t.Run("MarkConsumesDaily", func(t *testing.T) {
 		r, _ := testRepo(t, open)
 		c := mustImport(t, r, labImport(t0))
-		if err := r.RequestRefresh(t.Context(), labName, t0); err != nil {
+		if err := r.RequestRefresh(t.Context(), labName, fleet.ActorCLI, t0); err != nil {
 			t.Fatalf("RequestRefresh: %v", err)
 		}
 		at := t0.Add(time.Minute)
@@ -507,7 +520,7 @@ func runRepositorySuite(t *testing.T, open func(testing.TB) *db.DB) {
 			t.Run(string(trigger), func(t *testing.T) {
 				r, _ := testRepo(t, open)
 				c := mustImport(t, r, labImport(t0))
-				if err := r.RequestRefresh(t.Context(), labName, t0); err != nil {
+				if err := r.RequestRefresh(t.Context(), labName, fleet.ActorCLI, t0); err != nil {
 					t.Fatalf("RequestRefresh: %v", err)
 				}
 				mustMark(t, r, c, "T1", trigger, t0.Add(time.Minute))
@@ -521,7 +534,7 @@ func runRepositorySuite(t *testing.T, open func(testing.TB) *db.DB) {
 	t.Run("ConsumeTrigger", func(t *testing.T) {
 		r, _ := testRepo(t, open)
 		c := mustImport(t, r, labImport(t0))
-		if err := r.RequestRefresh(t.Context(), labName, t0); err != nil {
+		if err := r.RequestRefresh(t.Context(), labName, fleet.ActorCLI, t0); err != nil {
 			t.Fatalf("RequestRefresh: %v", err)
 		}
 		at := t0.Add(time.Minute)
@@ -545,7 +558,7 @@ func runRepositorySuite(t *testing.T, open func(testing.TB) *db.DB) {
 	t.Run("ConsumeTriggerRefusedOnStaleRevision", func(t *testing.T) {
 		r, _ := testRepo(t, open)
 		c := mustImport(t, r, labImport(t0))
-		if err := r.RequestRefresh(t.Context(), labName, t0); err != nil {
+		if err := r.RequestRefresh(t.Context(), labName, fleet.ActorCLI, t0); err != nil {
 			t.Fatalf("RequestRefresh: %v", err)
 		}
 		mustSet(t, r, SetRequest{Name: labName, Username: new("other"), At: t0})
@@ -582,7 +595,7 @@ func runRepositorySuite(t *testing.T, open func(testing.TB) *db.DB) {
 		r, _ := testRepo(t, open)
 		c := mustImport(t, r, labImport(t0))
 		mustMark(t, r, c, "T1", TriggerHead, t0)
-		if err := r.RequestRefresh(t.Context(), labName, t0); err != nil {
+		if err := r.RequestRefresh(t.Context(), labName, fleet.ActorCLI, t0); err != nil {
 			t.Fatalf("RequestRefresh: %v", err)
 		}
 		ok, err := r.MarkProcessing(t.Context(), markReq(c, "T2", TriggerRefresh, t0))
@@ -987,7 +1000,7 @@ func runRepositorySuite(t *testing.T, open func(testing.TB) *db.DB) {
 			t.Run(string(trigger), func(t *testing.T) {
 				r, _ := testRepo(t, open)
 				c := mustImport(t, r, labImport(t0))
-				if err := r.RequestRefresh(t.Context(), labName, t0); err != nil {
+				if err := r.RequestRefresh(t.Context(), labName, fleet.ActorCLI, t0); err != nil {
 					t.Fatalf("RequestRefresh: %v", err)
 				}
 				mustMark(t, r, c, "T1", trigger, t0)
