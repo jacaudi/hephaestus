@@ -8,9 +8,14 @@ This page is the operations guide for the utility operating system cache: where 
 
 | Path | Holds |
 |---|---|
-| `<data>/store` | The content store, an OCI image layout. Each entry is one tag, `utility/<entry>-<arch>:<pin id>`, over one blob per extracted file. Blob files are read-only (0444) and never edited in place |
+| `<data>/store` | The content store, an OCI image layout. Each entry is one tag, `utility/<entry>-<arch>:<pin id>`, over one blob per extracted file. Talos boot files share the store under `talos/<schematic>-<arch>:<version>` tags (see [Talos Boot Assets](first-install.md#talos-boot-assets)). Blob files are read-only (0444) and never edited in place |
 | `<data>/spool` | Partial downloads, `<pin id>-<object index>` with an `.etag` sidecar. A fetch resumes from them after a restart. Created 0700 at startup when missing |
+| `<data>/git` | The git object store of the imported clusters, not part of the content store. [Install Talos](first-install.md) covers it |
 | `<data>/store.corrupt-<UTC time>` | A store `serve` set aside at startup ([when the store is moved aside](#when-the-store-is-moved-aside)). Only the newest is kept |
+
+## Durability
+
+A blob is written to an ingest file, synced, renamed into place and its directory synced before the tag that names it is written, manifests and config blobs included, so an entry tagged before a power cut is whole afterwards. A blob already present at the right size is accepted only after its sha256 matches its digest. A file sync failure fails the push or the tag; a directory sync that the filesystem does not support is logged once at Warn and tolerated. This holds for content written by this release on; a right-size but zeroed blob that an older release tagged still passes the size check until it is fetched again.
 
 ## Artifact Route
 
@@ -18,7 +23,7 @@ A booted utility fetches its files from `GET /u/<entry>/<arch>/<version>/<path>`
 
 ## Parallel Downloads
 
-`HEPHAESTUS_FETCH_WORKERS` (default 4, 1 to 16) is how many entries `serve` downloads at once; an invalid value stops `serve` at startup. The setting is read at startup, so a change takes a restart. An upstream that averages under 32 KiB/s over 2 minutes is cut off and the row fails and is retried with backoff, so a slow mirror cannot hold a worker for good.
+`HEPHAESTUS_FETCH_WORKERS` (default 4, 1 to 16) is how many entries `serve` downloads at once, utility and Talos downloads together; an invalid value stops `serve` at startup. The setting is read at startup, so a change takes a restart. An upstream that averages under 32 KiB/s over 2 minutes is cut off and the row fails and is retried with backoff, so a slow mirror cannot hold a worker for good.
 
 ## Free Space
 
