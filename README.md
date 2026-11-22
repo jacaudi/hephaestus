@@ -1,15 +1,14 @@
 # hephaestus
 
-hephaestus gets bare metal from power-on to a correctly configured Talos node;
-once caches are warm, no boot step depends on the internet or any cloud
-service, and no secret sits anywhere unencrypted. It is a PXE boot and fleet
-service: it answers proxyDHCP and TFTP, serves iPXE boot scripts over HTTP and
-HTTPS, records each machine that boots, decides what each boot does, and
-installs Talos from a Topf cluster definition in your own git repository.
+hephaestus is a PXE boot and fleet service. It takes bare metal from power-on to
+a correctly configured Talos node. It records each machine that boots, decides
+what each boot does, and installs Talos from a Topf cluster definition in your
+git repository. When the caches are warm, no boot step needs the internet or a
+cloud service. hephaestus seals the secrets it stores.
 
-It is not a DHCP server: it runs next to the one you have and only adds the PXE
-options. Offline installs are not built yet: the Talos boot files still come
-from the public image factory the first time (see What It Does).
+hephaestus is not a DHCP server. It runs next to your DHCP server and adds only
+the PXE options. Offline installs are not built yet: the first time, the Talos
+boot files come from the public image factory.
 
 > [!WARNING]
 > **Agentically generated.** This codebase was produced through agentic,
@@ -21,82 +20,77 @@ from the public image factory the first time (see What It Does).
 
 ## What It Does
 
-A machine PXE-boots, chains into iPXE over TFTP, then fetches its boot script
-from hephaestus over HTTP and HTTPS. hephaestus records the machine and answers
-with one action: hold, boot the local disk, boot a utility operating system
-(memtest86+, SystemRescue, Clonezilla, GParted, ShredOS, grml or the UEFI
-shell) that you requested once from the admin CLI, or install Talos.
-
-For an install you import a Topf cluster definition from git, read the redacted
-diff of what it renders and approve it, then approve a discovered machine into
-one of its hosts. hephaestus fetches the Talos boot files from the image
-factory, serves the install script, and hands the machine its config once, over
-HTTPS, against a single-use ticket; you confirm the install. It has no UI: the
-admin CLI does all of it. A machine that is assigned but whose files are not
-cached holds and re-checks every 30 seconds.
+A machine PXE-boots and asks hephaestus for its boot script. hephaestus records
+the machine and gives it one action: hold, boot the local disk, boot a utility
+operating system, or install Talos. To install Talos, you import a Topf cluster
+definition from git, approve what it renders, and approve a machine into one of
+its hosts. hephaestus then serves the Talos boot files and gives the machine its
+config once, with a single-use ticket.
 
 ## Features
 
-- **proxyDHCP and TFTP** — PXE-boots machines next to your existing DHCP
-  server, with iPXE binaries embedded for BIOS and for amd64 and arm64 UEFI.
-- **TLS 1.3 boot chain** — iPXE trusts only the ISRG roots; hephaestus serves
-  a certificate that another tool renews, or sits behind a TLS-terminating
-  proxy.
-- **Per-machine boot decisions** — an ordered rule table, evaluated on every
-  boot, picks hold, local disk or utility.
-- **One-time utility boots** — `boot-next` boots a machine into a pinned
-  utility OS once; downloads are pinned and cached, then boot with no upstream.
-- **Git-imported clusters** — hephaestus polls a Topf definition in an https
-  git repository and holds each change as a pending pair until you approve it.
+- **proxyDHCP and TFTP** — PXE-boots machines next to your DHCP server. It
+  embeds iPXE binaries for BIOS and for amd64 and arm64 UEFI.
+- **TLS 1.3 boot chain** — iPXE trusts only the ISRG roots. hephaestus serves a
+  certificate that another tool renews, or sits behind a TLS-terminating proxy.
+- **Per-machine boot decisions** — an ordered rule table, checked on every boot,
+  picks hold, local disk or utility.
+- **One-time utility boots** — `boot-next` boots a machine into a utility OS
+  once: memtest86+, SystemRescue, Clonezilla, GParted, ShredOS, grml or the UEFI
+  shell. Pinned downloads are cached, so a boot needs no upstream.
+- **Git-imported clusters** — polls a Topf definition in an https git
+  repository. It holds each change as a pending pair until you approve it.
 - **Secrets from 1Password** *(optional)* — `ref+op://` references resolve
-  through a service account and are stored sealed under a data key; boots never
-  call 1Password.
-- **Talos installs** — an approved machine gets its install script and a
-  single-use config ticket; the boot files are cached from the image factory.
-- **Admin CLI and listener** — the same binary manages clusters, machines,
-  boot-next and the utility cache, and reads the audit log; `/readyz`,
-  `/health` and `/metrics` are served off the VLAN.
+  through a service account and are stored sealed. A boot never calls 1Password.
+- **Talos installs** — an approved machine gets an install script and a
+  single-use config ticket. A machine whose files are not cached holds and
+  checks again every 30 seconds.
+- **Admin CLI and listener** — one binary manages clusters, machines,
+  `boot-next` and the utility cache, and reads the audit log. It has no UI.
+  `/readyz`, `/health` and `/metrics` are served off the VLAN.
 - **SQLite or Postgres** — SQLite in the data directory by default.
 
 ## Quick Start
 
-hephaestus runs as a container on the host that holds the provisioning VLAN.
-You build the image from this repository.
+hephaestus runs as a container on the host that is on the provisioning VLAN. No
+image is published, so you build it from this repository.
 
 Prerequisites:
 
-- Docker (colima on macOS, with `DOCKER_HOST` set) and [Task](https://taskfile.dev),
-  to build the image.
+- Docker and [Task](https://taskfile.dev), to build the image. On macOS, use
+  colima and set `DOCKER_HOST`.
 - A host that allows host networking, with an interface on the provisioning
-  VLAN whose primary IPv4 address is the provisioning address.
-- An existing DHCP server on that VLAN; hephaestus is proxyDHCP only.
-- A LAN DNS record for your FQDN pointing at the provisioning address.
-- A certificate for that FQDN that chains to the ISRG roots (Let's Encrypt's
-  default chain does), written as `fullchain.pem` and `privkey.pem` by certbot,
-  lego or cert-manager, readable by UID 65532.
-- Ports 67, 69, 80, 443 and 4011 free on that host.
-- Outbound TLS 1.3 from that host to your git host and `factory.talos.dev`
-  (and to 1Password, if a definition uses references), for installs.
+  VLAN. The primary IPv4 address of that interface is the provisioning address.
+- A DHCP server on that VLAN. hephaestus is proxyDHCP only.
+- A LAN DNS record that points your FQDN to the provisioning address.
+- A certificate for that FQDN that chains to the ISRG roots. The default chain
+  of Let's Encrypt does. certbot, lego or cert-manager must write it as
+  `fullchain.pem` and `privkey.pem`, readable by UID 65532.
+- Free ports 67, 69, 80, 443 and 4011 on that host.
+- For installs, outbound TLS 1.3 from that host to your git host,
+  `factory.talos.dev` and `assets.factory.talos.dev`. If a definition uses
+  1Password references, also to 1Password.
 
-1. Build the image. It is `hephaestus:dev`, for linux/arm64 unless you pass
-   a platform.
+1. Build the image. It is named `hephaestus:dev`. The platform is linux/arm64
+   unless you set `PLATFORM`.
 
    ```sh
    task image:build PLATFORM=linux/amd64
    ```
 
-2. Create the data key, which seals the secrets hephaestus stores. Keep a copy
-   somewhere else: a lost key has no recovery, and a wrong one stops `serve`.
+2. Create the data key. hephaestus uses it to seal the secrets it stores. Keep
+   a copy in a different place. A lost key has no recovery, and a wrong key
+   stops `serve`.
 
    ```sh
    openssl rand -base64 32 > /etc/hephaestus/data-key
    chown 65532:65532 /etc/hephaestus/data-key && chmod 0400 /etc/hephaestus/data-key
    ```
 
-3. Write `hephaestus.env`. In the default `file` TLS mode these seven settings
-   are not optional; the rest have defaults (see
-   [Configuration](docs/configuration.md)). A 1Password service account token
-   is optional (`HEPHAESTUS_OP_TOKEN_FILE`).
+3. Write `hephaestus.env`. In the default `file` TLS mode, you must set these
+   seven variables. The other variables have defaults (see
+   [Configuration](docs/configuration.md)). `HEPHAESTUS_OP_TOKEN_FILE` is
+   optional. It holds a 1Password service account token.
 
    ```sh
    HEPHAESTUS_FQDN=boot.example.com
@@ -108,7 +102,8 @@ Prerequisites:
    HEPHAESTUS_DATA_KEY_FILE=/run/secrets/data-key
    ```
 
-4. Run it. The state directory holds the database, so keep it on a volume.
+4. Start the container. The state directory holds the database, so keep it on a
+   volume.
 
    ```sh
    docker run -d --name hephaestus --network host --stop-timeout 60 \
@@ -117,23 +112,24 @@ Prerequisites:
      --env-file hephaestus.env hephaestus:dev
    ```
 
-5. Check that it is ready. The admin listener defaults to `127.0.0.1:9090`.
+5. Make sure that it is ready. The admin listener is at `127.0.0.1:9090` by
+   default.
 
    ```sh
    curl -i http://127.0.0.1:9090/readyz
    ```
 
-   It answers `200` with the body `ok`. `serve` refuses to start on a missing
-   or invalid setting and reports every problem together; read
-   `docker logs hephaestus` if it exits.
+   It answers `200` with the body `ok`. If a setting is missing or not valid,
+   `serve` does not start and reports every problem together. If the container
+   exits, read `docker logs hephaestus`.
 
-To run the binary without a container, build it with `task build`, export the
-same variables and run `./bin/hephaestus serve`. It needs `CAP_NET_BIND_SERVICE`
-or root. What the host must provide is in [Run the image](docs/deployment.md).
-To install Talos on a machine, follow [Install Talos](docs/first-install.md).
+To run the binary without a container, run `task build`, export the same
+variables, and run `./bin/hephaestus serve`. It needs `CAP_NET_BIND_SERVICE` or
+root. For the host requirements, see [Run the Image](docs/deployment.md). To
+install Talos on a machine, see [Install Talos](docs/first-install.md).
 
-Upgrading from a release without clusters (M2)? `serve` now refuses to start
-without a data key; add one before restarting.
+If you upgrade from the utility-only release (M2), add a data key before you
+restart. `serve` does not start without one.
 
 ## How It Works
 
@@ -143,17 +139,17 @@ without a data key; add one before restarting.
 |---|---|
 | proxyDHCP | Offers the PXE boot file on UDP 67 and 4011, on the provisioning interface |
 | TFTP | Serves the embedded iPXE binaries |
-| HTTP :80 | `/start`, `/boot` (as a chain to HTTPS), `/tftp`, `/u/` utility files and `/t/` Talos boot files |
-| HTTPS :443 | `/boot`, `/discover` and `/config` over TLS 1.3 (`file` mode; the proxy serves them in `proxy` mode) |
-| Cluster poller | Fetches each imported git repository, resolves its 1Password references and renders pending pairs; never on the boot path |
-| Admin | `/healthz`, `/readyz`, `/health` and `/metrics`, on a management IP off the VLAN |
-| Database and store | Fleet, cluster and ticket state in SQLite or Postgres, secrets sealed; downloads and the git object store in the data directory |
+| HTTP :80 | Serves `/start`, `/boot` (a chain to HTTPS), `/tftp`, `/u/` utility files and `/t/` Talos boot files |
+| HTTPS :443 | In `file` mode, serves `/boot`, `/discover` and `/config` over TLS 1.3. In `proxy` mode, a TLS proxy terminates TLS and hephaestus serves them on `HEPHAESTUS_PROXY_ADDRESS` |
+| Cluster poller | Fetches each imported git repository, resolves its 1Password references and renders pending pairs. It is never on the boot path |
+| Admin | Serves `/healthz`, `/readyz`, `/health` and `/metrics` on a management IP off the VLAN |
+| Database and store | Keeps fleet, cluster and ticket state in SQLite or Postgres, with secrets sealed. Keeps downloads and the git object store in the data directory |
 
 ## Documentation
 
 **Run it**
 
-- [Run the image](docs/deployment.md) - what the host must provide, ports and `docker run`
+- [Run the Image](docs/deployment.md) - what the host must provide, ports and `docker run`
 - [Configuration](docs/configuration.md) - every `HEPHAESTUS_*` variable, default and rule
 - [TLS](docs/tls.md) - file mode and proxy mode, including the session-ticket rule
 
@@ -161,21 +157,25 @@ without a data key; add one before restarting.
 
 - [Install Talos](docs/first-install.md) - import a cluster, approve a machine, reinstall, and the runbooks
 - [Admin CLI](docs/admin-cli.md) - `cluster`, `machine`, `audit`, `unknown-action`, `boot-next`, `utility` and `version`
-- [Utility content](docs/utility-content.md) - the cache, parallel downloads, free space, recovery
+- [Utility Content](docs/utility-content.md) - the cache, parallel downloads, free space, recovery
 - [Observability](docs/observability.md) - admin routes, `/health` items, metrics and alerts
-- [Utility catalog](docs/utility-catalog.md) - the entries and how `task catalog:pin` pins them
+- [Utility Catalog](docs/utility-catalog.md) - the entries and how `task catalog:pin` pins them
 
 **Develop and verify**
 
 - [Development](docs/development.md) - prerequisites and `task` commands
-- [End-to-end test](test/e2e/README.md) - QEMU boots through hephaestus with `task e2e`
-- [M1 lab bring-up](docs/lab/m1-bring-up.md) - real-hardware checks for the boot path
-- [M2 lab bring-up](docs/lab/m2-utility-boots.md) - one real boot per utility entry
+- [End-to-End Test](test/e2e/README.md) - QEMU boots through hephaestus with `task e2e`
+- [M1 Lab Bring-Up](docs/lab/m1-bring-up.md) - real-hardware checks for the boot path
+- [M2 Lab Bring-Up](docs/lab/m2-utility-boots.md) - one real boot per utility entry
 
 **Background**
 
-- [Bundled code licences](docs/licensing.md) - copyleft and vendored code in the image
-- [iPXE TLS 1.3 note](docs/upstream/ipxe-tls13-new-session-ticket-transcript.md) - why session tickets are off
+- [Bundled Code Licences](docs/licensing.md) - copyleft and vendored code in the image
+- [iPXE TLS 1.3 Note](docs/upstream/ipxe-tls13-new-session-ticket-transcript.md) - why session tickets are off
+
+**Project**
+
+- [Issues](https://github.com/jacaudi/hephaestus/issues) - report a bug or ask for help
 
 ## Credits
 
