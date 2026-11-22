@@ -225,16 +225,12 @@ func (r *Repository) AuditEvents(ctx context.Context, since time.Time, machineID
 // LastMACMove returns when mac, normalized, last changed owner: the time of its
 // newest machine.mac_moved audit event, and false when it never has.
 func (r *Repository) LastMACMove(ctx context.Context, mac string) (time.Time, bool, error) {
-	// The detail is JSON as insertAudit encodes it, and a normalized MAC holds no
-	// LIKE wildcard.
+	// The detail is JSON as insertAudit encodes it; a normalized MAC is hex and
+	// colons, which JSON leaves as they are and LIKE reads literally.
 	// ponytail: scans every machine.mac_moved event; index the action if that log grows large.
-	key, err := json.Marshal(mac)
-	if err != nil {
-		return time.Time{}, false, fmt.Errorf("fleet: last MAC move: %w", err)
-	}
 	var row auditEventRow
-	err = r.bdb.NewSelect().Model(&row).Where("action = ?", actionMACMoved).
-		Where("detail LIKE ?", `%"mac":`+string(key)+`%`).Order("id DESC").Limit(1).Scan(ctx)
+	err := r.bdb.NewSelect().Model(&row).Where("action = ?", actionMACMoved).
+		Where("detail LIKE ?", `%"mac":"`+mac+`"%`).Order("id DESC").Limit(1).Scan(ctx)
 	if errors.Is(err, sql.ErrNoRows) {
 		return time.Time{}, false, nil
 	}
