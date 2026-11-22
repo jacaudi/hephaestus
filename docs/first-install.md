@@ -44,11 +44,13 @@ Approving replaces the older approved pair, revokes every live ticket of the clu
 
 ## Install a Machine
 
-1. Approve the machine into a host of the approved pair. The host must be unbound and the UUID must not be junk.
+1. Approve the machine into a host of the approved pair by its SMBIOS UUID (`machine list` shows it). The host must be unbound and the UUID must not be junk. Approving by MAC is refused for 24 hours after the MAC changes owner.
 
    ```sh
-   docker exec hephaestus /hephaestus machine approve 52:54:00:12:34:56 lab/cp-01
+   docker exec hephaestus /hephaestus machine approve 4c4c4544-0042-3510-8052-b4c04f4e4d32 lab/cp-01
    ```
+
+   The command prints the machine's UUID, serial and product before it binds; check them against the machine you mean.
 
 2. Wait for its files. `serve` fetches the Talos kernel, initramfs and kernel command line for the host's schematic, version and architecture; `machine show` reports their state. Until they are `ready` the machine holds and re-checks every 30 seconds. See [Talos Boot Assets](#talos-boot-assets).
 
