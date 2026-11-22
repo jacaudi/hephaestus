@@ -51,6 +51,7 @@ An alert is an audit event and a count of `hephaestus_alerts_total{kind}`; there
 | `config_unrecorded` | `alert.config_unrecorded` | A config was delivered and could not be recorded, even after retries; the runbook depends on the machine's state, see [Install Talos](first-install.md#when-something-goes-wrong) |
 | `git_store_moved_aside` | `cluster.store_moved_aside` | The git object store was corrupt and was moved to `git.corrupt-<UTC time>`; at most once an hour. A pair whose tree is no longer upstream cannot render until a new one is approved |
 | `cmdline_too_long` | `alert.cmdline_too_long` | The install kernel command line would exceed 2046 bytes, so the machine holds; once per machine per hour |
+| `mac_moved` | `machine.mac_moved` | A boot or a `/discover` report moved a MAC to another machine record, as a NIC swap or a rebuilt VM does; the detail names the MAC and both machines. `machine approve`, `adopt` and `rebind` refuse that MAC for 24 hours, so name the machine by SMBIOS UUID |
 
 ## Logs
 

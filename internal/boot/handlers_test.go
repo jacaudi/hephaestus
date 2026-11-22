@@ -1024,3 +1024,17 @@ func TestNewHandlers_RejectsMissingDependencies(t *testing.T) {
 		})
 	}
 }
+
+func TestBoot_MACMovedAlerted(t *testing.T) {
+	metrics := newMetrics(t)
+	g := newRig(t, WithMeter(metrics.Meter()))
+	g.boot(bootQ)
+	g.boot(bootQ)
+	if v, ok := metricLine(scrapeMetrics(t, metrics), `hephaestus_alerts_total{kind="mac_moved"`); ok {
+		t.Fatalf(`after a first insert and a same-owner refresh hephaestus_alerts_total{kind="mac_moved"} = %q, want none`, v)
+	}
+
+	g.boot("uuid=4c4c4544-0042-3510-8052-b4c04f4e4d99&mac=aa-bb-cc-00-00-01&arch=x86_64&serial=S2&product=P1")
+
+	wantMetric(t, scrapeMetrics(t, metrics), "hephaestus_alerts_total", `kind="mac_moved"`, "1")
+}

@@ -635,3 +635,35 @@ func FuzzParseDiscoverForm(f *testing.F) {
 		}
 	})
 }
+
+// otherQ is a boot query of a second machine whose MAC is the fixture's second NIC.
+const otherQ = "uuid=4c4c4544-0042-3510-8052-b4c04f4e4d99&mac=aa-bb-cc-00-00-02&arch=x86_64&serial=S2&product=P1"
+
+func TestDiscover_MACMovedAlerted(t *testing.T) {
+	tests := []struct {
+		name string
+		// setup boots the machines the report then takes a MAC from.
+		setup func(g *rig)
+		form  url.Values
+	}{
+		{"new machine takes a MAC", func(g *rig) { g.boot(bootQ) },
+			discoverForm("uuid", "4c4c4544-0042-3510-8052-b4c04f4e4d99", "serial", "S2", "nic1_mac", "")},
+		{"report takes a MAC", func(g *rig) { g.boot(bootQ); g.boot(otherQ) }, discoverForm()},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			metrics := newMetrics(t)
+			g := newRig(t, WithMeter(metrics.Meter()))
+			tt.setup(g)
+
+			if rec := g.discover(tt.form); rec.Code != http.StatusOK {
+				t.Fatalf("POST /discover: status %d, body %q", rec.Code, rec.Body.String())
+			}
+
+			wantMetric(t, scrapeMetrics(t, metrics), "hephaestus_alerts_total", `kind="mac_moved"`, "1")
+			if n := g.count("SELECT count(*) FROM audit_events WHERE action = 'machine.mac_moved'"); n != 1 {
+				t.Errorf("mac_moved events = %d, want 1", n)
+			}
+		})
+	}
+}
