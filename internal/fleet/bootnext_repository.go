@@ -57,7 +57,7 @@ type SetBootNextResult struct {
 // nothing has, is ErrNotFound.
 func (r *Repository) ResolveMachine(ctx context.Context, ref string) (Machine, error) {
 	if mac, err := NormalizeMAC(ref); err == nil {
-		owner, err := macOwner(ctx, r.bdb, mac)
+		owner, err := macOwner(ctx, r.bdb, mac, false)
 		if err != nil {
 			return Machine{}, err
 		}

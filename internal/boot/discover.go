@@ -315,7 +315,7 @@ func (h *Handlers) store(w http.ResponseWriter, r *http.Request, rep report, obs
 			return
 		}
 	}
-	stored, err := h.repo.RecordReport(ctx, obs.Machine.ID, fleet.Report{
+	stored, _, err := h.repo.RecordReport(ctx, obs.Machine.ID, fleet.Report{
 		Facts: rep.payload, MACs: rep.in.MACs, Manufacturer: rep.in.Facts.Manufacturer, At: h.now(),
 	})
 	if err != nil {

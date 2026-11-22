@@ -54,7 +54,7 @@ func TestConfigPendingCheck_Runbook(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			d := dbtest.SQLite(t)
 			repo := fleet.NewRepository(d)
-			m, err := repo.RecordBoot(t.Context(), fleet.BootRecord{
+			m, _, err := repo.RecordBoot(t.Context(), fleet.BootRecord{
 				Identity: fleet.Identity{UUID: "4c4c4544-0042-3510-8052-b4c04f4e4d32", MAC: "aa:bb:cc:00:00:01", Serial: "S", Product: "P"},
 				Arch:     fleet.ArchAMD64, Trigger: fleet.TriggerFirstContact,
 				Event: fleet.BootEvent{Row: 7, Action: "hold", Reason: "awaiting approval"}, At: checkT0,

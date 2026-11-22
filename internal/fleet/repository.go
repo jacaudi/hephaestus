@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/uptrace/bun"
+	"github.com/uptrace/bun/dialect"
 
 	"go.jacaudi.dev/hephaestus/internal/db"
 )
@@ -29,6 +30,7 @@ const (
 	actionHold             = "hold"
 	actionSetting          = "settings.unknown_action"
 	actionIdentityObserved = "identity.observed"
+	actionMACMoved         = "machine.mac_moved"
 	// holdCoalesceWindow is how long an identical hold is folded into the last one.
 	holdCoalesceWindow = time.Hour
 
@@ -127,6 +129,13 @@ type transitionDetail struct {
 	To   string `json:"to"`
 }
 
+// macMovedDetail is the detail of a machine.mac_moved audit event.
+type macMovedDetail struct {
+	MAC         string `json:"mac"`
+	FromMachine string `json:"from_machine"`
+	ToMachine   string `json:"to_machine"`
+}
+
 // identityDetail is the detail of an identity.observed audit event.
 type identityDetail struct {
 	Serial  string `json:"serial"`
@@ -213,6 +222,28 @@ func (r *Repository) AuditEvents(ctx context.Context, since time.Time, machineID
 	return out, nil
 }
 
+// LastMACMove returns when mac, normalized, last changed owner: the time of its
+// newest machine.mac_moved audit event, and false when it never has.
+func (r *Repository) LastMACMove(ctx context.Context, mac string) (time.Time, bool, error) {
+	// The detail is JSON as insertAudit encodes it, and a normalized MAC holds no
+	// LIKE wildcard.
+	// ponytail: scans every machine.mac_moved event; index the action if that log grows large.
+	key, err := json.Marshal(mac)
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("fleet: last MAC move: %w", err)
+	}
+	var row auditEventRow
+	err = r.bdb.NewSelect().Model(&row).Where("action = ?", actionMACMoved).
+		Where("detail LIKE ?", `%"mac":`+string(key)+`%`).Order("id DESC").Limit(1).Scan(ctx)
+	if errors.Is(err, sql.ErrNoRows) {
+		return time.Time{}, false, nil
+	}
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("fleet: last MAC move: %w", err)
+	}
+	return row.At.UTC(), true, nil
+}
+
 // HoldCoalesced reports whether RecordBoot would fold a hold for reason at at
 // into the machine's last boot event instead of storing it: whether that event
 // is a hold for the same reason within the hour. A machine with no boot events
@@ -235,18 +266,19 @@ func (r *Repository) HoldCoalesced(ctx context.Context, machineID, reason string
 // WantFetch run before the boot event is stored; any of them on another boot is
 // ErrInvalidTransition. ObserveIdentity stores the boot's serial and product as
 // the machine's first report, and ErrIdentityRace, storing nothing, says the
-// identity was observed since the caller read the machine.
-func (r *Repository) RecordBoot(ctx context.Context, rec BootRecord) (Machine, error) {
-	var out Machine
-	err := r.bdb.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
+// identity was observed since the caller read the machine. macMoved reports
+// that the boot's MAC moved to the machine from another, which is audited as
+// machine.mac_moved.
+func (r *Repository) RecordBoot(ctx context.Context, rec BootRecord) (m Machine, macMoved bool, err error) {
+	err = r.bdb.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
 		var err error
-		out, err = recordBoot(ctx, tx, rec)
+		m, macMoved, err = recordBoot(ctx, tx, rec)
 		return err
 	})
 	if err != nil {
-		return Machine{}, fmt.Errorf("fleet: record boot: %w", err)
+		return Machine{}, false, fmt.Errorf("fleet: record boot: %w", err)
 	}
-	return out, nil
+	return m, macMoved, nil
 }
 
 // TransitionRequest is an admin or system lifecycle change for Transition.
@@ -278,11 +310,12 @@ func (r *Repository) Transition(ctx context.Context, req TransitionRequest) (Mac
 	return out, nil
 }
 
-// Observation is what Observe found: the machine, whether the call created it
-// and whether the call raised the UUID-conflict alert.
+// Observation is what Observe found: the machine, whether the call created it,
+// whether the call raised the UUID-conflict alert and whether the machine it
+// created took its MAC from another machine (audited as machine.mac_moved).
 type Observation struct {
-	Machine          Machine
-	Created, Alerted bool
+	Machine                    Machine
+	Created, Alerted, MACMoved bool
 }
 
 // Observe records one /discover observation in a single transaction. An
@@ -339,19 +372,19 @@ type Report struct {
 // RecordReport applies a machine's inventory report in a single transaction:
 // it attaches the report's MACs, sets last_seen_at and a non-empty
 // Manufacturer, and stores the facts unless they equal the latest report's
-// byte for byte. It reports whether the facts were stored; only the newest
-// ReportsKept reports are kept.
-func (r *Repository) RecordReport(ctx context.Context, machineID string, rep Report) (bool, error) {
-	var stored bool
-	err := r.bdb.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
+// byte for byte. It reports whether the facts were stored and how many of the
+// MACs moved to the machine from another, each audited as machine.mac_moved;
+// only the newest ReportsKept reports are kept.
+func (r *Repository) RecordReport(ctx context.Context, machineID string, rep Report) (stored bool, macsMoved int, err error) {
+	err = r.bdb.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
 		var err error
-		stored, err = recordReport(ctx, tx, machineID, rep)
+		stored, macsMoved, err = recordReport(ctx, tx, machineID, rep)
 		return err
 	})
 	if err != nil {
-		return false, fmt.Errorf("fleet: record report: %w", err)
+		return false, 0, fmt.Errorf("fleet: record report: %w", err)
 	}
-	return stored, nil
+	return stored, macsMoved, nil
 }
 
 // UnknownAction returns the unknown_action setting; a missing row reads as
@@ -405,7 +438,8 @@ func observe(ctx context.Context, tx bun.IDB, id Identity, arch Arch, at time.Ti
 	}
 	switch {
 	case !ok:
-		m, err = createMachine(ctx, tx, BootRecord{Identity: id, Arch: arch, Trigger: TriggerFirstContact, At: at})
+		var moved bool
+		m, moved, err = createMachine(ctx, tx, BootRecord{Identity: id, Arch: arch, Trigger: TriggerFirstContact, At: at})
 		if err != nil {
 			return Observation{}, false, err
 		}
@@ -416,7 +450,7 @@ func observe(ctx context.Context, tx bun.IDB, id Identity, arch Arch, at time.Ti
 			return Observation{}, false, err
 		}
 		m, err = loadMachine(ctx, tx, m.ID)
-		return Observation{Machine: m, Created: true}, false, err
+		return Observation{Machine: m, Created: true, MACMoved: moved}, false, err
 	case m.Serial != id.Serial || m.Product != id.Product:
 		obs.Machine = m
 		if !m.Junk {
@@ -466,11 +500,15 @@ func observeIdentity(ctx context.Context, q bun.IDB, machineID string, id Identi
 	return true, InsertAudit(ctx, q, ev)
 }
 
-func recordReport(ctx context.Context, tx bun.IDB, machineID string, rep Report) (bool, error) {
+func recordReport(ctx context.Context, tx bun.IDB, machineID string, rep Report) (stored bool, macsMoved int, err error) {
 	at := rep.At.UTC()
 	for _, mac := range rep.MACs {
-		if err := upsertMAC(ctx, tx, machineID, mac, at); err != nil {
-			return false, err
+		moved, err := upsertMAC(ctx, tx, machineID, mac, at)
+		if err != nil {
+			return false, 0, err
+		}
+		if moved {
+			macsMoved++
 		}
 	}
 	m := Machine{ID: machineID, LastSeenAt: at, Manufacturer: rep.Manufacturer}
@@ -479,26 +517,26 @@ func recordReport(ctx context.Context, tx bun.IDB, machineID string, rep Report)
 		cols = append(cols, "manufacturer")
 	}
 	if _, err := tx.NewUpdate().Model(&m).Column(cols...).WherePK().Exec(ctx); err != nil {
-		return false, fmt.Errorf("update machine %s: %w", machineID, err)
+		return false, 0, fmt.Errorf("update machine %s: %w", machineID, err)
 	}
 
 	facts := string(rep.Facts)
 	latest, ok, err := latestFacts(ctx, tx, machineID)
 	if err != nil || (ok && latest == facts) {
-		return false, err
+		return false, macsMoved, err
 	}
 	row := inventoryReportRow{MachineID: machineID, Source: reportSourceIPXE, Facts: facts, ReceivedAt: at}
 	if _, err := tx.NewInsert().Model(&row).Exec(ctx); err != nil {
-		return false, fmt.Errorf("insert report: %w", err)
+		return false, 0, fmt.Errorf("insert report: %w", err)
 	}
 	oldest := tx.NewSelect().Model((*inventoryReportRow)(nil)).Column("id").
 		Where("machine_id = ?", machineID).Order("id DESC").Limit(1).Offset(ReportsKept)
 	_, err = tx.NewDelete().Model((*inventoryReportRow)(nil)).
 		Where("machine_id = ?", machineID).Where("id <= (?)", oldest).Exec(ctx)
 	if err != nil {
-		return false, fmt.Errorf("trim reports: %w", err)
+		return false, 0, fmt.Errorf("trim reports: %w", err)
 	}
-	return true, nil
+	return true, macsMoved, nil
 }
 
 // latestFacts returns the facts of the machine's newest report.
@@ -535,7 +573,7 @@ func storedUnknownAction(ctx context.Context, q bun.IDB) (string, error) {
 // request gets its own record and cannot mark or move the valid one.
 func lookupMachine(ctx context.Context, q bun.IDB, id Identity) (Machine, bool, error) {
 	if JunkPattern(id.UUID) {
-		owner, err := macOwner(ctx, q, id.MAC)
+		owner, err := macOwner(ctx, q, id.MAC, false)
 		if err != nil || owner == "" {
 			return Machine{}, false, err
 		}
@@ -552,7 +590,7 @@ func lookupMachine(ctx context.Context, q bun.IDB, id Identity) (Machine, bool, 
 	}
 	i := slices.IndexFunc(cands, func(m Machine) bool { return !m.Junk })
 	if i < 0 {
-		owner, err := macOwner(ctx, q, id.MAC)
+		owner, err := macOwner(ctx, q, id.MAC, false)
 		if err != nil {
 			return Machine{}, false, err
 		}
@@ -580,13 +618,19 @@ func foundMachine(m Machine, err error) (Machine, bool, error) {
 }
 
 // macOwner returns the ID of the machine owning mac, or "" when none does or
-// mac is empty.
-func macOwner(ctx context.Context, q bun.IDB, mac string) (string, error) {
+// mac is empty. With lock it also holds the MAC's row (FOR UPDATE on Postgres)
+// until the caller's transaction ends, so the owner read is the one a write
+// replaces; SQLite has one writer, so there is nothing to hold.
+func macOwner(ctx context.Context, q bun.IDB, mac string, lock bool) (string, error) {
 	if mac == "" {
 		return "", nil
 	}
 	var owner string
-	err := q.NewSelect().Model((*machineMAC)(nil)).Column("machine_id").Where("mac = ?", mac).Scan(ctx, &owner)
+	sel := q.NewSelect().Model((*machineMAC)(nil)).Column("machine_id").Where("mac = ?", mac)
+	if lock && q.Dialect().Name() == dialect.PG {
+		sel = sel.For("UPDATE")
+	}
+	err := sel.Scan(ctx, &owner)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}
@@ -645,28 +689,29 @@ func hydrate(ctx context.Context, q bun.IDB, m *Machine) error {
 	return nil
 }
 
-func recordBoot(ctx context.Context, tx bun.IDB, rec BootRecord) (Machine, error) {
+func recordBoot(ctx context.Context, tx bun.IDB, rec BootRecord) (Machine, bool, error) {
 	if (rec.ClearBootNext != nil || rec.WantFetch != nil) && (rec.MachineID == "" || rec.Conflict) {
-		return Machine{}, fmt.Errorf("%w: clearing boot-next or wanting a fetch needs a known boot that is not a conflict", ErrInvalidTransition)
+		return Machine{}, false, fmt.Errorf("%w: clearing boot-next or wanting a fetch needs a known boot that is not a conflict", ErrInvalidTransition)
 	}
 	if rec.ObserveIdentity && (rec.MachineID == "" || rec.Conflict) {
-		return Machine{}, fmt.Errorf("%w: observing the identity needs a known boot that is not a conflict", ErrInvalidTransition)
+		return Machine{}, false, fmt.Errorf("%w: observing the identity needs a known boot that is not a conflict", ErrInvalidTransition)
 	}
 	var (
-		from State
-		m    Machine
-		err  error
+		from  State
+		m     Machine
+		moved bool
+		err   error
 	)
 	if rec.MachineID == "" {
-		m, err = createMachine(ctx, tx, rec)
+		m, moved, err = createMachine(ctx, tx, rec)
 	} else {
-		from, m, err = recordKnownBoot(ctx, tx, rec)
+		from, m, moved, err = recordKnownBoot(ctx, tx, rec)
 	}
 	if err != nil {
-		return Machine{}, err
+		return Machine{}, false, err
 	}
 	if err := applyBootNext(ctx, tx, m.ID, rec); err != nil {
-		return Machine{}, err
+		return Machine{}, false, err
 	}
 	row := bootEventRow{
 		MachineID: m.ID, At: rec.At.UTC(), DecisionRow: rec.Event.Row, Action: rec.Event.Action, Reason: rec.Event.Reason,
@@ -675,9 +720,10 @@ func recordBoot(ctx context.Context, tx bun.IDB, rec BootRecord) (Machine, error
 		row.FromState, row.ToState = from, m.State
 	}
 	if err := insertBootEvent(ctx, tx, row); err != nil {
-		return Machine{}, err
+		return Machine{}, false, err
 	}
-	return loadMachine(ctx, tx, m.ID)
+	m, err = loadMachine(ctx, tx, m.ID)
+	return m, moved, err
 }
 
 // applyBootNext runs the boot-next fields of rec against the machine, which
@@ -699,31 +745,32 @@ func applyBootNext(ctx context.Context, tx bun.IDB, machineID string, rec BootRe
 	return nil
 }
 
-// createMachine inserts the machine and its MAC and returns the machine.
-func createMachine(ctx context.Context, tx bun.IDB, rec BootRecord) (Machine, error) {
+// createMachine inserts the machine and its MAC and returns the machine and
+// whether the MAC moved to it from another machine.
+func createMachine(ctx context.Context, tx bun.IDB, rec BootRecord) (Machine, bool, error) {
 	// Only first contact leaves StateNone without a host, so Next refuses every
 	// other trigger here.
 	lc, err := Next(Lifecycle{}, rec.Trigger, Guard{})
 	if err != nil {
-		return Machine{}, err
+		return Machine{}, false, err
 	}
 	id := rec.Identity
 	junk := JunkPattern(id.UUID)
 	if junk && id.MAC == "" {
-		return Machine{}, ErrUnidentifiable
+		return Machine{}, false, ErrUnidentifiable
 	}
 	n, err := tx.NewSelect().Model((*Machine)(nil)).Count(ctx)
 	if err != nil {
-		return Machine{}, fmt.Errorf("count machines: %w", err)
+		return Machine{}, false, fmt.Errorf("count machines: %w", err)
 	}
 	if n >= MaxMachines {
-		return Machine{}, ErrFleetFull
+		return Machine{}, false, ErrFleetFull
 	}
 	if !junk {
 		// A valid UUID that is already stored only reaches here as a clone of a
 		// junked machine; the unique index covers valid UUIDs only.
 		if junk, err = tx.NewSelect().Model((*Machine)(nil)).Where("smbios_uuid = ?", id.UUID).Exists(ctx); err != nil {
-			return Machine{}, fmt.Errorf("check UUID in use: %w", err)
+			return Machine{}, false, fmt.Errorf("check UUID in use: %w", err)
 		}
 	}
 
@@ -735,47 +782,50 @@ func createMachine(ctx context.Context, tx bun.IDB, rec BootRecord) (Machine, er
 		IdentityObserved: true,
 	}
 	if _, err := tx.NewInsert().Model(&m).Exec(ctx); err != nil {
-		return Machine{}, fmt.Errorf("insert machine: %w", err)
+		return Machine{}, false, fmt.Errorf("insert machine: %w", err)
 	}
+	moved := false
 	if id.MAC != "" {
-		if err := upsertMAC(ctx, tx, m.ID, id.MAC, at); err != nil {
-			return Machine{}, err
+		if moved, err = upsertMAC(ctx, tx, m.ID, id.MAC, at); err != nil {
+			return Machine{}, false, err
 		}
 	}
-	return m, nil
+	return m, moved, nil
 }
 
 // recordKnownBoot applies a boot of an existing machine and returns the state
-// it was in and the machine after.
-func recordKnownBoot(ctx context.Context, tx bun.IDB, rec BootRecord) (State, Machine, error) {
+// it was in, the machine after and whether the boot's MAC moved to it from
+// another machine.
+func recordKnownBoot(ctx context.Context, tx bun.IDB, rec BootRecord) (State, Machine, bool, error) {
 	m, err := loadLockedMachine(ctx, tx, rec.MachineID)
 	if err != nil {
-		return StateNone, Machine{}, err
+		return StateNone, Machine{}, false, err
 	}
 	if rec.Conflict {
 		if rec.MarkJunk {
 			if err := markUUIDJunk(ctx, tx, m, rec.Identity, rec.At); err != nil {
-				return StateNone, Machine{}, err
+				return StateNone, Machine{}, false, err
 			}
 		}
-		return m.State, m, nil
+		return m.State, m, false, nil
 	}
 
 	// First, so a lost race stores nothing.
 	if rec.ObserveIdentity {
 		observed, err := observeIdentity(ctx, tx, m.ID, rec.Identity, rec.At)
 		if err != nil {
-			return StateNone, Machine{}, err
+			return StateNone, Machine{}, false, err
 		}
 		if !observed {
-			return StateNone, Machine{}, ErrIdentityRace
+			return StateNone, Machine{}, false, ErrIdentityRace
 		}
 	}
 
 	at := rec.At.UTC()
+	moved := false
 	if rec.Identity.MAC != "" {
-		if err := upsertMAC(ctx, tx, m.ID, rec.Identity.MAC, at); err != nil {
-			return StateNone, Machine{}, err
+		if moved, err = upsertMAC(ctx, tx, m.ID, rec.Identity.MAC, at); err != nil {
+			return StateNone, Machine{}, false, err
 		}
 	}
 	from := m.State
@@ -783,16 +833,16 @@ func recordKnownBoot(ctx context.Context, tx bun.IDB, rec BootRecord) (State, Ma
 	if rec.Trigger == TriggerNextBoot {
 		lc, err := Next(m.Lifecycle(), rec.Trigger, Guard{Junk: m.Junk})
 		if err != nil {
-			return StateNone, Machine{}, err
+			return StateNone, Machine{}, false, err
 		}
 		m.State, m.Prior, m.OrphanedFrom = lc.State, lc.Prior, lc.OrphanedFrom
 		cols = append(cols, "state", "prior_state", "orphaned_from")
 	}
 	m.Arch, m.LastSeenAt = rec.Arch, at
 	if _, err := tx.NewUpdate().Model(&m).Column(cols...).WherePK().Exec(ctx); err != nil {
-		return StateNone, Machine{}, fmt.Errorf("update machine %s: %w", m.ID, err)
+		return StateNone, Machine{}, false, fmt.Errorf("update machine %s: %w", m.ID, err)
 	}
-	return from, m, nil
+	return from, m, moved, nil
 }
 
 // markUUIDJunk marks every machine holding stored's UUID junk, revokes their live
@@ -816,25 +866,37 @@ func markUUIDJunk(ctx context.Context, q bun.IDB, stored Machine, seen Identity,
 
 // upsertMAC attaches mac to the machine, moving it from any machine that held
 // it, and drops the machine's least recently seen MACs beyond MACsKept. Every
-// MAC write goes through it so the cap always applies.
-func upsertMAC(ctx context.Context, q bun.IDB, machineID, mac string, at time.Time) error {
+// MAC write goes through it so the cap always applies. A move, and only a move,
+// is audited as machine.mac_moved and reported true.
+func upsertMAC(ctx context.Context, q bun.IDB, machineID, mac string, at time.Time) (bool, error) {
+	from, err := macOwner(ctx, q, mac, true)
+	if err != nil {
+		return false, err
+	}
 	row := machineMAC{MAC: mac, MachineID: machineID, SeenAt: at.UTC()}
-	_, err := q.NewInsert().Model(&row).
+	_, err = q.NewInsert().Model(&row).
 		On("CONFLICT (mac) DO UPDATE").
 		Set("machine_id = EXCLUDED.machine_id").
 		Set("seen_at = EXCLUDED.seen_at").
 		Exec(ctx)
 	if err != nil {
-		return fmt.Errorf("upsert MAC: %w", err)
+		return false, fmt.Errorf("upsert MAC: %w", err)
 	}
 	newest := q.NewSelect().Model((*machineMAC)(nil)).Column("mac").
 		Where("machine_id = ?", machineID).Order("seen_at DESC", "mac").Limit(MACsKept)
 	_, err = q.NewDelete().Model((*machineMAC)(nil)).
 		Where("machine_id = ?", machineID).Where("mac NOT IN (?)", newest).Exec(ctx)
 	if err != nil {
-		return fmt.Errorf("trim MACs: %w", err)
+		return false, fmt.Errorf("trim MACs: %w", err)
 	}
-	return nil
+	if from == "" || from == machineID {
+		return false, nil
+	}
+	ev := AuditEvent{
+		At: at, Actor: ActorSystem, Action: actionMACMoved, MachineID: machineID,
+		Detail: macMovedDetail{MAC: mac, FromMachine: from, ToMachine: machineID},
+	}
+	return true, InsertAudit(ctx, q, ev)
 }
 
 // insertBootEvent stores row and drops the machine's events beyond

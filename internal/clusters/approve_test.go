@@ -109,7 +109,7 @@ func (e *approveEnv) discovered(n int) fleet.Machine {
 		UUID: fmt.Sprintf("4c4c4544-0042-3510-8052-b4c04f4e%04x", 0x4d30+n), MAC: fmt.Sprintf("aa:bb:cc:00:00:%02x", n),
 		Serial: "S" + strconv.Itoa(n), Product: "P",
 	}
-	m, err := e.f.RecordBoot(e.t.Context(), fleet.BootRecord{
+	m, _, err := e.f.RecordBoot(e.t.Context(), fleet.BootRecord{
 		Identity: id, Arch: fleet.ArchAMD64, Trigger: fleet.TriggerFirstContact,
 		Event: fleet.BootEvent{Row: 7, Action: "hold", Reason: "awaiting approval"}, At: e.tick(),
 	})

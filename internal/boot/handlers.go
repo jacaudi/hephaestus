@@ -386,7 +386,7 @@ func (h *Handlers) decideAndRecord(ctx context.Context, id fleet.Identity, req R
 			return bootOutcome{}, err
 		}
 
-		stored, err := h.repo.RecordBoot(ctx, bootRecord(id, req, s, out))
+		stored, _, err := h.repo.RecordBoot(ctx, bootRecord(id, req, s, out))
 		switch {
 		case errors.Is(err, fleet.ErrBootNextChanged):
 			if attempt == bootAttempts-2 {

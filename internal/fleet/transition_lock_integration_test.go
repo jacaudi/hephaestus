@@ -82,7 +82,7 @@ func TestTransition_Postgres_ReadsTheMachineUnderItsLock(t *testing.T) {
 			func(ctx context.Context) error {
 				rec := bootOf(m, 10, "install", t0.Add(3*time.Minute))
 				rec.Trigger = TriggerNextBoot
-				_, err := r.RecordBoot(ctx, rec)
+				_, _, err := r.RecordBoot(ctx, rec)
 				return err
 			})
 		_ = err // the boot is refused or recorded against the aborted state; either is consistent

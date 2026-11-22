@@ -1143,7 +1143,7 @@ func TestFetcher_TenthFailureClearsBootNext(t *testing.T) {
 			return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusServiceUnavailable) })
 		})
 	})
-	m, err := r.repo.RecordBoot(t.Context(), fleet.BootRecord{
+	m, _, err := r.repo.RecordBoot(t.Context(), fleet.BootRecord{
 		Identity: fleet.Identity{UUID: fixtureUUID, MAC: "aa:bb:cc:00:00:01", Serial: "S1", Product: "P1"},
 		Arch:     fleet.ArchAMD64, Trigger: fleet.TriggerFirstContact,
 		Event: fleet.BootEvent{Row: 7, Action: "hold", Reason: "awaiting approval"}, At: fetchT0(),

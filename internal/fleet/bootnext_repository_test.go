@@ -70,7 +70,7 @@ func serveOnce(ctx context.Context, r *Repository, m Machine, at time.Time) (saw
 		saw = true
 		rec := bootOf(m, 3, "utility", at)
 		rec.ClearBootNext = &BootNextClear{Entry: cur.BootNext, SetAt: cur.BootNextSetAt, Reason: ClearServed}
-		if _, err := r.RecordBoot(ctx, rec); !errors.Is(err, ErrBootNextChanged) {
+		if _, _, err := r.RecordBoot(ctx, rec); !errors.Is(err, ErrBootNextChanged) {
 			return saw, lost, err
 		}
 		lost++
@@ -437,7 +437,7 @@ func runBootNextSuite(t *testing.T, open func(testing.TB) *db.DB, pair func(test
 
 		rec := bootOf(m, 3, "utility", t0.Add(2*time.Minute))
 		rec.ClearBootNext = &BootNextClear{Entry: "tshell", SetAt: t0, Reason: ClearServed}
-		if _, err := r.RecordBoot(t.Context(), rec); !errors.Is(err, ErrBootNextChanged) {
+		if _, _, err := r.RecordBoot(t.Context(), rec); !errors.Is(err, ErrBootNextChanged) {
 			t.Fatalf("RecordBoot error = %v, want ErrBootNextChanged", err)
 		}
 		if n := bootEvents(t, d, m.ID, 3); n != 0 {
@@ -492,7 +492,7 @@ func runBootNextSuite(t *testing.T, open func(testing.TB) *db.DB, pair func(test
 		for i := range tests {
 			tc := &tests[i]
 			tc.set(&tc.rec)
-			if _, err := r.RecordBoot(t.Context(), tc.rec); !errors.Is(err, ErrInvalidTransition) {
+			if _, _, err := r.RecordBoot(t.Context(), tc.rec); !errors.Is(err, ErrInvalidTransition) {
 				t.Errorf("%s: RecordBoot error = %v, want ErrInvalidTransition", tc.name, err)
 			}
 		}

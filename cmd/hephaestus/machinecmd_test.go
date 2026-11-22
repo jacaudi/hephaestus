@@ -514,7 +514,7 @@ func TestMachine_RecordedNotReceivedInstallUnconfirmed(t *testing.T) {
 	c := newCLITest(t)
 	c.labApproved(t)
 	m := c.install(t, c.assign(t, c.machine(t, 1, fleet.ArchAMD64), hostCP))
-	_, err := c.repo.RecordBoot(t.Context(), fleet.BootRecord{
+	_, _, err := c.repo.RecordBoot(t.Context(), fleet.BootRecord{
 		Identity: fleet.Identity{UUID: cliUUID(1), MAC: cliMAC(1), Serial: "S", Product: "P"}, Arch: fleet.ArchAMD64,
 		MachineID: m.ID, Trigger: fleet.TriggerNextBoot, Event: fleet.BootEvent{Row: 6, Action: "exit"}, At: cliT0,
 	})

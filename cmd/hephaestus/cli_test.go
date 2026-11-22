@@ -121,7 +121,7 @@ func (c *cliTest) mustRun(t *testing.T, args ...string) string {
 // record makes the machine of id by its first contact, arriving as arch.
 func (c *cliTest) record(t *testing.T, id fleet.Identity, arch fleet.Arch) fleet.Machine {
 	t.Helper()
-	m, err := c.repo.RecordBoot(t.Context(), fleet.BootRecord{
+	m, _, err := c.repo.RecordBoot(t.Context(), fleet.BootRecord{
 		Identity: id, Arch: arch, Trigger: fleet.TriggerFirstContact,
 		Event: fleet.BootEvent{Row: 7, Action: "hold", Reason: "awaiting approval"}, At: cliT0,
 	})
