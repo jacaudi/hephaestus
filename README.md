@@ -175,6 +175,7 @@ restart. `serve` does not start without one.
 
 **Project**
 
+- [Project Status](docs/status.md) - milestones done, work left, open follow-ups and conventions
 - [Issues](https://github.com/jacaudi/hephaestus/issues) - report a bug or ask for help
 
 ## Credits
