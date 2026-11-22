@@ -99,13 +99,20 @@ func (c *cliTest) useCatalog(cat *catalog.Catalog) {
 // run executes the root command with args and returns its stdout and error.
 func (c *cliTest) run(t *testing.T, args ...string) (string, error) {
 	t.Helper()
+	out, _, err := c.runStreams(t, args...)
+	return out, err
+}
+
+// runStreams executes the root command with args and returns its stdout, its stderr and its error.
+func (c *cliTest) runStreams(t *testing.T, args ...string) (stdout, stderr string, err error) {
+	t.Helper()
 	var out, errOut bytes.Buffer
 	cmd := newRootCmdWith(c.deps)
 	cmd.SetArgs(args)
 	cmd.SetOut(&out)
 	cmd.SetErr(&errOut)
-	err := cmd.ExecuteContext(t.Context())
-	return out.String(), err
+	err = cmd.ExecuteContext(t.Context())
+	return out.String(), errOut.String(), err
 }
 
 // mustRun is run for a command that must succeed.
@@ -121,7 +128,7 @@ func (c *cliTest) mustRun(t *testing.T, args ...string) string {
 // record makes the machine of id by its first contact, arriving as arch.
 func (c *cliTest) record(t *testing.T, id fleet.Identity, arch fleet.Arch) fleet.Machine {
 	t.Helper()
-	m, err := c.repo.RecordBoot(t.Context(), fleet.BootRecord{
+	m, _, err := c.repo.RecordBoot(t.Context(), fleet.BootRecord{
 		Identity: id, Arch: arch, Trigger: fleet.TriggerFirstContact,
 		Event: fleet.BootEvent{Row: 7, Action: "hold", Reason: "awaiting approval"}, At: cliT0,
 	})

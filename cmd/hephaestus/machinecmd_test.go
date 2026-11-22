@@ -189,6 +189,106 @@ func TestMachineApprove_Text(t *testing.T) {
 	}
 }
 
+func TestMachineApprove_PrintsIdentity(t *testing.T) {
+	tests := []struct {
+		name, ref, host string
+		// refused is true when the bind itself is refused: the line comes before it.
+		refused bool
+	}{
+		{"by MAC", cliMAC(1), hostCP, false},
+		{"by UUID", cliUUID(1), hostCP, false},
+		{"before a refused bind", cliMAC(1), "nope-01", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := newCLITest(t)
+			c.labApproved(t)
+			m := c.record(t, fleet.Identity{UUID: cliUUID(1), MAC: cliMAC(1), Serial: "SN-1\x1b", Product: "Box 9"}, fleet.ArchAMD64)
+
+			_, stderr, err := c.runStreams(t, "machine", "approve", tt.ref, "lab/"+tt.host, "--json")
+
+			if (err != nil) != tt.refused {
+				t.Fatalf("error = %v, want refused %t", err, tt.refused)
+			}
+			want := "machine " + m.ID + ": uuid " + cliUUID(1) + `, serial SN-1\x1b, product Box 9` + "\n"
+			if stderr != want {
+				t.Errorf("stderr = %q, want %q", stderr, want)
+			}
+		})
+	}
+}
+
+// takeMAC records a second machine that takes machine 1's MAC at cliT0, as a swapped NIC does, and returns it.
+func (c *cliTest) takeMAC(t *testing.T) fleet.Machine {
+	t.Helper()
+	c.machine(t, 1, fleet.ArchAMD64)
+	return c.record(t, fleet.Identity{UUID: cliUUID(2), MAC: cliMAC(1), Serial: "S2", Product: "P2"}, fleet.ArchAMD64)
+}
+
+func TestMachineBind_MACMovedGuard(t *testing.T) {
+	verbs := []struct {
+		verb, host, state string
+		// prepare brings the machine that took the MAC to a state the verb binds from.
+		prepare func(t *testing.T, c *cliTest, m fleet.Machine)
+	}{
+		{"approve", hostCP, "assigned", func(*testing.T, *cliTest, fleet.Machine) {}},
+		{"adopt", hostCP, "installed", func(*testing.T, *cliTest, fleet.Machine) {}},
+		{"rebind", hostWrk, "assigned", func(t *testing.T, c *cliTest, m fleet.Machine) {
+			t.Helper()
+			c.trigger(t, c.assign(t, m, hostCP), fleet.TriggerHostLeft)
+		}},
+	}
+	refs := []struct {
+		name    string
+		byUUID  bool
+		since   time.Duration
+		refused bool
+	}{
+		{"MAC within the guard", false, macMovedGuard - time.Second, true},
+		{"MAC once the guard ends", false, macMovedGuard, false},
+		{"UUID within the guard", true, 0, false},
+	}
+	for _, v := range verbs {
+		for _, ref := range refs {
+			t.Run(v.verb+"/"+ref.name, func(t *testing.T) {
+				c := newCLITest(t)
+				c.labApproved(t)
+				m := c.takeMAC(t)
+				v.prepare(t, c, m)
+				c.now = cliT0.Add(ref.since)
+				name := cliMAC(1)
+				if ref.byUUID {
+					name = m.UUID
+				}
+				before := c.get(t, m.ID).State
+
+				_, err := c.run(t, "machine", v.verb, name, "lab/"+v.host)
+
+				if !ref.refused {
+					if err != nil {
+						t.Fatalf("machine %s %s: %v", v.verb, name, err)
+					}
+					if got := stateLabel(c.get(t, m.ID).State); got != v.state {
+						t.Errorf("state = %s, want %s", got, v.state)
+					}
+					return
+				}
+				if exitCode(err) != exitError {
+					t.Errorf("exit code = %d, want %d", exitCode(err), exitError)
+				}
+				for _, want := range []string{cliMAC(1), "changed owner at " + formatTime(cliT0), "SMBIOS UUID", m.UUID} {
+					if err == nil || !strings.Contains(err.Error(), want) {
+						t.Errorf("error = %v, want it to name %q", err, want)
+					}
+				}
+				if got := c.get(t, m.ID).State; got != before {
+					t.Errorf("state = %s, want it left %s", got, before)
+				}
+			})
+		}
+	}
+}
+
 func TestMachineAdopt(t *testing.T) {
 	c := newCLITest(t)
 	c.labApproved(t)
@@ -514,7 +614,7 @@ func TestMachine_RecordedNotReceivedInstallUnconfirmed(t *testing.T) {
 	c := newCLITest(t)
 	c.labApproved(t)
 	m := c.install(t, c.assign(t, c.machine(t, 1, fleet.ArchAMD64), hostCP))
-	_, err := c.repo.RecordBoot(t.Context(), fleet.BootRecord{
+	_, _, err := c.repo.RecordBoot(t.Context(), fleet.BootRecord{
 		Identity: fleet.Identity{UUID: cliUUID(1), MAC: cliMAC(1), Serial: "S", Product: "P"}, Arch: fleet.ArchAMD64,
 		MachineID: m.ID, Trigger: fleet.TriggerNextBoot, Event: fleet.BootEvent{Row: 6, Action: "exit"}, At: cliT0,
 	})

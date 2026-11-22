@@ -282,6 +282,9 @@ func (h *Handlers) admit(w http.ResponseWriter, r *http.Request, rep report) (fl
 	}
 	switch {
 	case err == nil:
+		if obs.MACMoved {
+			h.countAlert(ctx, alertKindMACMoved)
+		}
 		return obs, true
 	case errors.Is(err, fleet.ErrIdentityConflict):
 		if obs.Alerted {
@@ -315,12 +318,15 @@ func (h *Handlers) store(w http.ResponseWriter, r *http.Request, rep report, obs
 			return
 		}
 	}
-	stored, err := h.repo.RecordReport(ctx, obs.Machine.ID, fleet.Report{
+	stored, moved, err := h.repo.RecordReport(ctx, obs.Machine.ID, fleet.Report{
 		Facts: rep.payload, MACs: rep.in.MACs, Manufacturer: rep.in.Facts.Manufacturer, At: h.now(),
 	})
 	if err != nil {
 		h.discoverInternalError(w, r, err)
 		return
+	}
+	for range moved {
+		h.countAlert(ctx, alertKindMACMoved)
 	}
 	outcome := outcomeUnchanged
 	if stored {

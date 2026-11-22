@@ -43,7 +43,7 @@ A machine is named by its MAC or its UUID, and must have booted through hephaest
 |---|---|
 | `machine list` | Every machine with its state |
 | `machine show <mac\|uuid>` | State, binding and Talos tuple, the state of the Talos files it installs from, and its live config ticket: when it was minted and whether `/config` was ever asked for with it. The token is never shown |
-| `machine approve <mac\|uuid> <cluster>/<host>` | Binds a discovered machine to an unbound host of the approved pair and assigns it: its next boot installs Talos. Its Talos files are wanted at once. Refused for a junk UUID |
+| `machine approve <mac\|uuid> <cluster>/<host>` | Binds a discovered machine to an unbound host of the approved pair and assigns it: its next boot installs Talos. Its Talos files are wanted at once. Refused for a junk UUID. Name the machine by its SMBIOS UUID: a MAC that changed owner in the last 24 hours is refused, here and in `adopt` and `rebind`. Each prints the machine's UUID, serial and product on stderr before it binds |
 | `machine adopt <mac\|uuid> <cluster>/<host>` | Binds a discovered machine that already runs Talos as `installed`; nothing is installed |
 | `machine adopt --uuid <uuid> --arch <amd64\|arm64> <cluster>/<host>` | The same for a machine that has never booted through hephaestus. It creates the record, with its MACs, serial and product filled in by its first boot |
 | `machine fetch <mac\|uuid> [--reset-hash]` | Wants the Talos files of the machine's host, and re-arms a `failed` or `broken` row. `--reset-hash` clears the recorded sizes and hashes so the next fetch records afresh from any state: a changed upstream build is a trust decision, and this accepts it. Audited |

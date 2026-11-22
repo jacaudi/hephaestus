@@ -39,6 +39,7 @@ const (
 	contentTypeBinary = "application/octet-stream"
 
 	alertKindUUIDConflict = "uuid_conflict"
+	alertKindMACMoved     = "mac_moved"
 )
 
 // errValueTooLong is returned by parseBootQuery and parseDiscoverForm for a
@@ -386,7 +387,7 @@ func (h *Handlers) decideAndRecord(ctx context.Context, id fleet.Identity, req R
 			return bootOutcome{}, err
 		}
 
-		stored, err := h.repo.RecordBoot(ctx, bootRecord(id, req, s, out))
+		stored, moved, err := h.repo.RecordBoot(ctx, bootRecord(id, req, s, out))
 		switch {
 		case errors.Is(err, fleet.ErrBootNextChanged):
 			if attempt == bootAttempts-2 {
@@ -398,6 +399,9 @@ func (h *Handlers) decideAndRecord(ctx context.Context, id fleet.Identity, req R
 		default:
 			if err == nil {
 				s.m = stored
+				if moved {
+					h.countAlert(ctx, alertKindMACMoved)
+				}
 				telemetry.AddAttrs(ctx, slog.String("state", string(s.m.State)))
 			}
 			if s.m.ID != "" {

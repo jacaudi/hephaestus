@@ -17,6 +17,9 @@ import (
 // noHostReason is why "machine fetch" has nothing to fetch for a machine without a host.
 const noHostReason = "machine is not bound to a host"
 
+// macMovedGuard is how long after a MAC changes owner a bind refuses to name the machine by that MAC.
+const macMovedGuard = 24 * time.Hour
+
 // actionFetchRequested is the audit action of a "machine fetch" that wants a Talos row; with --reset-hash the reset is
 // audited as talos.hash_reset by fleet.
 const actionFetchRequested = "talos.fetch_requested"
@@ -162,12 +165,14 @@ func newMachineCmd(deps cliDeps) *cobra.Command {
 		Short: "List machines and move them through their lifecycle",
 		Long: `List and show machines, bind them to hosts of an approved cluster pair, and move them through
 their lifecycle: one command per admin action. A machine is named by its MAC or its UUID, and must
-have booted through hephaestus once (adopt --uuid creates one).
+have booted through hephaestus once (adopt --uuid creates one). approve, adopt and rebind print the
+machine's UUID, serial and product on stderr, and refuse a MAC that changed owner in the last 24
+hours: name the machine by its SMBIOS UUID instead.
 
 These commands run inside the container and write the database that "hephaestus serve" reads. Every
 change is audited with the actor cli.`,
 		Example: `  docker exec hephaestus /hephaestus machine list
-  docker exec hephaestus /hephaestus machine approve 52:54:00:12:34:56 lab/cp-01`,
+  docker exec hephaestus /hephaestus machine approve 4c4c4544-0042-3510-8052-b4c04f4e4d32 lab/cp-01`,
 		Args: noArgs,
 		RunE: helpGroup,
 	}
@@ -458,8 +463,9 @@ type bindRequest struct {
 	bind          func(*clusters.Repository, context.Context, clusters.MachineRequest) (fleet.Machine, error)
 }
 
-// runBind resolves the machine and binds it to the host, which goes through the clusters repository: it holds the
-// cluster row, so a bind cannot race a cluster's removal.
+// runBind resolves the machine, prints its identity on stderr and binds it to the host, which goes through the
+// clusters repository: it holds the cluster row, so a bind cannot race a cluster's removal. A machine named by a MAC
+// that changed owner within macMovedGuard is refused (movedMAC).
 func runBind(cmd *cobra.Command, deps cliDeps, req bindRequest) error {
 	cluster, host, err := hostOf(cmd, req.host)
 	if err != nil {
@@ -470,14 +476,42 @@ func runBind(cmd *cobra.Command, deps cliDeps, req bindRequest) error {
 		if err != nil {
 			return err
 		}
+		_, err = fmt.Fprintf(cmd.ErrOrStderr(), "machine %s: uuid %s, serial %s, product %s\n",
+			m.ID, m.UUID, safeText(m.Serial), safeText(m.Product))
+		if err != nil {
+			return err
+		}
+		now := deps.now()
+		if err := movedMAC(cmd, s.Fleet, req, m, now); err != nil {
+			return err
+		}
 		bound, err := req.bind(s.Clusters, cmd.Context(), clusters.MachineRequest{
-			MachineID: m.ID, Cluster: cluster, Host: host, Actor: fleet.ActorCLI, At: deps.now(),
+			MachineID: m.ID, Cluster: cluster, Host: host, Actor: fleet.ActorCLI, At: now,
 		})
 		if err != nil {
 			return bindErr(err, req.verb, m.ID, cluster, host)
 		}
 		return printChange(cmd, s, &bound, stateLabel(m.State), req.asJSON)
 	})
+}
+
+// movedMAC refuses req when it names m by a MAC that changed owner within macMovedGuard of now. A MAC is whatever a
+// boot reports, so after a change of owner the admin confirms the machine by its SMBIOS UUID instead. A UUID ref is
+// never refused here.
+func movedMAC(cmd *cobra.Command, repo *fleet.Repository, req bindRequest, m fleet.Machine, now time.Time) error {
+	mac, err := fleet.NormalizeMAC(req.machine)
+	if err != nil {
+		return nil //nolint:nilerr // a ref that is not a MAC is a UUID, which the guard does not cover
+	}
+	at, moved, err := repo.LastMACMove(cmd.Context(), mac)
+	if err != nil {
+		return fmt.Errorf("check MAC %s: %w", mac, err)
+	}
+	if !moved || now.Sub(at) >= macMovedGuard {
+		return nil
+	}
+	return fmt.Errorf("cannot %s %s: this MAC changed owner at %s; name the machine by its SMBIOS UUID instead: "+
+		"hephaestus machine %s %s %s", req.verb, mac, formatTime(at), req.verb, m.UUID, req.host)
 }
 
 // bindErr is err in the admin's words when it is a refusal an admin causes, and err otherwise.
@@ -524,8 +558,8 @@ func newMachineApproveCmd(deps cliDeps) *cobra.Command {
 		Long: `Bind a discovered machine to a host of the cluster's approved pair, assigned: its next boot installs
 Talos there. The host must be in the approved pair and unbound, and the machine's UUID must not be junk.
 The machine's Talos assets are wanted at once.`,
-		Example: `  hephaestus machine approve 52:54:00:12:34:56 lab/cp-01
-  hephaestus machine approve 4c4c4544-0042-3510-8052-b4c04f4e4d32 lab/wrk-01 --json`,
+		Example: `  hephaestus machine approve 4c4c4544-0042-3510-8052-b4c04f4e4d32 lab/cp-01
+  hephaestus machine approve 52:54:00:12:34:56 lab/wrk-01 --json`,
 		Args: exactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runBind(cmd, deps, bindRequest{

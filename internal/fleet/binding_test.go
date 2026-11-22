@@ -620,7 +620,7 @@ func runBindingSuite(t *testing.T, open func(testing.TB) *db.DB, pair func(testi
 		events := scalar[int](t, d, "SELECT count(*) FROM boot_events WHERE machine_id = ?", created.ID)
 		audits := len(auditRows(t, d))
 
-		_, err := r.RecordBoot(t.Context(), stale)
+		_, _, err := r.RecordBoot(t.Context(), stale)
 		if !errors.Is(err, ErrIdentityRace) {
 			t.Fatalf("RecordBoot error = %v, want ErrIdentityRace", err)
 		}
@@ -647,7 +647,7 @@ func runBindingSuite(t *testing.T, open func(testing.TB) *db.DB, pair func(testi
 			{"conflict", &BootRecord{Identity: originalIdentity(), Arch: ArchAMD64, MachineID: created.ID, Conflict: true, ObserveIdentity: true, At: t0}},
 		}
 		for _, tc := range tests {
-			if _, err := r.RecordBoot(t.Context(), *tc.rec); !errors.Is(err, ErrInvalidTransition) {
+			if _, _, err := r.RecordBoot(t.Context(), *tc.rec); !errors.Is(err, ErrInvalidTransition) {
 				t.Errorf("%s: RecordBoot error = %v, want ErrInvalidTransition", tc.name, err)
 			}
 		}
@@ -664,7 +664,7 @@ func runBindingSuite(t *testing.T, open func(testing.TB) *db.DB, pair func(testi
 		serials := [2]string{"S1", "S2"}
 		var errs [2]error
 		together(func(i int) {
-			_, errs[i] = repos[i].RecordBoot(t.Context(), firstReport(created, serials[i], t0.Add(time.Minute)))
+			_, _, errs[i] = repos[i].RecordBoot(t.Context(), firstReport(created, serials[i], t0.Add(time.Minute)))
 		})
 		winner := 0
 		if errs[0] != nil {

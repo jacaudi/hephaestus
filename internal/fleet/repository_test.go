@@ -42,7 +42,7 @@ func execRaw(t *testing.T, d *db.DB, query string, args ...any) error {
 // firstContact records a machine's first boot as the /boot handler does.
 func firstContact(t *testing.T, r *Repository, id Identity, at time.Time) Machine {
 	t.Helper()
-	m, err := r.RecordBoot(t.Context(), BootRecord{
+	m, _, err := r.RecordBoot(t.Context(), BootRecord{
 		Identity: id, Arch: ArchAMD64, Trigger: TriggerFirstContact,
 		Event: BootEvent{Row: 7, Action: "hold", Reason: "awaiting approval"}, At: at,
 	})
@@ -58,7 +58,7 @@ func knownBoot(t *testing.T, r *Repository, rec BootRecord) Machine {
 	if rec.Arch == "" {
 		rec.Arch = ArchAMD64
 	}
-	m, err := r.RecordBoot(t.Context(), rec)
+	m, _, err := r.RecordBoot(t.Context(), rec)
 	if err != nil {
 		t.Fatalf("known boot %+v: %v", rec, err)
 	}
@@ -115,10 +115,20 @@ func auditRows(t *testing.T, d *db.DB) []auditEventRow {
 	return rows
 }
 
+// macMoves reads the machine.mac_moved audit events, oldest first.
+func macMoves(t *testing.T, d *db.DB) []auditEventRow {
+	t.Helper()
+	var rows []auditEventRow
+	if err := d.Bun().NewSelect().Model(&rows).Where("action = ?", "machine.mac_moved").Order("id").Scan(t.Context()); err != nil {
+		t.Fatalf("read mac_moved events: %v", err)
+	}
+	return rows
+}
+
 // mustReport stores a report and returns whether it was new.
 func mustReport(t *testing.T, r *Repository, machineID string, rep Report) bool {
 	t.Helper()
-	stored, err := r.RecordReport(t.Context(), machineID, rep)
+	stored, _, err := r.RecordReport(t.Context(), machineID, rep)
 	if err != nil {
 		t.Fatalf("RecordReport: %v", err)
 	}
@@ -188,7 +198,7 @@ func runRepositorySuite(t *testing.T, open func(testing.TB) *db.DB) {
 	t.Run("JunkPatternWithoutMACUnidentifiable", func(t *testing.T) {
 		d := open(t)
 		r := NewRepository(d)
-		_, err := r.RecordBoot(t.Context(), BootRecord{
+		_, _, err := r.RecordBoot(t.Context(), BootRecord{
 			Arch: ArchAMD64, Trigger: TriggerFirstContact, Event: BootEvent{Row: 7, Action: "hold"}, At: t0,
 		})
 		if !errors.Is(err, ErrUnidentifiable) {
@@ -297,6 +307,102 @@ func runRepositorySuite(t *testing.T, open func(testing.TB) *db.DB) {
 		wantMACs(t, mustGet(t, r, a.ID))
 	})
 
+	t.Run("MACMoveAudited", func(t *testing.T) {
+		d := open(t)
+		r := NewRepository(d)
+		mac := macN(0x21)
+		idA := Identity{UUID: "11111111-1111-1111-1111-111111111111", MAC: mac, Serial: "S1", Product: "P1"}
+		idB := Identity{UUID: "22222222-2222-2222-2222-222222222222", MAC: mac, Serial: "S2", Product: "P1"}
+		record := func(rec BootRecord) (Machine, bool) {
+			t.Helper()
+			rec.Arch, rec.Event = ArchAMD64, BootEvent{Row: 7, Action: "hold", Reason: "awaiting approval"}
+			m, moved, err := r.RecordBoot(t.Context(), rec)
+			if err != nil {
+				t.Fatalf("RecordBoot(%+v): %v", rec, err)
+			}
+			return m, moved
+		}
+
+		a, moved := record(BootRecord{Identity: idA, Trigger: TriggerFirstContact, At: t0})
+		if moved {
+			t.Error("first insert: moved = true, want false")
+		}
+		if _, moved := record(BootRecord{Identity: idA, MachineID: a.ID, At: t0.Add(time.Second)}); moved {
+			t.Error("same-owner refresh: moved = true, want false")
+		}
+		if rows := macMoves(t, d); len(rows) != 0 {
+			t.Fatalf("mac_moved events after a first insert and a same-owner refresh = %+v, want none", rows)
+		}
+
+		b, moved := record(BootRecord{Identity: idB, Trigger: TriggerFirstContact, At: t0.Add(2 * time.Second)})
+		if !moved {
+			t.Error("re-home: moved = false, want true")
+		}
+		rows := macMoves(t, d)
+		want := fmt.Sprintf(`{"mac":%q,"from_machine":%q,"to_machine":%q}`, mac, a.ID, b.ID)
+		if len(rows) != 1 || rows[0].Actor != ActorSystem || rows[0].MachineID != b.ID || rows[0].Detail != want {
+			t.Fatalf("mac_moved events = %+v, want one by system for %s with detail %s", rows, b.ID, want)
+		}
+	})
+
+	t.Run("ObserveMACMoved", func(t *testing.T) {
+		d := open(t)
+		r := NewRepository(d)
+		a := firstContact(t, r, originalIdentity(), t0)
+		id := Identity{UUID: "22222222-2222-2222-2222-222222222222", MAC: macN(1), Serial: "S2", Product: "P1"}
+		obs, err := r.Observe(t.Context(), id, ArchAMD64, t0.Add(time.Second))
+		if err != nil {
+			t.Fatalf("Observe: %v", err)
+		}
+		if !obs.Created || !obs.MACMoved {
+			t.Fatalf("observation = %+v, want created with the MAC moved", obs)
+		}
+		want := fmt.Sprintf(`{"mac":%q,"from_machine":%q,"to_machine":%q}`, macN(1), a.ID, obs.Machine.ID)
+		if rows := macMoves(t, d); len(rows) != 1 || rows[0].Detail != want {
+			t.Fatalf("mac_moved events = %+v, want one with detail %s", rows, want)
+		}
+	})
+
+	t.Run("ReportMACMoved", func(t *testing.T) {
+		d := open(t)
+		r := NewRepository(d)
+		a := firstContact(t, r, originalIdentity(), t0)
+		b := firstContact(t, r, Identity{UUID: "22222222-2222-2222-2222-222222222222", MAC: macN(2), Serial: "S2", Product: "P1"}, t0)
+		rep := Report{Facts: []byte(`{}`), MACs: []string{macN(1), macN(2)}, At: t0.Add(time.Second)}
+		stored, moved, err := r.RecordReport(t.Context(), b.ID, rep)
+		if err != nil || !stored {
+			t.Fatalf("RecordReport = %v, %v; want stored", stored, err)
+		}
+		if moved != 1 {
+			t.Errorf("moved = %d, want 1: only %s changed owner", moved, macN(1))
+		}
+		want := fmt.Sprintf(`{"mac":%q,"from_machine":%q,"to_machine":%q}`, macN(1), a.ID, b.ID)
+		if rows := macMoves(t, d); len(rows) != 1 || rows[0].Detail != want {
+			t.Fatalf("mac_moved events = %+v, want one with detail %s", rows, want)
+		}
+	})
+
+	t.Run("LastMACMove", func(t *testing.T) {
+		r := NewRepository(open(t))
+		mac := macN(0x21)
+		idA := Identity{UUID: "11111111-1111-1111-1111-111111111111", MAC: mac, Serial: "S1", Product: "P1"}
+		a := firstContact(t, r, idA, t0)
+		if _, ok, err := r.LastMACMove(t.Context(), mac); err != nil || ok {
+			t.Fatalf("LastMACMove before any move = %v, %v; want false", ok, err)
+		}
+		firstContact(t, r, Identity{UUID: "22222222-2222-2222-2222-222222222222", MAC: mac, Serial: "S2", Product: "P1"}, t0.Add(time.Minute))
+		knownBoot(t, r, BootRecord{Identity: idA, MachineID: a.ID, Event: BootEvent{Row: 7, Action: "exit"}, At: t0.Add(time.Hour)})
+		// A later move of another MAC is not mac's.
+		firstContact(t, r, Identity{UUID: "33333333-3333-3333-3333-333333333333", MAC: macN(2), Serial: "S3", Product: "P1"}, t0)
+		knownBoot(t, r, BootRecord{Identity: Identity{UUID: idA.UUID, MAC: macN(2), Serial: "S1", Product: "P1"}, MachineID: a.ID,
+			Event: BootEvent{Row: 7, Action: "exit"}, At: t0.Add(2 * time.Hour)})
+
+		at, ok, err := r.LastMACMove(t.Context(), mac)
+		if err != nil || !ok || !at.Equal(t0.Add(time.Hour)) {
+			t.Fatalf("LastMACMove(%s) = %v, %v, %v; want the newest move, at t0+1h", mac, at, ok, err)
+		}
+	})
+
 	t.Run("JunkPatternNeverMatchesValidUUIDMachine", func(t *testing.T) {
 		d := open(t)
 		r := NewRepository(d)
@@ -335,7 +441,7 @@ func runRepositorySuite(t *testing.T, open func(testing.TB) *db.DB) {
 		if _, err := d.Bun().NewInsert().Model(&rows).Exec(t.Context()); err != nil {
 			t.Fatalf("bulk insert: %v", err)
 		}
-		_, err := r.RecordBoot(t.Context(), BootRecord{
+		_, _, err := r.RecordBoot(t.Context(), BootRecord{
 			Identity: originalIdentity(), Arch: ArchAMD64, Trigger: TriggerFirstContact,
 			Event: BootEvent{Row: 7, Action: "hold"}, At: t0,
 		})
@@ -398,7 +504,7 @@ func runRepositorySuite(t *testing.T, open func(testing.TB) *db.DB) {
 		d := open(t)
 		r := NewRepository(d)
 		exit := BootEvent{Row: 6, Action: "exit"}
-		m, err := r.RecordBoot(t.Context(), BootRecord{
+		m, _, err := r.RecordBoot(t.Context(), BootRecord{
 			Identity: originalIdentity(), Arch: ArchAMD64, Trigger: TriggerFirstContact, Event: exit, At: t0,
 		})
 		if err != nil {
@@ -582,7 +688,7 @@ func runRepositorySuite(t *testing.T, open func(testing.TB) *db.DB) {
 				t.Errorf("%s: HoldCoalesced = %t, %v; want %t", tc.name, got, err, tc.want)
 			}
 		}
-		if _, err := r.RecordBoot(t.Context(), bootOf(m, 6, "exit", t0.Add(time.Minute))); err != nil {
+		if _, _, err := r.RecordBoot(t.Context(), bootOf(m, 6, "exit", t0.Add(time.Minute))); err != nil {
 			t.Fatalf("RecordBoot exit: %v", err)
 		}
 		if got, err := r.HoldCoalesced(t.Context(), m.ID, "awaiting approval", t0.Add(2*time.Minute)); err != nil || got {
@@ -881,7 +987,7 @@ func TestRecordBoot_Refused(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := r.RecordBoot(t.Context(), tc.rec); !errors.Is(err, tc.want) {
+			if _, _, err := r.RecordBoot(t.Context(), tc.rec); !errors.Is(err, tc.want) {
 				t.Fatalf("RecordBoot error = %v, want %v", err, tc.want)
 			}
 		})
